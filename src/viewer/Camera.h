@@ -1,14 +1,23 @@
 #pragma once
 #include <glm/glm.hpp>
+#include <glm/gtc/quaternion.hpp>
 
 namespace pf {
 
 // First-person fly camera operating in "centred" space (world minus the octree
 // cube centre) so coordinates stay small and float-friendly.
+//
+// Orientation is stored as a quaternion and mouse look rotates around the
+// CAMERA's own axes (yaw about its up, pitch about its right), so turning is
+// relative to where you are facing, not to the world.
+//
+// `yaw` / `pitch` are kept as the serialised pose (bookmarks, camera paths,
+// saved views). They describe the forward vector. If external code assigns
+// them, the orientation is rebuilt from them with roll cleared.
 class Camera {
 public:
     glm::vec3 position{0, 0, 0};
-    float yaw   = -90.0f;   // degrees
+    float yaw   = -90.0f;   // degrees (pose of forward; see note above)
     float pitch = 0.0f;
     float fovY  = 60.0f;    // degrees
     float nearZ = 0.05f;
@@ -19,13 +28,24 @@ public:
     float moveSpeed = 10.0f;     // units/sec
     float lookSpeed = 0.15f;     // degrees/pixel
 
-    glm::vec3 front() const;
-    glm::vec3 right() const;
+    glm::vec3 front() const;   // camera forward
+    glm::vec3 right() const;   // camera right
+    glm::vec3 up() const;      // camera up (roll follows the camera)
     glm::mat4 view() const;
     glm::mat4 proj() const;
     glm::mat4 viewProj() const { return proj() * view(); }
 
+    // Rotate the camera about its OWN axes by dYaw / dPitch (scaled by lookSpeed).
     void addYawPitch(float dYaw, float dPitch);
+    // Roll about the camera's FORWARD axis by dDeg (keeps forward, tilts the horizon).
+    void roll(float dDeg);
+    // Slide the camera sideways/up in its OWN view plane (middle-drag pan).
+    // dxPx/dyPx are mouse deltas in pixels (dy > 0 = mouse moved down). The scene
+    // follows the mouse, so the camera moves opposite to dx and with dy.
+    void pan(float dxPx, float dyPx, float unitsPerPx);
+    // Remove all roll: keep the current forward direction and make the horizon
+    // level (world Z stays up, camera right stays horizontal).
+    void levelHorizon();
     void moveLocal(const glm::vec3& delta) { position += delta; }
 
     // Point the camera at a target (sets yaw/pitch; position unchanged).
@@ -39,6 +59,16 @@ public:
     // lands on the near plane; dir is unit length and points into the scene.
     void screenRay(float mx, float my, int w, int h,
                    glm::vec3& outOrigin, glm::vec3& outDir) const;
+
+private:
+    // Rebuild orient_ from yaw/pitch if they were changed externally.
+    void sync() const;
+    static glm::quat fromYawPitch(float yawDeg, float pitchDeg);
+
+    mutable glm::quat orient_{1.0f, 0.0f, 0.0f, 0.0f};  // w, x, y, z
+    mutable bool  orientValid_ = false;
+    mutable float syncYaw_ = 0.0f;
+    mutable float syncPitch_ = 0.0f;
 };
 
 } // namespace pf

@@ -513,6 +513,7 @@ static const KeyBindInfo kKeyBinds[] = {
     { "F12",          "Screenshot",                      "Files" },
     { "Drag & drop",  "Octree folder loads, scan file opens Convert", "Files" },
     { "LMB drag",     "Orbit around pivot",              "Navigation" },
+    { "MMB drag",     "Pan (slide view)",                "Navigation" },
     { "Double-click", "Focus pivot on point",            "Navigation" },
     { "RMB drag",     "Free look",                       "Navigation" },
     { "Wheel",        "Zoom to cursor",                  "Navigation" },
@@ -675,6 +676,7 @@ int main(int argc, char** argv) {
     glm::dvec3 sceneOrigin = glm::dvec3(0.0);
     bool octreeLoaded = false;   // a cloud (any type) is active — drives render/nav
     bool octreeActive = false;   // the ACTIVE cloud is an octree (has an OctreeStore)
+    bool splatActive  = false;   // the ACTIVE cloud is a Gaussian splat cloud
     auto activeCloud = [&]() -> SceneCloud& {
         return scene[(size_t)activeCloudIndex];
     };
@@ -700,6 +702,9 @@ int main(int argc, char** argv) {
         octreeLoaded = activeCloudIndex >= 0 && activeCloudIndex < (int)scene.size();
         octreeActive = octreeLoaded &&
                        scene[(size_t)activeCloudIndex].store != nullptr;
+        splatActive  = octreeLoaded && !octreeActive &&
+                       scene[(size_t)activeCloudIndex].type == CloudType::GaussianSplat &&
+                       scene[(size_t)activeCloudIndex].splatRenderer != nullptr;
     };
     // (initial / auto-load happens after settings + helpers are set up below)
 
@@ -878,6 +883,7 @@ int main(int argc, char** argv) {
 
     // ---- tunables (persisted in pfview_config.txt) -------------------------
     float pointSize   = 2.0f;
+    float splatMinPx  = 0.5f;   // splat LOD: skip splats smaller than this on screen (px)
     float sseBudget   = 1.5f;   // pixels; smaller = more detail loaded
     int   gpuBudgetMB = 1024;
     bool  roundPoints = true;
@@ -958,6 +964,15 @@ int main(int argc, char** argv) {
     // ---- navigation (orbit / focus / zoom-to-cursor) ----------------------
     glm::vec3 pivot(0.0f);            // orbit pivot in centred space (cube centre = origin)
     bool orbitDrag = false;          // LMB held -> turntable orbit
+    bool panDrag = false;            // MMB held -> pan in the view plane
+    // World units per mouse pixel at the current view: keeps the pan speed
+    // matched to what is on screen (perspective scales with distance to the pivot).
+    auto panUnitsPerPx = [&]() -> float {
+        const float h = (float)std::max(winH, 1);
+        if (cam.isOrtho) return 2.0f * cam.orthoSize / h;
+        const float dist = std::max(glm::length(cam.position - pivot), 0.01f);
+        return 2.0f * dist * std::tan(glm::radians(cam.fovY) * 0.5f) / h;
+    };
     bool remoteOrbitWasActive = false; // edge-detect the web remote's LMB-equivalent
     bool pendingFocus = false; int focusX = 0, focusY = 0;   // double-click to focus
     bool pendingZoom  = false; float zoomDelta = 0.0f; int zoomX = 0, zoomY = 0;
@@ -1133,7 +1148,13 @@ int main(int argc, char** argv) {
                     m.points = strtoull(v.c_str() + t1 + 1, nullptr, 10);
                     if (t2 != std::string::npos) m.bytes = strtoull(v.c_str() + t2 + 1, nullptr, 10);
                 }
-                if (!path.empty() && recentDirs.size() < 10) {
+                // Only keep entries that still exist and are not duplicates. Stale
+                // entries (deleted/moved .vxpc, cache folders) otherwise come back
+                // on every start and fail as "invalid file".
+                std::error_code rec;
+                const bool exists = !path.empty() && std::filesystem::exists(path, rec);
+                const bool dup = std::find(recentDirs.begin(), recentDirs.end(), path) != recentDirs.end();
+                if (exists && !dup && recentDirs.size() < 10) {
                     recentDirs.push_back(path);
                     recentMeta[path] = m;
                 }
@@ -1639,7 +1660,14 @@ int main(int argc, char** argv) {
         } else {
             anyLoaded = appendCloud(dir, "", "");
         }
-        if (!anyLoaded) { pf::logError("Could not load any cloud from " + dir); return false; }
+        if (!anyLoaded) {
+            pf::logError("Could not load any cloud from " + dir);
+            // Drop it from Recent so a broken entry does not come back on restart.
+            recentDirs.erase(std::remove(recentDirs.begin(), recentDirs.end(), dir), recentDirs.end());
+            recentMeta.erase(dir);
+            saveSettings();
+            return false;
+        }
 
         setActiveCloud((int)scene.size() - 1);
         if (wasEmpty && scene.size() == 1) setupCamera();
@@ -2559,6 +2587,10 @@ int main(int argc, char** argv) {
                         }
                     }
                 }
+            } else if (e.type == SDL_MOUSEBUTTONDOWN && e.button.button == SDL_BUTTON_MIDDLE) {
+                if (octreeLoaded && !ImGui::GetIO().WantCaptureMouse) panDrag = true;
+            } else if (e.type == SDL_MOUSEBUTTONUP && e.button.button == SDL_BUTTON_MIDDLE) {
+                panDrag = false;
             } else if (e.type == SDL_MOUSEBUTTONUP && e.button.button == SDL_BUTTON_LEFT) {
                 orbitDrag = false;
             } else if (e.type == SDL_MOUSEBUTTONDOWN && e.button.button == SDL_BUTTON_RIGHT) {
@@ -2573,6 +2605,10 @@ int main(int argc, char** argv) {
                     cam.addYawPitch((float)e.motion.xrel, -(float)e.motion.yrel);
                 } else if (orbitDrag && octreeLoaded) {
                     cam.orbit((float)e.motion.xrel, -(float)e.motion.yrel, pivot);
+                } else if (panDrag && octreeLoaded) {
+                    const glm::vec3 before = cam.position;
+                    cam.pan((float)e.motion.xrel, (float)e.motion.yrel, panUnitsPerPx());
+                    pivot += cam.position - before;   // keep the orbit pivot with the view
                 }
             } else if (e.type == SDL_MOUSEWHEEL) {
                 if (!ImGui::GetIO().WantCaptureMouse) {
@@ -2636,6 +2672,8 @@ int main(int argc, char** argv) {
                     camPresetTop();
                 } else if (!typing && octreeLoaded && k == SDLK_5) {
                     cam.isOrtho = !cam.isOrtho;
+                } else if (!typing && octreeLoaded && k == SDLK_g) {
+                    cam.levelHorizon();                         // G = one-press level horizon
                 } else if (k == SDLK_ESCAPE) {
                     if (stereoSBS) {
                         stereoSBS = false; saveSettings();      // Esc leaves stereo first
@@ -2665,8 +2703,16 @@ int main(int argc, char** argv) {
             if (ks[SDL_SCANCODE_S]) moveDir -= fwd;
             if (ks[SDL_SCANCODE_D]) moveDir += rgt;
             if (ks[SDL_SCANCODE_A]) moveDir -= rgt;
-            if (ks[SDL_SCANCODE_E]) moveDir += glm::vec3(0, 0, 1); // E is up (world Z-up)
-            if (ks[SDL_SCANCODE_Q]) moveDir -= glm::vec3(0, 0, 1); // Q is down
+            // E / Q move along the CAMERA's up, not world Z.
+            glm::vec3 camUp = cam.up();
+            if (ks[SDL_SCANCODE_E]) moveDir += camUp;
+            if (ks[SDL_SCANCODE_Q]) moveDir -= camUp;
+
+            // Z / X roll the camera about its forward axis to level the horizon.
+            // Hold to roll; Shift = faster.
+            const float rollRate = 45.0f * dt * (ks[SDL_SCANCODE_LSHIFT] ? 3.0f : 1.0f);
+            if (ks[SDL_SCANCODE_Z]) cam.roll( rollRate);
+            if (ks[SDL_SCANCODE_X]) cam.roll(-rollRate);
 
             if (glm::length(moveDir) > 0.0f) {
                 moveDir = glm::normalize(moveDir);
@@ -2705,7 +2751,7 @@ int main(int argc, char** argv) {
                 }
                 // Triggers / D-pad vertical = down / up.
                 float up = s.rt - s.lt + (pad.held(PAD_DU) ? 1.0f : 0.0f) - (pad.held(PAD_DD) ? 1.0f : 0.0f);
-                cam.position += glm::vec3(0, 0, 1) * up * mv;
+                cam.position += cam.up() * up * mv;   // camera-relative up/down
 
                 // Action buttons.
                 if (pad.pressed(PAD_A)) frameAllReq = true;          // A = frame all
@@ -2763,7 +2809,7 @@ int main(int argc, char** argv) {
                 float mv = cam.moveSpeed * dt * camSpeedMultiplier * padMoveSens * boost;
                 glm::vec3 fwd = cam.front(), rgt = cam.right();
                 cam.position += (fwd * remote.fwd() + rgt * remote.strafe()) * mv;
-                cam.position += glm::vec3(0, 0, 1) * remote.up() * mv;
+                cam.position += cam.up() * remote.up() * mv;   // camera-relative up/down
                 // Web joystick: up = +1 = look up (already matches addYawPitch).
                 float invY = padInvertY ? -1.0f : 1.0f;
                 float dYaw = remote.yawRate() * padLookSens * dt;
@@ -3096,6 +3142,7 @@ int main(int argc, char** argv) {
                         if (cloud.splatRenderer && cloud.splatRenderer->isReady()) {
                             glm::mat4 model = glm::translate(glm::mat4(1.0f), glm::vec3(cloud.worldOffset));
                             glm::mat4 cloudView = cam.view() * model;
+                            cloud.splatRenderer->minPixelRadius = splatMinPx;
                             cloud.splatRenderer->draw(cam.proj(), cloudView, glm::vec2((float)vpW, (float)vpH));
                         }
                         continue;
@@ -4011,18 +4058,21 @@ int main(int argc, char** argv) {
 
                 ImGui::SeparatorEx(ImGuiSeparatorFlags_Vertical); ImGui::SameLine();
 
-                const char* modes[] = { "True Color", "Elevation", "Solid Color", "Intensity", "Classification" };
-                ImGui::SetNextItemWidth(130.0f * S);
-                if (ImGui::Combo("##colormode", &colorMode, modes, IM_ARRAYSIZE(modes))) saveSettings();
-                ImGui::SetItemTooltip("Color mode");
-                ImGui::SameLine();
-                const char* quals[] = { "Low", "Medium", "High", "Ultra" };
-                ImGui::SetNextItemWidth(100.0f * S);
-                if (ImGui::Combo("##quality", &qualityIdx, quals, IM_ARRAYSIZE(quals))) {
-                    applyQualityPreset(qualityIdx);
-                    saveSettings();
+                // Colour mode and octree quality apply to point clouds only.
+                if (!splatActive) {
+                    const char* modes[] = { "True Color", "Elevation", "Solid Color", "Intensity", "Classification" };
+                    ImGui::SetNextItemWidth(130.0f * S);
+                    if (ImGui::Combo("##colormode", &colorMode, modes, IM_ARRAYSIZE(modes))) saveSettings();
+                    ImGui::SetItemTooltip("Color mode");
+                    ImGui::SameLine();
+                    const char* quals[] = { "Low", "Medium", "High", "Ultra" };
+                    ImGui::SetNextItemWidth(100.0f * S);
+                    if (ImGui::Combo("##quality", &qualityIdx, quals, IM_ARRAYSIZE(quals))) {
+                        applyQualityPreset(qualityIdx);
+                        saveSettings();
+                    }
+                    ImGui::SetItemTooltip("Quality preset: LOD detail + GPU memory budget");
                 }
-                ImGui::SetItemTooltip("Quality preset: LOD detail + GPU memory budget");
                 ImGui::EndDisabled();
 
                 ImGui::SameLine(); ImGui::SeparatorEx(ImGuiSeparatorFlags_Vertical); ImGui::SameLine();
@@ -4136,42 +4186,57 @@ int main(int argc, char** argv) {
                         }
                     }
 
-                    // Display
+                    // Display: only the controls that apply to the ACTIVE cloud type.
+                    // Splats take colour and size from the file and are drawn per
+                    // splat, so point/octree controls (quality, point size, colour
+                    // mode, EDL, LOD budget, GPU budget, round points) are hidden.
                     if (ImGui::CollapsingHeader("Display", ImGuiTreeNodeFlags_DefaultOpen)) {
-                        const char* quals[] = { "Low", "Medium", "High", "Ultra" };
-                        if (ImGui::Combo("Quality", &qualityIdx, quals, IM_ARRAYSIZE(quals))) {
-                            applyQualityPreset(qualityIdx);
-                            settingsChanged = true;
+                        if (splatActive) {
+                            const SplatRenderer& sr = *activeCloud().splatRenderer;
+                            ImGui::TextDisabled("Gaussian splats: colour and shape come from the file.");
+                            ImGui::Text("Visible:  %s / %s", prettyCount(sr.timings().visible).c_str(),
+                                        prettyCount(sr.splatCount()).c_str());
+                            if (ImGui::SliderFloat("Min splat size (px)", &splatMinPx, 0.0f, 4.0f, "%.2f"))
+                                settingsChanged = true;
+                            ImGui::SetItemTooltip("Splats smaller than this on screen are skipped (LOD).\n"
+                                                  "0 = draw all. Higher = faster, less far-away detail.");
+                        } else {
+                            const char* quals[] = { "Low", "Medium", "High", "Ultra" };
+                            if (ImGui::Combo("Quality", &qualityIdx, quals, IM_ARRAYSIZE(quals))) {
+                                applyQualityPreset(qualityIdx);
+                                settingsChanged = true;
+                            }
+                            ImGui::SetItemTooltip("One-knob preset for LOD detail + GPU budget.");
+                            if (ImGui::SliderFloat("Point size", &pointSize, 1.0f, 16.0f)) settingsChanged = true;
+                            ImGui::SetItemTooltip("Point size in pixels. Also: Ctrl+mouse wheel.");
+                            const char* modes[] = { "True Color", "Elevation", "Solid Color", "Intensity", "Classification" };
+                            if (ImGui::Combo("Color Mode", &colorMode, modes, IM_ARRAYSIZE(modes))) settingsChanged = true;
+                            if (colorMode == 2) {
+                                if (ImGui::ColorEdit3("Solid Color", solidColor)) settingsChanged = true;
+                            }
+                            if (ImGui::Checkbox("Eye-Dome Lighting", &enableEDL)) settingsChanged = true;
+                            ImGui::SetItemTooltip("Shades depth edges for much better depth perception on uncoloured clouds.");
+                            if (enableEDL) {
+                                ImGui::Indent();
+                                if (ImGui::SliderFloat("Strength", &edlStrength, 0.1f, 5.0f)) settingsChanged = true;
+                                if (ImGui::SliderFloat("Radius", &edlRadius, 0.5f, 4.0f)) settingsChanged = true;
+                                ImGui::Unindent();
+                            }
+                            if (ImGui::TreeNode("Advanced")) {
+                                if (ImGui::SliderFloat("LOD budget (px)", &sseBudget, 0.3f, 8.0f)) settingsChanged = true;
+                                ImGui::SetItemTooltip("Screen-space error target. Lower = more detail loaded (slower).");
+                                if (ImGui::SliderInt("GPU budget (MB)", &gpuBudgetMB, 128, 8192)) settingsChanged = true;
+                                ImGui::SetItemTooltip("Max GPU memory for resident points before LRU eviction.");
+                                if (ImGui::SliderInt("Uploads/frame", &uploadsPerFrame, 1, 256)) settingsChanged = true;
+                                ImGui::SetItemTooltip("Node VBO uploads per frame. Higher = faster streaming, more hitches.");
+                                if (ImGui::Checkbox("Round points", &roundPoints)) settingsChanged = true;
+                                ImGui::SameLine();
+                                if (ImGui::Checkbox("Attenuate", &attenuate)) settingsChanged = true;
+                                ImGui::TreePop();
+                            }
                         }
-                        ImGui::SetItemTooltip("One-knob preset for LOD detail + GPU budget.");
-                        if (ImGui::SliderFloat("Point size", &pointSize, 1.0f, 16.0f)) settingsChanged = true;
-                        ImGui::SetItemTooltip("Splat size in pixels. Also: Ctrl+mouse wheel.");
-                        const char* modes[] = { "True Color", "Elevation", "Solid Color", "Intensity", "Classification" };
-                        if (ImGui::Combo("Color Mode", &colorMode, modes, IM_ARRAYSIZE(modes))) settingsChanged = true;
-                        if (colorMode == 2) {
-                            if (ImGui::ColorEdit3("Solid Color", solidColor)) settingsChanged = true;
-                        }
-                        if (ImGui::Checkbox("Eye-Dome Lighting", &enableEDL)) settingsChanged = true;
-                        ImGui::SetItemTooltip("Shades depth edges for much better depth perception on uncoloured clouds.");
-                        if (enableEDL) {
-                            ImGui::Indent();
-                            if (ImGui::SliderFloat("Strength", &edlStrength, 0.1f, 5.0f)) settingsChanged = true;
-                            if (ImGui::SliderFloat("Radius", &edlRadius, 0.5f, 4.0f)) settingsChanged = true;
-                            ImGui::Unindent();
-                        }
-                        if (ImGui::TreeNode("Advanced")) {
-                            if (ImGui::SliderFloat("LOD budget (px)", &sseBudget, 0.3f, 8.0f)) settingsChanged = true;
-                            ImGui::SetItemTooltip("Screen-space error target. Lower = more detail loaded (slower).");
-                            if (ImGui::SliderInt("GPU budget (MB)", &gpuBudgetMB, 128, 8192)) settingsChanged = true;
-                            ImGui::SetItemTooltip("Max GPU memory for resident points before LRU eviction.");
-                            if (ImGui::SliderInt("Uploads/frame", &uploadsPerFrame, 1, 256)) settingsChanged = true;
-                            ImGui::SetItemTooltip("Node VBO uploads per frame. Higher = faster streaming, more hitches.");
-                            if (ImGui::Checkbox("Round points", &roundPoints)) settingsChanged = true;
-                            ImGui::SameLine();
-                            if (ImGui::Checkbox("Attenuate", &attenuate)) settingsChanged = true;
-                            if (ImGui::ColorEdit3("Background", clearColor)) settingsChanged = true;
-                            ImGui::TreePop();
-                        }
+                        // Common to all cloud types.
+                        if (ImGui::ColorEdit3("Background", clearColor)) settingsChanged = true;
                     }
 
                     // Camera
@@ -4185,6 +4250,9 @@ int main(int argc, char** argv) {
                         if (ImGui::Button("Reset View")) setupCamera();
                         ImGui::SameLine();
                         if (ImGui::Button("Frame All")) frameAllReq = true;
+                        ImGui::SameLine();
+                        if (ImGui::Button("Level Horizon (G)")) cam.levelHorizon();
+                        ImGui::SetItemTooltip("Remove roll: keeps where you look, makes the horizon level.");
                         ImGui::Text("Presets:");
                         ImGui::SameLine(); if (ImGui::SmallButton("Front (1)")) camPresetFront();
                         ImGui::SameLine(); if (ImGui::SmallButton("Side (3)")) camPresetSide();
@@ -4588,6 +4656,21 @@ int main(int argc, char** argv) {
                         snprintf(budgetOv, sizeof(budgetOv), "%.0f / %d MB GPU", residentMB, gpuBudgetMB);
                         ImGui::ProgressBar(gpuBudgetMB > 0 ? residentMB / (float)gpuBudgetMB : 0.0f,
                                            ImVec2(-FLT_MIN, 0), budgetOv);
+                    } else if (!scene.empty() && activeCloud().type == CloudType::GaussianSplat &&
+                               activeCloud().splatRenderer) {
+                        // Gaussian splats: timings from SplatRenderer (GPU is read 1-2 frames late).
+                        const SplatRenderer& sr = *activeCloud().splatRenderer;
+                        const SplatRenderer::Timings& t = sr.timings();
+                        ImGui::Separator();
+                        ImGui::Text("Splats:         %s", prettyCount(sr.splatCount()).c_str());
+                        ImGui::Text("Frame time:     %.2f ms  (%.0f FPS)", dt * 1000.0f, dt > 0 ? 1.0f / dt : 0.0f);
+                        ImGui::Text("GPU draw:       %.2f ms", t.gpuMs);
+                        ImGui::Text("CPU submit:     %.2f ms", t.drawCpuMs);
+                        ImGui::Text("Visible:        %s / %s", prettyCount(t.visible).c_str(),
+                                    prettyCount(sr.splatCount()).c_str());
+                        ImGui::Text("Sort (thread):  %.2f ms  %s", t.sortMs,
+                                    t.sortedThisFrame ? "(new list this frame)" : "(no new list)");
+                        ImGui::Text("Last upload:    %.1f ms", t.uploadMs);
                     } else {
                         ImGui::TextDisabled("No cloud loaded.");
                     }

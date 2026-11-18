@@ -186,11 +186,10 @@ void main() {
 inline const char* kSplatVertSrc = R"GLSL(#version 330 core
 layout(location = 0) in vec2 inQuadCorner;
 
-layout(location = 1) in vec3 inPos;
-layout(location = 2) in vec3 inScale;
-layout(location = 3) in vec4 inRot; // w, x, y, z
-layout(location = 4) in float inOpacity;
-layout(location = 5) in vec3 inColor;
+// Splat records: 4 RGBA32F texels per splat (see SplatRenderer::upload).
+uniform samplerBuffer uData;
+// Back-to-front draw order: one uint per draw slot.
+uniform usamplerBuffer uIdx;
 
 uniform mat4 uProj;
 uniform mat4 uView;
@@ -214,6 +213,19 @@ mat3 quaternionToRotation(vec4 q) {
 }
 
 void main() {
+    // Fetch this instance's splat via the sorted index.
+    uint sid = texelFetch(uIdx, gl_InstanceID).r;
+    int base = int(sid) * 4;
+    vec4 t0 = texelFetch(uData, base);
+    vec4 t1 = texelFetch(uData, base + 1);
+    vec4 t2 = texelFetch(uData, base + 2);
+    vec4 t3 = texelFetch(uData, base + 3);
+    vec3 inPos     = t0.xyz;
+    float inOpacity = t0.w;
+    vec3 inScale   = t1.xyz;
+    vec4 inRot     = t2;       // w, x, y, z
+    vec3 inColor   = t3.xyz;
+
     vColor = inColor;
     vOpacity = inOpacity;
 
