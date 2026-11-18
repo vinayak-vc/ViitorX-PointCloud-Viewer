@@ -201,12 +201,15 @@ out float vOpacity;
 out vec3 vConic;
 out vec2 vCoord;
 
+// Rotation matrix from quaternion (w,x,y,z). GLSL mat3(...) takes COLUMNS, so
+// each column below is a column of the standard R (R[row][col]). Passing rows
+// would produce R^T and orient every anisotropic splat incorrectly.
 mat3 quaternionToRotation(vec4 q) {
     float w = q.x, x = q.y, y = q.z, z = q.w;
     return mat3(
-        1.0 - 2.0*(y*y + z*z), 2.0*(x*y - w*z),     2.0*(x*z + w*y),
-        2.0*(x*y + w*z),     1.0 - 2.0*(x*x + z*z), 2.0*(y*z - w*x),
-        2.0*(x*z - w*y),     2.0*(y*z + w*x),     1.0 - 2.0*(x*x + y*y)
+        1.0 - 2.0*(y*y + z*z), 2.0*(x*y + w*z),     2.0*(x*z - w*y),     // column 0
+        2.0*(x*y - w*z),     1.0 - 2.0*(x*x + z*z), 2.0*(y*z + w*x),     // column 1
+        2.0*(x*z + w*y),     2.0*(y*z - w*x),     1.0 - 2.0*(x*x + y*y)  // column 2
     );
 }
 
@@ -215,7 +218,9 @@ void main() {
     vOpacity = inOpacity;
 
     vec4 camPos = uView * vec4(inPos, 1.0);
-    if (camPos.z >= 0.0) {
+    // Cull splats behind or too close to the eye. Near-eye splats have a
+    // J ~ 1/z footprint that covers the whole screen (the "big colour" blob).
+    if (camPos.z >= -0.2) {
         gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
         return;
     }
@@ -234,15 +239,36 @@ void main() {
     float focalX = uProj[0][0] * uViewportSize.x * 0.5;
     float focalY = uProj[1][1] * uViewportSize.y * 0.5;
 
+    // Projection-aware Jacobian. Perspective (uProj[3][3] == 0) divides by depth;
+    // orthographic (uProj[3][3] == 1) has no depth term, so the splat footprint
+    // stays constant in world units instead of shrinking to a point.
+    bool isOrtho = uProj[3][3] > 0.5;
+
     float z = camPos.z;
     float invZ = 1.0 / z;
     float invZ2 = invZ * invZ;
 
-    mat3 J = mat3(
-        focalX * invZ, 0.0, 0.0,
-        0.0, focalY * invZ, 0.0,
-        -focalX * camPos.x * invZ2, -focalY * camPos.y * invZ2, 0.0
-    );
+    mat3 J;
+    if (isOrtho) {
+        J = mat3(
+            focalX, 0.0, 0.0,
+            0.0, focalY, 0.0,
+            0.0, 0.0, 0.0
+        );
+    } else {
+        // Clamp the view-space x/z, y/z to ~1.3x the frustum half-extent (the
+        // standard 3DGS trick). Keeps the Jacobian bounded for splats near the
+        // edge of view, which would otherwise produce huge, wrong footprints.
+        float limX = 1.3 / uProj[0][0];
+        float limY = 1.3 / uProj[1][1];
+        float tx = clamp(camPos.x * invZ, -limX, limX) * z;
+        float ty = clamp(camPos.y * invZ, -limY, limY) * z;
+        J = mat3(
+            focalX * invZ, 0.0, 0.0,
+            0.0, focalY * invZ, 0.0,
+            -focalX * tx * invZ2, -focalY * ty * invZ2, 0.0
+        );
+    }
 
     // 2D covariance: Sigma' = J W Sigma W^T J^T. Here J and W are in true
     // (non-transposed) form, so A = J*W and cov2D = A Sigma A^T.
@@ -265,6 +291,8 @@ void main() {
     float mid = 0.5 * (covA + covC);
     float lambda = sqrt(max(0.1, mid * mid - det));
     float radius = ceil(3.0 * sqrt(max(mid + lambda, mid - lambda)));
+    // A footprint larger than the viewport is off-screen work with no benefit.
+    radius = min(radius, max(uViewportSize.x, uViewportSize.y));
 
     vec4 clipPos = uProj * camPos;
     vec2 pointCenter = clipPos.xy / clipPos.w;

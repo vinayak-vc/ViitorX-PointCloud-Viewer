@@ -42,11 +42,6 @@ private:
     };
 #pragma pack(pop)
 
-    struct DistanceIndex {
-        float depth;
-        uint32_t index;
-    };
-
     GLuint quadVao_ = 0;
     GLuint quadVbo_ = 0;
     GLuint instanceVbo_ = 0;
@@ -57,7 +52,15 @@ private:
 
     std::vector<GpuSplatRecord> records_;        // canonical (upload) order
     std::vector<GpuSplatRecord> sortedRecords_;  // back-to-front scratch buffer
-    glm::mat4 lastSortView_{0.0f};
+
+    // Sort scratch (reused every sort to avoid per-frame allocation).
+    std::vector<uint32_t> sortKeys_, sortKeysTmp_;
+    std::vector<uint32_t> sortIdx_, sortIdxTmp_;
+
+    // Sort is a function of view DIRECTION only: translating the camera adds
+    // the same constant to every depth, so the order does not change.
+    glm::vec3 lastSortDir_{0.0f};
+    bool sortValid_ = false;
 };
 
 } // namespace pf

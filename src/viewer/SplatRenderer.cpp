@@ -3,6 +3,7 @@
 #include "common/Log.h"
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 
 namespace pf {
 
@@ -121,42 +122,70 @@ void SplatRenderer::upload(const SplatCloudData& data) {
     count_ = records_.size();
     sortedRecords_.resize(count_);
 
-    // Force a re-sort on the next draw regardless of the cached view matrix.
-    lastSortView_ = glm::mat4(0.0f);
+    // Force a re-sort on the next draw regardless of the cached view direction.
+    sortValid_ = false;
 
     logInfo("SplatRenderer: Uploaded " + std::to_string(count_) + " splats to GPU");
+}
+
+// Order-preserving map float -> uint32 (flip sign bit for positives, invert
+// all bits for negatives), so unsigned integer order matches float order.
+static inline uint32_t floatToSortableKey(float f) {
+    uint32_t u;
+    std::memcpy(&u, &f, sizeof(u));
+    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
 }
 
 void SplatRenderer::sortSplats(const glm::mat4& view) {
     if (records_.empty() || count_ == 0) return;
 
-    // Fast check if view matrix changed significantly
-    if (view == lastSortView_) return;
-    lastSortView_ = view;
+    // Camera-space z axis expressed in cloud space (row 2 of the view matrix).
+    // Depth of splat p is dot(zAxis, p) + const, so only the DIRECTION matters
+    // for ordering. Skip the sort unless the view direction moved noticeably;
+    // translating (WASD/fly) never triggers a re-sort.
+    glm::vec3 zAxis(view[0][2], view[1][2], view[2][2]);
+    zAxis = glm::normalize(zAxis);
+    if (sortValid_ && glm::dot(zAxis, lastSortDir_) > 0.9999f) return;
+    lastSortDir_ = zAxis;
+    sortValid_ = true;
 
-    std::vector<DistanceIndex> depthPairs(count_);
+    const size_t n = count_;
+    sortKeys_.resize(n);
+    sortKeysTmp_.resize(n);
+    sortIdx_.resize(n);
+    sortIdxTmp_.resize(n);
 
-    // Camera-space depth z = (V * p).z. Row 2 of the column-major view matrix.
-    glm::vec4 viewZ(view[0][2], view[1][2], view[2][2], view[3][2]);
-
-    for (size_t i = 0; i < count_; ++i) {
+    for (size_t i = 0; i < n; ++i) {
         const auto& pos = records_[i].position;
-        depthPairs[i].depth = viewZ.x * pos.x + viewZ.y * pos.y + viewZ.z * pos.z + viewZ.w;
-        depthPairs[i].index = static_cast<uint32_t>(i);
+        // Ascending depth = most negative (farthest) first: back-to-front for
+        // "over" compositing.
+        float depth = zAxis.x * pos.x + zAxis.y * pos.y + zAxis.z * pos.z;
+        sortKeys_[i] = floatToSortableKey(depth);
+        sortIdx_[i] = static_cast<uint32_t>(i);
     }
 
-    // Back-to-front: the camera looks down -Z, so the most negative depth is
-    // farthest and must be drawn first for correct "over" alpha compositing.
-    std::sort(depthPairs.begin(), depthPairs.end(), [](const DistanceIndex& a, const DistanceIndex& b) {
-        return a.depth < b.depth;
-    });
+    // LSD radix sort, 4 passes x 8 bits. O(n) and far faster than std::sort on
+    // ~1M+ splats, which was the main cause of the low FPS while flying.
+    for (int shift = 0; shift < 32; shift += 8) {
+        size_t hist[256] = {0};
+        for (size_t i = 0; i < n; ++i) hist[(sortKeys_[i] >> shift) & 0xFFu]++;
+        size_t sum = 0;
+        for (int b = 0; b < 256; ++b) { size_t c = hist[b]; hist[b] = sum; sum += c; }
+        for (size_t i = 0; i < n; ++i) {
+            size_t dst = hist[(sortKeys_[i] >> shift) & 0xFFu]++;
+            sortKeysTmp_[dst] = sortKeys_[i];
+            sortIdxTmp_[dst] = sortIdx_[i];
+        }
+        sortKeys_.swap(sortKeysTmp_);
+        sortIdx_.swap(sortIdxTmp_);
+    }
 
     // glDrawArraysInstanced walks the instance VBO in gl_InstanceID order and
     // ignores any bound element buffer, so the sorted order must live in the
     // instance VBO itself. Reorder from the canonical records_ and re-upload.
-    sortedRecords_.resize(count_);
-    for (size_t i = 0; i < count_; ++i) {
-        sortedRecords_[i] = records_[depthPairs[i].index];
+    sortedRecords_.resize(n);
+    for (size_t i = 0; i < n; ++i) {
+        sortedRecords_[i] = records_[sortIdx_[i]];
     }
 
     glBindBuffer(GL_ARRAY_BUFFER, instanceVbo_);

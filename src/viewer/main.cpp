@@ -2533,6 +2533,12 @@ int main(int argc, char** argv) {
                     openConvertDialogForImages(dropFile);   // photo folder -> photogrammetry
                 } else if (std::filesystem::is_directory(dropFile, ec) || isVxpc(dropFile)) {
                     loadOctree(dropFile);           // converted octree/package -> open it
+                } else if (std::filesystem::is_regular_file(dropFile, ec) &&
+                           pf::SplatReader::detectFormat(dropFile) != pf::SplatFileFormat::Unknown) {
+                    // 3DGS .ply / .splat -> load directly as Gaussian splats. Routing
+                    // through Convert would run the point-only PLY reader and drop
+                    // the splat attributes (opacity, scale, rot, f_dc).
+                    loadOctree(dropFile);
                 } else if (std::filesystem::is_regular_file(dropFile, ec)) {
                     openConvertDialog(dropFile);    // raw scan -> Convert, pre-filled
                 }
