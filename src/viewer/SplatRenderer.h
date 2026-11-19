@@ -19,11 +19,16 @@ namespace pf {
 //   * The draw list is an index list (R32UI texture buffer) holding only the
 //     VISIBLE splats in back-to-front order. Typically a few bytes per visible splat.
 //
-// A background thread builds the draw list. It re-sorts only when the view
-// direction changes, and otherwise just filters the cached order against the
-// view frustum. The render loop never waits for it: it uses the newest finished
-// list. A list may lag the camera by a frame or two; splats are culled with a
-// bounding-sphere test (3 sigma) so popping at the frustum edge is minimal.
+// A background thread builds the draw list and re-sorts only when the view
+// direction changes. The render loop never waits for it: it uses the newest
+// finished list, which may lag the camera by several frames while it turns.
+//
+// Culling therefore happens in the VERTEX SHADER against the current camera
+// (frustum, screen-size LOD, behind-eye), every frame. By default the draw list
+// is the full back-to-front order, so a lagging list can never leave holes
+// ("black patches") where splats were outside the OLD frustum. cpuCull = true
+// pre-culls the list on the sort thread against a widened frustum: fewer
+// vertices for very large clouds, at the risk of gaps during very fast turns.
 class SplatRenderer {
 public:
     SplatRenderer();
@@ -46,7 +51,13 @@ public:
     // GPU time. 0 disables LOD.
     float minPixelRadius = 0.5f;
 
+    // Pre-cull the draw list on the sort thread (guard-banded frustum + relaxed
+    // LOD). Off by default: the vertex shader culls exactly, every frame.
+    bool cpuCull = false;
+
     size_t splatCount() const { return count_; }
+    // Approximate GPU memory: 4 RGBA32F texels per splat + one uint draw-list slot.
+    size_t gpuBytes() const { return count_ * (4 * sizeof(float) * 4 + sizeof(uint32_t)); }
     bool isReady() const { return initialized_ && count_ > 0; }
 
     // Per-frame timings for the Performance panel.
@@ -54,7 +65,7 @@ public:
         double uploadMs = 0.0;          // CPU: last upload() (one-off per load)
         double sortMs = 0.0;            // CPU (sort thread): time of the last completed job
         bool   sortedThisFrame = false; // a new draw list was uploaded this frame
-        size_t visible = 0;             // splats in the current draw list (after culling)
+        size_t visible = 0;             // splats in the current draw list (the GPU culls further)
         double drawCpuMs = 0.0;         // CPU: time to submit the draw call
         double gpuMs = 0.0;             // GPU: draw time from a timer query (read 1-2 frames late)
     };
@@ -69,13 +80,16 @@ private:
         float focalPx = 0.0f;     // proj[1][1] * viewportH * 0.5 (pixels per unit at depth 1)
         bool  ortho = false;
         float minPx = 0.0f;       // LOD: skip splats whose projected radius is below this
+        bool  cull = false;       // false: list = full sorted order (GPU culls)
     };
 
     // Sort thread
     void startWorker();
     void stopWorker();
     void workerLoop();
-    void computeJob(const Job& job, std::vector<uint32_t>& out);
+    // Returns false when the result would equal the list already published
+    // (full-order mode, no re-sort), so nothing needs to be re-uploaded.
+    bool computeJob(const Job& job, std::vector<uint32_t>& out);
     void sortFull(const glm::vec3& zAxis);
     void waitForWorkerIdle();
 
@@ -117,6 +131,7 @@ private:
     std::vector<uint32_t> fullOrder_;    // worker only: all splats, back-to-front for workerDir_
     glm::vec3 workerDir_{0.0f};          // worker only
     bool workerHasOrder_ = false;        // worker only
+    bool publishedFullOrder_ = false;    // worker only: last published list == fullOrder_
     std::vector<uint32_t> keys_, keysTmp_, idxTmp_;  // worker scratch
 
     Timings timings_;

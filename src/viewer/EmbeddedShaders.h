@@ -194,6 +194,7 @@ uniform usamplerBuffer uIdx;
 uniform mat4 uProj;
 uniform mat4 uView;
 uniform vec2 uViewportSize;
+uniform float uMinPx;   // LOD: cull splats whose 3-sigma radius is below this (px); 0 = off
 
 out vec3 vColor;
 out float vOpacity;
@@ -229,10 +230,26 @@ void main() {
     vColor = inColor;
     vOpacity = inOpacity;
 
+    // Splats that can never reach 1/255 alpha contribute nothing.
+    if (inOpacity < 1.0 / 255.0) {
+        gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
+        return;
+    }
+
     vec4 camPos = uView * vec4(inPos, 1.0);
     // Cull splats behind or too close to the eye. Near-eye splats have a
     // J ~ 1/z footprint that covers the whole screen (the "big colour" blob).
     if (camPos.z >= -0.2) {
+        gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
+        return;
+    }
+
+    // Screen-size LOD against the CURRENT camera (the draw list may lag it).
+    // Same metric as the CPU pre-cull: 3 * max(scale) projected, no dilation.
+    float focalLod = uProj[1][1] * uViewportSize.y * 0.5;
+    float boundPx = 3.0 * max(inScale.x, max(inScale.y, inScale.z)) * focalLod;
+    if (uProj[3][3] < 0.5) boundPx /= -camPos.z;
+    if (uMinPx > 0.0 && boundPx < uMinPx) {
         gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
         return;
     }
@@ -300,17 +317,31 @@ void main() {
     float invDet = 1.0 / det;
     vConic = vec3(covC * invDet, -covB * invDet, covA * invDet);
 
-    float mid = 0.5 * (covA + covC);
-    float lambda = sqrt(max(0.1, mid * mid - det));
-    float radius = ceil(3.0 * sqrt(max(mid + lambda, mid - lambda)));
-    // A footprint larger than the viewport is off-screen work with no benefit.
-    radius = min(radius, max(uViewportSize.x, uViewportSize.y));
+    // Visible extent in sigmas: 3 for opaque splats, less for faint ones (alpha =
+    // opacity * exp(-0.5 d^2) drops below 1/255 at d = sqrt(2 ln(255 opacity))).
+    float extent = min(3.0, sqrt(2.0 * log(max(255.0 * inOpacity, 1.0001))));
+    // Tight quad: half-extents of the ellipse's bounding box per axis, instead
+    // of a square of the largest radius. Thin splats cover far fewer pixels.
+    vec2 halfPx = max(ceil(extent * sqrt(vec2(covA, covC))), vec2(1.0));
+    // Giant footprints (camera inside or right against a splat) are dropped,
+    // not clamped: clamping the quad cuts the Gaussian off at the quad edge and
+    // shows as hard-edged rectangles. Limit: one viewport (larger side).
+    if (max(halfPx.x, halfPx.y) > max(uViewportSize.x, uViewportSize.y)) {
+        gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
+        return;
+    }
 
     vec4 clipPos = uProj * camPos;
     vec2 pointCenter = clipPos.xy / clipPos.w;
-    vec2 offset = inQuadCorner * radius * 2.0 / uViewportSize;
+    // Frustum: skip quads entirely outside the screen (current camera).
+    vec2 radiusNdc = halfPx * 2.0 / uViewportSize;
+    if (any(greaterThan(abs(pointCenter), vec2(1.0) + radiusNdc))) {
+        gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
+        return;
+    }
+    vec2 offset = inQuadCorner * radiusNdc;
 
-    vCoord = inQuadCorner * radius;
+    vCoord = inQuadCorner * halfPx;
     gl_Position = vec4(pointCenter + offset, clipPos.z / clipPos.w, 1.0);
 }
 )GLSL";

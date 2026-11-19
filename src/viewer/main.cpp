@@ -663,7 +663,8 @@ int main(int argc, char** argv) {
         std::unique_ptr<PointRenderer> renderer;
         std::unique_ptr<SplatRenderer> splatRenderer;
         pf::SplatCloudData splatData;
-        std::string dir;                  // source file/folder (shared by clouds
+        pf::SplatUpAxis splatAxis = pf::SplatUpAxis::ZUp;   // convention splatData is currently in
+        std::string dir;                // source file/folder (shared by clouds
                                           // from one multi-cloud package)
         std::string pkgPrefix;            // "clouds/<i>/" for a multi-cloud
                                           // package member; empty otherwise
@@ -883,7 +884,9 @@ int main(int argc, char** argv) {
 
     // ---- tunables (persisted in pfview_config.txt) -------------------------
     float pointSize   = 2.0f;
-    float splatMinPx  = 0.5f;   // splat LOD: skip splats smaller than this on screen (px)
+    float splatMinPx  = 0.5f;   // splat LOD: skip splats smaller than this on screen (px); 0 = LOD off
+    bool  splatCpuCull = false; // splat: pre-cull the draw list on the sort thread (may gap on fast turns)
+    int   splatUpAxis = (int)pf::SplatUpAxis::YDown;   // "up" in splat files (3DGS default: Y down)
     float sseBudget   = 1.5f;   // pixels; smaller = more detail loaded
     int   gpuBudgetMB = 1024;
     bool  roundPoints = true;
@@ -1031,6 +1034,9 @@ int main(int argc, char** argv) {
         FILE* f = fopen(configPath.c_str(), "w");
         if (!f) return;
         fprintf(f, "pointSize=%f\n", pointSize);
+        fprintf(f, "splatUpAxis=%d\n", splatUpAxis);
+        fprintf(f, "splatMinPx=%f\n", splatMinPx);
+        fprintf(f, "splatCpuCull=%d\n", (int)splatCpuCull);
         fprintf(f, "sseBudget=%f\n", sseBudget);
         fprintf(f, "gpuBudgetMB=%d\n", gpuBudgetMB);
         fprintf(f, "uploadsPerFrame=%d\n", uploadsPerFrame);
@@ -1090,6 +1096,9 @@ int main(int argc, char** argv) {
         while (fgets(line, sizeof(line), f)) {
             float f1, f2, f3; int i;
             if (sscanf(line, "pointSize=%f", &f1) == 1) pointSize = f1;
+            else if (sscanf(line, "splatUpAxis=%d", &i) == 1) splatUpAxis = std::clamp(i, 0, 2);
+            else if (sscanf(line, "splatMinPx=%f", &f1) == 1) splatMinPx = std::clamp(f1, 0.0f, 4.0f);
+            else if (sscanf(line, "splatCpuCull=%d", &i) == 1) splatCpuCull = (i != 0);
             else if (sscanf(line, "sseBudget=%f", &f1) == 1) sseBudget = f1;
             else if (sscanf(line, "gpuBudgetMB=%d", &i) == 1) gpuBudgetMB = i;
             else if (sscanf(line, "uploadsPerFrame=%d", &i) == 1) uploadsPerFrame = i;
@@ -1577,6 +1586,9 @@ int main(int argc, char** argv) {
                             pf::logError("Could not load Gaussian Splat from package " + d + " [" + splatKey + "]");
                             return false;
                         }
+                        // Loaders return the file as stored; turn it upright for the Z-up world.
+                        pf::reorientSplats(cloud.splatData, pf::SplatUpAxis::ZUp, (pf::SplatUpAxis)splatUpAxis);
+                        cloud.splatAxis = (pf::SplatUpAxis)splatUpAxis;
 
                         cloud.splatRenderer->upload(cloud.splatData);
 
@@ -1603,6 +1615,9 @@ int main(int argc, char** argv) {
                     pf::logError("Could not load Gaussian Splat from " + d);
                     return false;
                 }
+                // Loaders return the file as stored; turn it upright for the Z-up world.
+                pf::reorientSplats(cloud.splatData, pf::SplatUpAxis::ZUp, (pf::SplatUpAxis)splatUpAxis);
+                cloud.splatAxis = (pf::SplatUpAxis)splatUpAxis;
 
                 cloud.splatRenderer->upload(cloud.splatData);
 
@@ -1730,7 +1745,20 @@ int main(int argc, char** argv) {
         Vec3d minB( 1e30,  1e30,  1e30);
         Vec3d maxB(-1e30, -1e30, -1e30);
         for (const auto& cloud : scene) {
-            if (!cloud.visible || !cloud.store) continue;
+            if (!cloud.visible) continue;
+            if (cloud.type == CloudType::GaussianSplat && cloud.splatData.ok) {
+                // Splat positions are drawn relative to their centre at worldOffset.
+                const Vec3d& c = cloud.splatData.center;
+                const glm::dvec3& o = cloud.worldOffset;
+                minB.x = std::min(minB.x, cloud.splatData.boxMin.x - c.x + o.x);
+                minB.y = std::min(minB.y, cloud.splatData.boxMin.y - c.y + o.y);
+                minB.z = std::min(minB.z, cloud.splatData.boxMin.z - c.z + o.z);
+                maxB.x = std::max(maxB.x, cloud.splatData.boxMax.x - c.x + o.x);
+                maxB.y = std::max(maxB.y, cloud.splatData.boxMax.y - c.y + o.y);
+                maxB.z = std::max(maxB.z, cloud.splatData.boxMax.z - c.z + o.z);
+                continue;
+            }
+            if (!cloud.store) continue;
             double cs = cloud.store->cube(cloud.store->rootIndex()).size;
             glm::dvec3 ctr = cloud.worldOffset;
             minB.x = std::min(minB.x, ctr.x - cs * 0.5);
@@ -3143,6 +3171,7 @@ int main(int argc, char** argv) {
                             glm::mat4 model = glm::translate(glm::mat4(1.0f), glm::vec3(cloud.worldOffset));
                             glm::mat4 cloudView = cam.view() * model;
                             cloud.splatRenderer->minPixelRadius = splatMinPx;
+                            cloud.splatRenderer->cpuCull = splatCpuCull;
                             cloud.splatRenderer->draw(cam.proj(), cloudView, glm::vec2((float)vpW, (float)vpH));
                         }
                         continue;
@@ -4180,6 +4209,15 @@ int main(int argc, char** argv) {
                                         prettyCount(activeStore().meta().pointCount).c_str(),
                                         prettyCount(activeStore().meta().nodeCount).c_str());
                             ImGui::Text("Cube size: %.1f m", activeStore().meta().cubeSize);
+                        } else if (splatActive) {
+                            // Splat clouds have no OctreeStore: report from the parsed file.
+                            const SceneCloud& c = activeCloud();
+                            const std::string label = c.name.empty() ? baseName(c.dir) : c.name;
+                            ImGui::Text("%s", label.c_str());
+                            ImGui::SetItemTooltip("%s", c.dir.c_str());
+                            ImGui::Text("%s Gaussian splats", prettyCount(c.splatData.count()).c_str());
+                            const Vec3d d = c.splatData.boxMax - c.splatData.boxMin;
+                            ImGui::Text("Extent: %.1f x %.1f x %.1f m", d.x, d.y, d.z);
                         } else {
                             ImGui::TextDisabled("No cloud loaded.");
                             ImGui::TextWrapped("Open a converted octree or convert a scan to begin.");
@@ -4194,12 +4232,50 @@ int main(int argc, char** argv) {
                         if (splatActive) {
                             const SplatRenderer& sr = *activeCloud().splatRenderer;
                             ImGui::TextDisabled("Gaussian splats: colour and shape come from the file.");
-                            ImGui::Text("Visible:  %s / %s", prettyCount(sr.timings().visible).c_str(),
+                            ImGui::Text("Draw list:  %s / %s", prettyCount(sr.timings().visible).c_str(),
                                         prettyCount(sr.splatCount()).c_str());
-                            if (ImGui::SliderFloat("Min splat size (px)", &splatMinPx, 0.0f, 4.0f, "%.2f"))
+                            ImGui::SetItemTooltip("Splats sent to the GPU. Off-screen and (with LOD) sub-pixel\n"
+                                                  "splats are then culled per frame on the GPU.");
+                            // Up axis of splat files. Applies to every splat cloud and is
+                            // remembered for the next file.
+                            const char* upAxes[] = { "Y down (3DGS / COLMAP)", "Y up (glTF / OpenGL)", "Z up (as stored)" };
+                            if (ImGui::Combo("Up axis", &splatUpAxis, upAxes, IM_ARRAYSIZE(upAxes))) {
+                                const auto newAxis = (pf::SplatUpAxis)splatUpAxis;
+                                for (SceneCloud& c : scene) {
+                                    if (c.type != CloudType::GaussianSplat || !c.splatRenderer || !c.splatData.ok) continue;
+                                    pf::reorientSplats(c.splatData, c.splatAxis, newAxis);
+                                    c.splatAxis = newAxis;
+                                    c.splatRenderer->upload(c.splatData);
+                                    // The centre moved with the rotation; keep the cloud placed by it.
+                                    const glm::dvec3 ctr(c.splatData.center.x, c.splatData.center.y, c.splatData.center.z);
+                                    if (scene.size() == 1) sceneOrigin = ctr;
+                                    c.worldOffset = ctr - sceneOrigin;
+                                }
+                                frameAll();
                                 settingsChanged = true;
-                            ImGui::SetItemTooltip("Splats smaller than this on screen are skipped (LOD).\n"
-                                                  "0 = draw all. Higher = faster, less far-away detail.");
+                            }
+                            ImGui::SetItemTooltip("Which way is up in the splat file.\n"
+                                                  "Y down: 3DGS training output (most .ply / .splat files).\n"
+                                                  "Y up: glTF / OpenGL exports.  Z up: as stored.");
+                            // LOD on/off. splatMinPx == 0 means off (that is what is saved).
+                            static float lastLodPx = 0.5f;
+                            bool lodOn = splatMinPx > 0.0f;
+                            if (ImGui::Checkbox("LOD (skip sub-pixel splats)", &lodOn)) {
+                                if (lodOn) splatMinPx = lastLodPx > 0.0f ? lastLodPx : 0.5f;
+                                else { lastLodPx = splatMinPx; splatMinPx = 0.0f; }
+                                settingsChanged = true;
+                            }
+                            ImGui::SetItemTooltip("Off = draw every splat (highest quality, slowest).");
+                            if (lodOn) {
+                                if (ImGui::SliderFloat("Min splat size (px)", &splatMinPx, 0.05f, 4.0f, "%.2f"))
+                                    settingsChanged = true;
+                                ImGui::SetItemTooltip("Splats smaller than this on screen are skipped.\n"
+                                                      "Higher = faster, less far-away detail.");
+                            }
+                            if (ImGui::Checkbox("CPU pre-cull", &splatCpuCull)) settingsChanged = true;
+                            ImGui::SetItemTooltip("Also cull on the sort thread before drawing. Faster for very\n"
+                                                  "large clouds, but fast turns can briefly show gaps.\n"
+                                                  "Off = the GPU culls every frame (no gaps).");
                         } else {
                             const char* quals[] = { "Low", "Medium", "High", "Ultra" };
                             if (ImGui::Combo("Quality", &qualityIdx, quals, IM_ARRAYSIZE(quals))) {
@@ -4666,7 +4742,7 @@ int main(int argc, char** argv) {
                         ImGui::Text("Frame time:     %.2f ms  (%.0f FPS)", dt * 1000.0f, dt > 0 ? 1.0f / dt : 0.0f);
                         ImGui::Text("GPU draw:       %.2f ms", t.gpuMs);
                         ImGui::Text("CPU submit:     %.2f ms", t.drawCpuMs);
-                        ImGui::Text("Visible:        %s / %s", prettyCount(t.visible).c_str(),
+                        ImGui::Text("Draw list:      %s / %s", prettyCount(t.visible).c_str(),
                                     prettyCount(sr.splatCount()).c_str());
                         ImGui::Text("Sort (thread):  %.2f ms  %s", t.sortMs,
                                     t.sortedThisFrame ? "(new list this frame)" : "(no new list)");
@@ -6007,10 +6083,18 @@ int main(int argc, char** argv) {
                     // scene-wide; per-cloud numbers live in the Scene panel).
                     double totalMB = 0;
                     uint64_t totalPts = 0;
+                    uint64_t shownPts = drawnPoints;   // octree points drawn + splats listed
                     if (octreeLoaded) {
                         size_t totalPend = 0;
                         for (auto& s : scene) {
-                            if (!s.store || !s.renderer) continue;   // splat clouds have neither
+                            if (s.splatRenderer && s.splatRenderer->isReady()) {
+                                // Splat clouds: resident GPU data + splat count.
+                                totalMB += s.splatRenderer->gpuBytes() / 1048576.0;
+                                totalPts += s.splatRenderer->splatCount();
+                                if (s.visible) shownPts += s.splatRenderer->timings().visible;
+                                continue;
+                            }
+                            if (!s.store || !s.renderer) continue;
                             totalMB += s.renderer->residentBytes() / 1048576.0;
                             totalPts += s.store->meta().pointCount;
                             totalPend += s.store->pendingRequests();
@@ -6035,7 +6119,7 @@ int main(int argc, char** argv) {
                     if (octreeLoaded) {
                         snprintf(stats, sizeof(stats), "GPU %.0f MB   %s / %s pts   %.0f FPS   v" PF_VERSION_STRING,
                                  totalMB,
-                                 prettyCount(drawnPoints).c_str(),
+                                 prettyCount(shownPts).c_str(),
                                  prettyCount(totalPts).c_str(),
                                  dt > 0 ? 1.0f / dt : 0.0f);
                     } else {

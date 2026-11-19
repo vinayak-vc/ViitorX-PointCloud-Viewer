@@ -363,4 +363,50 @@ SplatCloudData SplatReader::loadPlyGaussians(const std::string& path) {
     return res;
 }
 
+namespace {
+// Rotation about +X (right-handed) that takes the file frame to the viewer's
+// Z-up frame for each convention: Y down -> -90 deg, Y up -> +90 deg, Z up -> 0.
+int upAxisAngleDeg(SplatUpAxis a) {
+    switch (a) {
+    case SplatUpAxis::YDown: return -90;
+    case SplatUpAxis::YUp:   return 90;
+    default:                 return 0;
+    }
+}
+} // namespace
+
+void reorientSplats(SplatCloudData& data, SplatUpAxis from, SplatUpAxis to) {
+    // Net rotation about X; multiples of 90 deg, so use exact sin/cos.
+    int deg = (upAxisAngleDeg(to) - upAxisAngleDeg(from)) % 360;
+    if (deg < 0) deg += 360;
+    if (deg == 0 || data.splats.empty()) return;
+    const double c = (deg == 180) ? -1.0 : 0.0;
+    const double s = (deg == 90) ? 1.0 : (deg == 270 ? -1.0 : 0.0);
+    // Quaternion of the same rotation: (cos t/2, sin t/2, 0, 0).
+    const double half = deg * 0.5 * 3.14159265358979323846 / 180.0;
+    const double qw = std::cos(half), qx = std::sin(half);
+
+    Vec3d bmin(1e30, 1e30, 1e30), bmax(-1e30, -1e30, -1e30);
+    for (GaussianSplat& g : data.splats) {
+        // Position: y' = c y - s z, z' = s y + c z.
+        const double y = g.position.y, z = g.position.z;
+        g.position.y = c * y - s * z;
+        g.position.z = s * y + c * z;
+
+        // Orientation: q' = qR * q  (stored as w, x, y, z).
+        const double w1 = g.quaternion[0], x1 = g.quaternion[1], y1 = g.quaternion[2], z1 = g.quaternion[3];
+        g.quaternion[0] = static_cast<float>(qw * w1 - qx * x1);
+        g.quaternion[1] = static_cast<float>(qw * x1 + qx * w1);
+        g.quaternion[2] = static_cast<float>(qw * y1 - qx * z1);
+        g.quaternion[3] = static_cast<float>(qw * z1 + qx * y1);
+
+        bmin.x = std::min(bmin.x, g.position.x); bmax.x = std::max(bmax.x, g.position.x);
+        bmin.y = std::min(bmin.y, g.position.y); bmax.y = std::max(bmax.y, g.position.y);
+        bmin.z = std::min(bmin.z, g.position.z); bmax.z = std::max(bmax.z, g.position.z);
+    }
+    data.boxMin = bmin;
+    data.boxMax = bmax;
+    data.center = (bmin + bmax) * 0.5;   // same centring as the loaders
+}
+
 } // namespace pf

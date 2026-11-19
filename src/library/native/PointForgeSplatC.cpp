@@ -219,6 +219,14 @@ PF_API int32_t PF_Splat_LastVisibleCount(PFSplatCloud* cloud) {
     return cloud ? cloud->lastVisible : 0;
 }
 
+PF_API int64_t PF_Splat_CopyGpuRecords(PFSplatCloud* cloud, PFSplatGpuRecord* out, int64_t capacity) {
+    if (!cloud || !out || capacity <= 0) return 0;
+    static_assert(sizeof(PFSplatGpuRecord) == sizeof(SplatHot), "GPU record must mirror SplatHot");
+    const int64_t n = std::min<int64_t>(capacity, static_cast<int64_t>(cloud->hot.size()));
+    std::memcpy(out, cloud->hot.data(), static_cast<size_t>(n) * sizeof(SplatHot));
+    return n;
+}
+
 PF_API int32_t PF_Splat_Update(PFSplatCloud* cloud, const PFSplatCamera* cam,
                                PFSplatInstance* out, int32_t capacity) {
     if (!cloud || !cam || !out || capacity <= 0) return 0;
@@ -249,9 +257,14 @@ PF_API int32_t PF_Splat_Update(PFSplatCloud* cloud, const PFSplatCamera* cam,
 
     const Planes frustum = extractPlanes(vp);
 
+    // Walk NEAR to far so that, when more splats are visible than `cap`, the
+    // nearest ones are kept and the farthest (smallest on screen) are dropped.
+    // The output is reversed at the end to restore back-to-front draw order.
+    // (Walking far-to-near and stopping at cap dropped the foreground instead.)
     int32_t written = 0;
     int32_t visible = 0;
-    for (const SplatHot& h : c.sorted) {
+    for (auto it = c.sorted.rbegin(); it != c.sorted.rend(); ++it) {
+        const SplatHot& h = *it;
         if (written >= cap) break;
         const float r = h.radius;
         const float px0 = h.p[0], py0 = h.p[1], pz0 = h.p[2];
@@ -311,8 +324,11 @@ PF_API int32_t PF_Splat_Update(PFSplatCloud* cloud, const PFSplatCamera* cam,
 
         const float mid = 0.5f * (covA + covC);
         const float lambda = std::sqrt(std::max(0.1f, mid * mid - det));
-        float radiusPx = std::ceil(3.0f * std::sqrt(std::max(mid + lambda, mid - lambda)));
-        radiusPx = std::min(radiusPx, maxViewport);
+        const float radiusPx = std::ceil(3.0f * std::sqrt(std::max(mid + lambda, mid - lambda)));
+        // Drop giant footprints (camera inside / against the splat) instead of
+        // clamping: a clamped quad cuts the Gaussian off at its edge, which shows
+        // as hard-edged rectangles. Up to 2x the viewport the full quad is kept.
+        if (radiusPx > 2.0f * maxViewport) continue;
 
         const glm::vec4 clip = proj * pc;
         if (clip.w == 0.0f) continue;
@@ -337,6 +353,9 @@ PF_API int32_t PF_Splat_Update(PFSplatCloud* cloud, const PFSplatCamera* cam,
         o.color[2] = h.col[2];
         o.color[3] = h.col[3];
     }
+
+    // Collected near-to-far; callers blend in array order, so flip to back-to-front.
+    std::reverse(out, out + written);
 
     c.lastVisible = visible;
     return written;

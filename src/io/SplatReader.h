@@ -34,6 +34,20 @@ enum class SplatFileFormat {
     PlyGaussians   // 3DGS .ply format
 };
 
+// Which way is "up" in a splat file. The viewer's world is right-handed Z-up,
+// so YDown / YUp are proper rotations about X (no mirroring).
+enum class SplatUpAxis : int {
+    YDown = 0,   // 3DGS / COLMAP training output: x right, y down, z forward (most .ply / .splat)
+    YUp   = 1,   // glTF / OpenGL: x right, y up, z towards the viewer
+    ZUp   = 2,   // right-handed Z up (already the viewer's frame; no change)
+};
+
+// Re-orients a loaded cloud from one up-axis convention to another: rotates
+// positions and per-splat orientation quaternions (scales are local, so they
+// follow the quaternion), then recomputes the bounds and centre. Loaders always
+// return the file as stored, which is the ZUp (identity) frame.
+void reorientSplats(SplatCloudData& data, SplatUpAxis from, SplatUpAxis to);
+
 class SplatReader {
 public:
     // Auto-detect format by extension/header and parse whole dataset

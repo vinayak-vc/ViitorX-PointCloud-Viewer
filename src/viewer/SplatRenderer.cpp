@@ -68,6 +68,7 @@ void SplatRenderer::clear() {
     fullOrder_.clear();
     workIdx_.clear();
     workerHasOrder_ = false;
+    publishedFullOrder_ = false;
     {
         std::lock_guard<std::mutex> lk(mtx_);
         resultIdx_.clear();
@@ -129,6 +130,7 @@ void SplatRenderer::upload(const SplatCloudData& data) {
     // Stop the sort thread from reading the old arrays before we replace them.
     waitForWorkerIdle();
     workerHasOrder_ = false;
+    publishedFullOrder_ = false;
 
     const size_t n = data.splats.size();
     positions_.resize(n);
@@ -214,15 +216,29 @@ void SplatRenderer::sortFull(const glm::vec3& zAxis) {
     workerHasOrder_ = true;
 }
 
-// Build the visible, back-to-front draw list. Runs on the sort thread.
-void SplatRenderer::computeJob(const Job& job, std::vector<uint32_t>& out) {
+// Build the back-to-front draw list. Runs on the sort thread.
+bool SplatRenderer::computeJob(const Job& job, std::vector<uint32_t>& out) {
     // Re-sort only when the view direction changed; otherwise reuse the order.
+    bool resorted = false;
     if (!workerHasOrder_ || glm::dot(job.zAxis, workerDir_) <= 0.9999f) {
         sortFull(job.zAxis);
+        resorted = true;
     }
 
-    // Keep splats whose bounding sphere touches all six frustum planes AND whose
-    // projected radius is at least minPx (screen-size LOD).
+    if (!job.cull) {
+        // Full order: the vertex shader culls against the CURRENT camera, so a
+        // list that lags the camera never drops on-screen splats.
+        if (!resorted && publishedFullOrder_) return false;   // nothing new to upload
+        out = fullOrder_;
+        publishedFullOrder_ = true;
+        return true;
+    }
+    publishedFullOrder_ = false;
+
+    // Pre-cull: keep splats whose bounding sphere touches all six (guard-banded)
+    // frustum planes AND whose projected radius is at least minPx. The planes
+    // and minPx are deliberately generous (see draw()); the shader does the
+    // exact test.
     out.clear();
     for (uint32_t i : fullOrder_) {
         const glm::vec3& p = positions_[i];
@@ -249,6 +265,7 @@ void SplatRenderer::computeJob(const Job& job, std::vector<uint32_t>& out) {
         }
         out.push_back(i);
     }
+    return true;
 }
 
 void SplatRenderer::workerLoop() {
@@ -263,13 +280,15 @@ void SplatRenderer::workerLoop() {
         lk.unlock();
 
         const auto t0 = SteadyClock::now();
-        computeJob(job, workIdx_);
+        const bool changed = computeJob(job, workIdx_);
         const double ms = msSince(t0);
 
         lk.lock();
-        std::swap(resultIdx_, workIdx_);   // publish the finished draw list
-        resultReady_ = true;
-        resultMs_ = ms;
+        if (changed) {
+            std::swap(resultIdx_, workIdx_);   // publish the finished draw list
+            resultReady_ = true;
+            resultMs_ = ms;
+        }
         busy_ = false;
         cv_.notify_all();
     }
@@ -298,10 +317,12 @@ void SplatRenderer::draw(const glm::mat4& proj, const glm::mat4& view, const glm
         timings_.sortedThisFrame = true;
     }
     timings_.visible = mainIdx_.size();
-    if (mainIdx_.empty()) return;
 
     // 2) Submit a job when the camera moved and the worker is free. The
     //    matrix is cloud space (view includes the cloud's model offset).
+    //    This must run even when the current list is empty: an empty list
+    //    (e.g. after looking at empty space with cpuCull on) would otherwise
+    //    never be replaced and the view would stay blank.
     const glm::mat4 vp = proj * view;
     if (!haveLastVP_ || vp != lastVP_) {
         Job job;
@@ -309,13 +330,21 @@ void SplatRenderer::draw(const glm::mat4& proj, const glm::mat4& view, const glm
         job.depthRow = glm::vec4(view[0][2], view[1][2], view[2][2], view[3][2]);
         job.focalPx = proj[1][1] * viewportSize.y * 0.5f;   // same focal as the shader
         job.ortho = proj[3][3] > 0.5f;
-        job.minPx = minPixelRadius;
+        job.cull = cpuCull;
+        // The list lags the camera, so pre-cull generously: half the LOD
+        // threshold and a frustum widened by kGuard (the shader is exact).
+        job.minPx = minPixelRadius * 0.5f;
+        constexpr float kGuard = 1.75f;
+        glm::mat4 guardProj = proj;
+        guardProj[0][0] /= kGuard;
+        guardProj[1][1] /= kGuard;
+        const glm::mat4 cullVp = guardProj * view;
 
-        // Gribb-Hartmann frustum planes from the rows of vp.
-        const glm::vec4 row0(vp[0][0], vp[1][0], vp[2][0], vp[3][0]);
-        const glm::vec4 row1(vp[0][1], vp[1][1], vp[2][1], vp[3][1]);
-        const glm::vec4 row2(vp[0][2], vp[1][2], vp[2][2], vp[3][2]);
-        const glm::vec4 row3(vp[0][3], vp[1][3], vp[2][3], vp[3][3]);
+        // Gribb-Hartmann frustum planes from the rows of the guard-banded vp.
+        const glm::vec4 row0(cullVp[0][0], cullVp[1][0], cullVp[2][0], cullVp[3][0]);
+        const glm::vec4 row1(cullVp[0][1], cullVp[1][1], cullVp[2][1], cullVp[3][1]);
+        const glm::vec4 row2(cullVp[0][2], cullVp[1][2], cullVp[2][2], cullVp[3][2]);
+        const glm::vec4 row3(cullVp[0][3], cullVp[1][3], cullVp[2][3], cullVp[3][3]);
         const glm::vec4 raw[6] = {
             row3 + row0, row3 - row0,   // left, right
             row3 + row1, row3 - row1,   // bottom, top
@@ -336,13 +365,16 @@ void SplatRenderer::draw(const glm::mat4& proj, const glm::mat4& view, const glm
         }
     }
 
-    // 3) Draw the visible splats in the current order.
+    if (mainIdx_.empty()) return;
+
+    // 3) Draw the listed splats in the current order (the shader culls).
     shader_.use();
     shader_.setInt("uData", 0);   // texture unit 0: splat data
     shader_.setInt("uIdx", 1);    // texture unit 1: draw list
     shader_.setMat4("uProj", &proj[0][0]);
     shader_.setMat4("uView", &view[0][0]);
     shader_.setVec2("uViewportSize", viewportSize.x, viewportSize.y);
+    shader_.setFloat("uMinPx", minPixelRadius);
 
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_BUFFER, dataTex_);

@@ -82,7 +82,14 @@ set(PF_OPTIONAL_DEFS "")
 # because LASZIP_INCLUDE_DIR points straight at the laszip/ folder.
 # Prefer the release static lib dir: vcpkg also exposes debug/lib, and a bare
 # find_library can latch onto the debug variant -> CRT mismatch in a Release exe.
-set(_PF_REL_LIB "${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/lib")
+# Use vcpkg's own installed dir: a build dir can point VCPKG_INSTALLED_DIR at
+# another tree (e.g. a shared one), and then <binary dir>/vcpkg_installed does
+# not exist, the release search misses, and the fallback finds debug/lib.
+if(DEFINED VCPKG_INSTALLED_DIR AND NOT VCPKG_INSTALLED_DIR STREQUAL "")
+    set(_PF_REL_LIB "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/lib")
+else()
+    set(_PF_REL_LIB "${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/lib")
+endif()
 find_path(LASZIP_INCLUDE_DIR NAMES laszip_api.h PATH_SUFFIXES laszip)
 # Release-only first (NO_DEFAULT_PATH skips vcpkg's CMAKE_PREFIX_PATH, which also
 # lists debug/lib and would otherwise win); fall back to a normal search.
@@ -272,6 +279,37 @@ if(PF_BUILD_UNITY_PLUGIN)
         endif()
     endif()
     set_target_properties(pfunity PROPERTIES OUTPUT_NAME "PointForgeUnity" PREFIX "")
+endif()
+
+# ---------------------------------------------------------------------------
+# PointForgeNative — engine-agnostic native DLL (consumed by the Unreal plugin
+# via runtime LoadLibrary). Superset of pfunity: the same octree C API
+# (PointForgeC.h) PLUS the Gaussian-splat C API (PointForgeSplatC.h:
+# PF_Splat_Open/Update/GetInfo/Close/LastVisibleCount). Like pfunity it does
+# NOT link pfcore (no laszip/E57/SDL/GL/ImGui). Build with the
+# x64-windows-static triplet for a self-contained, KERNEL32-class-only DLL.
+# PackageFormat.cpp pulls winhttp/bcrypt via #pragma comment(lib).
+# ---------------------------------------------------------------------------
+option(PF_BUILD_NATIVE_DLL "Build the PointForgeNative DLL (octree + splat C API)" ON)
+if(PF_BUILD_NATIVE_DLL)
+    add_library(PointForgeNative SHARED
+        src/library/unity/PointForgeC.cpp
+        src/library/native/PointForgeSplatC.cpp
+        src/viewer/OctreeStore.cpp
+        src/io/SplatReader.cpp
+        src/io/PackageFormat.cpp
+        src/common/Log.cpp
+    )
+    target_include_directories(PointForgeNative PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(PointForgeNative PRIVATE glm::glm Threads::Threads)
+    if(PF_ZSTD_LIB)
+        target_link_libraries(PointForgeNative PRIVATE ${PF_ZSTD_LIB})
+        target_compile_definitions(PointForgeNative PRIVATE PF_WITH_ZSTD)
+        if(PF_ZSTD_INC)
+            target_include_directories(PointForgeNative PRIVATE ${PF_ZSTD_INC})
+        endif()
+    endif()
+    set_target_properties(PointForgeNative PROPERTIES PREFIX "")
 endif()
 
 # ---------------------------------------------------------------------------
