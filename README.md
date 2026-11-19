@@ -2,7 +2,8 @@
 
 An out-of-core point cloud **importer + viewer**, built to ingest very large point
 clouds (LAS/LAZ, E57, PLY, PTS/XYZ) — including data sets far larger than RAM
-(billions of points) — and to display them interactively.
+(billions of points) — and to display them interactively. The viewer also
+renders **3D Gaussian Splats** (3DGS `.ply`, `.splat`, `.vxpc`).
 
 It deliberately mirrors the technology stack of *Axiom Present*:
 
@@ -28,7 +29,12 @@ PointForge is split into two programs that share a common core (`pfcore`):
   is bounded regardless of input size.
 * **`pfview`** (built as `ViitorXPCViewer.exe`) — the *viewer*. Streams octree
   nodes on demand using frustum culling and screen-space-error LOD selection,
-  so only the visible/relevant detail is ever resident on the GPU.
+  so only the visible/relevant detail is ever resident on the GPU. Also draws
+  Gaussian splat clouds (see §3, *Gaussian splats*).
+
+A third target, **`PointForgeNative.dll`**, exposes the octree reader and a
+Gaussian-splat API as a flat C interface for engine integrations (the Unreal
+plugin *PointForge Viewer* uses it). See §2, *Native DLL*.
 
 The viewer can also start from **plain photos** (drone/camera): the Convert
 wizard reconstructs a point cloud with an external photogrammetry engine
@@ -79,6 +85,27 @@ exe for the dynamic build only).
 Watch the configure output for `-- LASzip: ...` and `-- libE57Format: ...` to
 confirm those readers were detected; if a library is missing, the project
 still builds — that reader becomes a graceful stub instead of a hard failure.
+
+### Native DLL (`PointForgeNative.dll`)
+
+Built with the rest of the project (CMake option `PF_BUILD_NATIVE_DLL`, on by
+default). To build just the DLL:
+
+```powershell
+cmake --build build --config Release --target PointForgeNative
+```
+
+Headers: `src/library/unity/PointForgeC.h` (octree API) and
+`src/library/native/PointForgeSplatC.h` (splat API). The splat API opens a
+cloud (`PF_Splat_Open`), culls/sorts/projects it per camera on the calling
+thread (`PF_Splat_Update`, keeps the nearest splats when capped), and exports
+view-independent records for GPU renderers (`PF_Splat_CopyGpuRecords`). Copy the
+DLL and headers into `Plugins/PointForgeViewer/ThirdParty/PointForgeNative/` of
+the Unreal project when they change.
+
+LASzip is looked up in vcpkg's own install folder (`VCPKG_INSTALLED_DIR`), so a
+build directory that shares another vcpkg tree still links the release
+library.
 
 ### Single-file release build
 
@@ -169,6 +196,33 @@ as a background job — the dialog closes immediately, and progress shows in the
 status-bar pill and the *Jobs* panel. Dragging an already-converted octree
 **folder** onto the window loads it directly.
 
+### Gaussian splats
+
+```powershell
+ViitorXPCViewer.exe D:\scans\room.ply
+```
+
+Or drag a 3DGS `.ply` / `.splat` onto the window. Splats are loaded directly
+(no conversion). In *Properties › Display*:
+
+* **Up axis** — *Y down (3DGS / COLMAP)* (default), *Y up (glTF / OpenGL)*,
+  *Z up (as stored)*. 3DGS training output is Y down; the viewer's world is
+  Z up, so the default opens such scenes upright. Changing it re-orients the
+  loaded clouds in place and reframes.
+* **LOD** — skip splats smaller than *Min splat size* (px). Off draws every
+  splat.
+* **CPU pre-cull** (off by default) — also cull on the sort thread. Faster for
+  very large clouds; very fast turns can briefly show gaps.
+
+These settings are saved. **F** frames splat clouds like point clouds.
+
+How it renders: splat records are uploaded once; a background thread keeps a
+back-to-front draw order (re-sorted when the view direction changes); the
+vertex shader culls against the current camera every frame, so a lagging sort
+never leaves holes. Each splat is drawn as a quad sized to its ellipse (and to
+its visible extent for faint splats). Splats larger than the screen (camera
+inside them) are skipped.
+
 Controls:
 
 | Input                  | Action                                    |
@@ -207,9 +261,13 @@ PointForge/
     project-overview.md, roadmap.md, tasks.md, decisions.md, ai_handoff.md
   src/
     common/      Vec3d, AABB, Point, PointFormat, OctreeFormat, Log (+ setLogSink)
-    io/          PointReader interface + LAS/E57/PLY/text readers + factory
+    io/          PointReader interface + LAS/E57/PLY/text readers + factory;
+                 SplatReader (3DGS .ply / .splat, up-axis conversion)
+    library/
+      unity/     PointForgeC.h — flat C octree API
+      native/    PointForgeSplatC.h — flat C Gaussian-splat API (PointForgeNative.dll)
     indexer/     out-of-core octree builder (chunking + sampling + writer)
-    viewer/      Camera, Shader, OctreeStore, PointRenderer, Controller,
+    viewer/      Camera, Shader, OctreeStore, PointRenderer, SplatRenderer, Controller,
                  SerialController, Jobs.h (background convert job queue),
                  UiLog.h (Console panel log buffer), main.cpp (docked UI shell)
     tools/
