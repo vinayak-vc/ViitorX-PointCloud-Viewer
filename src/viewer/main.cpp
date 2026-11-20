@@ -1082,6 +1082,7 @@ int main(int argc, char** argv) {
         fprintf(f, "r360Colmap=%s\n", recon360Settings.colmapExe.c_str());
         fprintf(f, "r360Ffmpeg=%s\n", recon360Settings.ffmpegExe.c_str());
         fprintf(f, "r360Ffprobe=%s\n", recon360Settings.ffprobeExe.c_str());
+        fprintf(f, "r360MaskModel=%s\n", recon360Settings.maskModelDir.c_str());
         for (const auto& r : recentDirs) {
             auto it = recentMeta.find(r);
             uint64_t p = it != recentMeta.end() ? it->second.points : 0;
@@ -1164,6 +1165,7 @@ int main(int argc, char** argv) {
                     else if (k == "r360Colmap") recon360Settings.colmapExe = v;
                     else if (k == "r360Ffmpeg") recon360Settings.ffmpegExe = v;
                     else if (k == "r360Ffprobe") recon360Settings.ffprobeExe = v;
+                    else if (k == "r360MaskModel") recon360Settings.maskModelDir = v;
                 }
             }
             else if (strncmp(line, "recent=", 7) == 0) {

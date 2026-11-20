@@ -46,6 +46,7 @@ STAGES = (
     "video_validation",
     "frame_extraction",
     "panorama_projection",
+    "masking",
     "camera_reconstruction",
     "training",
     "export",

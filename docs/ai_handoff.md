@@ -1,5 +1,14 @@
 # AI Handoff - PointForge (C++ repo)
 
+## Session (2026-11-21) - 360 Studio: real GPU run + automatic masking (branch `splat-generator`)
+
+- **Installed (this machine)**: pf360 env (Python 3.10, torch 2.1.2+cu118, nerfstudio 1.1.5, **prebuilt** gsplat 1.4.0+pt21cu118, setuptools 69.5.1), COLMAP 3.11.1 from conda-forge in `engines\colmap-conda`, masking add-on (transformers 4.46.3 + `upernet-convnext-base-ade20k`). CAVEAT: installed from inside the Claude desktop app, so Windows put them in `%LOCALAPPDATA%\Packages\Claude_pzs8sxrjxfjjc\LocalCache\Local\ViitorX\PointForge\engines` — copy that `ViitorX` folder to the real `%LOCALAPPDATA%` from a normal PowerShell before using PointForge started from Explorer.
+- **Real-run fixes**: worker runs COLMAP itself with fixed PINHOLE intrinsics + largest model (was 2/240 registered, now 240/240); doctor checks COLMAP CLI compatibility (SiftExtraction.*); worker imports MSVC 14.3x + CUDA_HOME and caps MAX_JOBS for any gsplat JIT; setup pins setuptools<70, imports vcvars, installs the prebuilt gsplat wheel.
+- **Masking** (new stage `masking` between projection and COLMAP): `ns_helpers/mask.py` (segment / attach / overlay / self-test), manifest `processing.masking {enabled, groups[people|vehicles|animals|sky], dilatePx}`, COLMAP `--ImageReader.mask_path`, Splatfacto `mask_path` + `masks_2/4/8` at exact `images_N` sizes, report stats, doctor `Masking (optional)`, `pf360 mask-preview`. C++: 8 stages (`kStageCount`), `StageState::Off`, masking fields in `Recon360JobSpec`, `recon360MaskPreview`, wizard Processing > Masking (+ "Preview masks on this frame" overlay), Preferences "Masking model" path (`r360MaskModel`).
+- **Verified**: synthetic clip (`scripts/pf360/make_synthetic_360.py`) Preview: 259,599 Gaussians, PLY validated, loads Z-up in PointForge (camera-up = +Z checked numerically); masked run: 240 masks in ~30 s, COLMAP 240/240, 190,969 Gaussians. Segmentation checked on one real street image. Python 80/80, `pf360hosttest` 57/57, pfview builds clean (VS 18, `build-r360`).
+- **NOT verified**: real 360 footage; clicking through the new wizard controls.
+- **Next**: real footage with people/traffic; then sharp-keyframe selection + exposure compensation; interactive SAM 2.1 masks; COLMAP rigs.
+
 ## Session (2026-11-20) - 360 Reconstruction Studio: 360 video -> 3DGS PLY (branch `splat-generator`)
 
 New feature: File > **Gaussian Splat from 360 Video...** (Ctrl+R; Tools menu, palette, drop a .mp4/.mov/.mkv). Full doc: **docs/360-reconstruction.md**.

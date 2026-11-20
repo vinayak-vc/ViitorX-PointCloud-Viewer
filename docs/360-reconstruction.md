@@ -42,7 +42,8 @@ JobQueue (Jobs.h) Kind::Recon360                   video_probe  ffprobe + projec
   └ recon360Run (Recon360.cpp)                     backend.ReconstructionBackend  (extension point)
       CreateProcessW + Job Object (kill-on-close)    └ NerfstudioBackend
       stdout JSONL -> Recon360Live (stages, log)        panorama_projection  ns_helpers/planar.py
-      stderr -> Console                                 camera_reconstruction ns-process-data images
+                                                        masking (optional)   ns_helpers/mask.py
+      stderr -> Console                                 camera_reconstruction colmap (fixed PINHOLE) + ns-process-data --skip-colmap
       stdin "cancel" -> graceful stop, 20 s grace       training             ns-train splatfacto[-big]
       then TerminateJobObject                           export               ns-export gaussian-splat
 main.cpp: menu/shortcut/drop/toasts/prefs,         ply_validate  SplatReader-compatible checks
@@ -69,7 +70,8 @@ main.cpp: menu/shortcut/drop/toasts/prefs,         ply_validate  SplatReader-com
 | `video_validation` | ffprobe/ffmpeg | readable stream, supported projection (or user-confirmed), duration, GPU/CUDA + disk check |
 | `frame_extraction` | ffmpeg `-ss/-t -vf fps=N/window -frames:v N` | ≥1 frame; warns < 90 % or < 10 |
 | `panorama_projection` | Nerfstudio `equirect_utils` | expected perspective image count |
-| `camera_reconstruction` | `ns-process-data images` (COLMAP) | `transforms.json`; ≥ 30 % and ≥ 8 images registered; > 2 distinct camera positions (rotation-only capture fails); warns < 70 %, split models, missing sparse cloud |
+| `masking` (optional; `stage_skipped` with `data.enabled=false` when off) | `ns_helpers/mask.py` in the NS env: UperNet-ConvNeXt-Base ADE20K semantic segmentation per perspective view | one mask per view; warns when > 40 % masked on average or views > 60 % masked |
+| `camera_reconstruction` | COLMAP with fixed PINHOLE intrinsics (+ `--ImageReader.mask_path`), then `ns-process-data images --skip-colmap` (+ masks attached per frame) | `transforms.json`; ≥ 30 % and ≥ 8 images registered; > 2 distinct camera positions (rotation-only capture fails); warns < 70 %, split models, missing sparse cloud |
 | `training` | `ns-train splatfacto[-big]` | `config.yml` + checkpoint exist |
 | `export` | `ns-export gaussian-splat` | PLY found (requested name, else newest new `.ply`) |
 | `validation` | `pf360 validate-ply` (numpy full scan in the NS env, else sampled) | binary LE, `vertex` first, float/double only, all 3DGS attributes, count > 0, no NaN/Inf, non-degenerate bounds |
@@ -90,14 +92,15 @@ the resolved copy is stored as `<workspace>/manifest.json`.
   "input": {"videoPath": "D:/Capture/room.mp4", "projection": "equirectangular",
             "projectionConfirmed": true, "startTimeSeconds": 0, "endTimeSeconds": null},
   "processing": {"targetFrames": 90, "imagesPerEquirect": 14, "cropTop": 0, "cropBottom": 0.2,
-                 "cropLeft": 0, "cropRight": 0, "matchingMethod": "sequential"},
+                 "cropLeft": 0, "cropRight": 0, "matchingMethod": "sequential",
+                 "masking": {"enabled": true, "groups": ["people", "vehicles"], "dilatePx": 8}},
   "training": {"qualityPreset": "high", "method": "splatfacto-big", "fallbackMethod": "splatfacto",
                "iterations": 40000, "downscaleFactor": 1, "shDegree": 3, "randomSeed": 42,
                "useScaleRegularization": true,
                "cullAlphaThresh": null, "densifyGradThresh": null, "cullScaleThresh": null},
   "output": {"directory": "D:/PointForgeProjects/room", "plyFileName": "room_splat.ply", "format": "ply"},
   "environment": {"backend": "native", "nerfstudioPython": null, "colmapExe": null,
-                  "ffmpegExe": null, "ffprobeExe": null},
+                  "ffmpegExe": null, "ffprobeExe": null, "maskModelDir": null},
   "options": {"allowCache": true, "stopAfter": null}
 }
 ```
@@ -108,7 +111,14 @@ the resolved copy is stored as `<workspace>/manifest.json`.
 * Every field is type/range checked (`manifest.validate`); all problems are
   reported at once. Paths in `environment` must be existing files; the manifest
   can never inject commands or arguments.
-* `stopAfter`: `frame_extraction | panorama_projection | camera_reconstruction | training | export`.
+* `stopAfter`: `frame_extraction | panorama_projection | masking | camera_reconstruction | training | export`.
+* `processing.masking` (default off): `groups` ⊆ `people` (incl. bicycle/minibike riders),
+  `vehicles` (car, bus, truck, van, minibike, bicycle, boat, airplane, ship — parked ones too),
+  `animals`, `sky`; `dilatePx` 0–64 grows the masked regions. Masks are 8-bit PNGs, 255 keep /
+  0 ignore, named `<view>.jpg.png` (COLMAP `--ImageReader.mask_path`); for training they are
+  copied to `processed/masks*/frame_NNNNN.png` at the exact size of each `images_N` file and
+  referenced as `mask_path` in `transforms.json` (Splatfacto multiplies both rendered and
+  ground-truth images by the mask). The image-name mapping is verified by pixel comparison.
 * Crop semantics are Nerfstudio's: top/bottom remove elevation rings, left/right
   narrow the yaw span. Top+bottom combos that make Nerfstudio 1.1.5 crash are
   rejected up front (port verified identical on 1,800 combinations).
@@ -138,11 +148,11 @@ Exit codes: 0 done, 2 failed, 3 cancelled, 4 invalid manifest, 1 internal.
 
 ```
 <project>/manifest.json  state.json  source_reference.json
-         frames/frame_00001.jpg …  frames/planar_projections/*.jpg
-         processed/  (images, images_2/4/8, colmap/, transforms.json, sparse_pc.ply)
+         frames/frame_00001.jpg …  frames/planar_projections/*.jpg  frames/masks/*.png (if masking)
+         processed/  (images, images_2/4/8, masks, masks_2/4/8, colmap/, transforms.json, sparse_pc.ply)
          training/pf360/<method>/run/  (config.yml, nerfstudio_models/*.ckpt)
          export/<name>.ply
-         logs/worker.log ffmpeg.log panorama.log colmap.log training.log export.log
+         logs/worker.log ffmpeg.log panorama.log masking.log colmap.log training.log export.log
          reconstruction_report.json  reconstruction_report.txt
 ```
 
@@ -190,8 +200,19 @@ scales are logs — exactly what `SplatReader::loadPlyGaussians` expects.
    `setuptools<70` (torch 2.1 imports `pkg_resources.packaging`).
    Versions: `tools/pf360/compat.json`.
 4. Check: `scripts\pf360\doctor.ps1` or the wizard's *Full diagnostic*.
-5. First training run compiles gsplat's CUDA kernels (cached in
-   `%LOCALAPPDATA%\torch_extensions`); expect tens of minutes once.
+5. gsplat: the setup script installs the **prebuilt** `gsplat 1.4.0+pt21cu118` wheel, so
+   no CUDA compile is needed. (Falling back to the JIT build fails on Windows + CUDA 11.8.)
+6. Optional masking add-on: `powershell -ExecutionPolicy Bypass -File scripts\pf360\setup_masking.ps1`
+   — asks first, ~0.5 GB: `transformers==4.46.3` (+ safetensors, huggingface_hub) into the
+   pf360 env with torch pinned, and `openmmlab/upernet-convnext-base` (MIT, **safetensors
+   only**, pinned revision) into `engines\models\upernet-convnext-base-ade20k`. Jobs never
+   download models; the doctor reports `Masking (optional)` PASS/SKIP and the wizard
+   disables the masking controls until it is installed.
+
+> **Note when installing from inside a packaged app (e.g. the Claude desktop app):**
+> Windows may redirect that app's writes to `%LOCALAPPDATA%` into
+> `%LOCALAPPDATA%\Packages\<app>\LocalCache\Local\…`, where PointForge started normally
+> cannot see them. Run the setup scripts from a normal PowerShell window.
 
 Only the `native` execution backend is implemented. WSL2/Docker are not offered
 in the UI; `environment.backend` is the extension point for them.
@@ -211,20 +232,26 @@ in the UI; `environment.backend` is the extension point for them.
 | Low registration % | too little overlap/texture; try 14 views, more frames, or `exhaustive` matching |
 | CUDA out of memory | raise downscale factor, fewer frames, standard Splatfacto, close GPU apps |
 | Upside-down result | file not recognised as pf360 output (report moved?) — use Properties ▸ Up axis |
+| Masking controls greyed out | add-on not installed: run `setup_masking.ps1`, then *Full diagnostic* |
+| "Masking is enabled but the segmentation model is not installed" | same; or turn masking off |
+| Warning "N view(s) are more than 60% masked" | usually Sky on indoor scenes (textured ceilings can be classed as sky) or a crowd filling the view; drop that category or crop |
+| Ghosts / smeared people remain | add Vehicles, raise *Grow mask*; masks are per-view semantic segmentation, so tiny distant people can be missed |
 
 ## 10. Tests
 
-* Python: `cd tools\pf360 && python -m unittest discover -s tests -t .` — 68 tests
+* Python: `cd tools\pf360 && python -m unittest discover -s tests -t .` — 80 tests
+  (incl. masking manifest/switch/cache keys/model discovery and masked worker runs)
   (manifest, presets, Nerfstudio view-count parity, ffprobe parsing + projection
   classification, quality metrics, protocol, PLY validation incl. NaN/truncation/
   types, process-tree cancellation, Unicode/space paths, CLI flag construction
   for old/new tyro, COLMAP registration checks, export resolution, full worker
   orchestration with a fake backend incl. cache reuse/failure/cancel). Uses real
   ffmpeg/ffprobe when present (skips otherwise); no GPU.
-* C++: `pf360hosttest` (built with `PF_BUILD_TESTS`) — 46 checks: view port,
-  presets, manifest UTF-8 round trip, real worker launch + JSONL parsing, probe,
+* C++: `pf360hosttest` (built with `PF_BUILD_TESTS`) — 57 checks: view port,
+  presets, manifest UTF-8 round trip + masking fields, real worker launch + JSONL parsing, probe,
   frames-only job + cache reuse, failure propagation, cancel (worker exit 3,
-  no surviving `ffmpeg.exe`), Z-up detection.
+  no surviving `ffmpeg.exe`), Z-up detection, mask preview through the real model
+  (skipped when the add-on is absent) and rejection of invalid group strings.
 * Integration media needed for the GPU chain (not in the repo): a 20–60 s,
   ≥ 4K stitched equirectangular MP4 walked slowly through a static, textured
   room, camera at head height. Run it through the wizard with the *Preview*
@@ -234,14 +261,16 @@ in the UI; `environment.backend` is the extension point for them.
 
 | Item | Status |
 |---|---|
-| Worker CLI, manifest, protocol, cache, report, validation | tested (68 Python tests) |
-| Host launch / JSONL / cancel / Job Object | tested (pf360hosttest 46/46) |
+| Worker CLI, manifest, protocol, cache, report, validation | tested (80 Python tests) |
+| Host launch / JSONL / cancel / Job Object / mask preview | tested (pf360hosttest 57/57) |
+| Masking end to end | **done 2026-11-21** on the synthetic clip (people + sky, dilate 8): 240 masks in ~30 s on GPU, COLMAP 240/240 with masks, training with per-frame masks, 190,969 Gaussians, validated PLY. Segmentation quality checked on one real street photo (pedestrians, auto-rickshaw, truck, distant traffic masked; one tiny distant figure missed) |
 | Static release build (VS 18, MSVC 14.51) incl. `pftest` PASS | done |
 | Viewer starts and exits cleanly with the new code | done |
 | Wizard UI interaction | **not exercised** by an automated run (native SDL window) |
 | Nerfstudio projection → COLMAP → Splatfacto → export → load | **done 2026-11-21** on a *synthetic* 30 s 2880×1440 clip (`scripts/pf360/make_synthetic_360.py`), Preview preset, RTX 3060: 240/240 views registered, 30 distinct positions, 7000 its in 3.2 min, 259,599 Gaussians, validated PLY, loaded in PointForge (`--export-glb` smoke). Versions: `compat.json` |
 | Z-up orientation of a real export | **verified** on that run: camera centres vary only in X/Y, mean camera-up = +Z in export space |
-| Real-world 360 footage | **not run yet** (people/sky/moving objects untested; no masking) |
+| Real-world 360 footage | **not run yet** (masking not yet exercised on real moving people/traffic) |
+| Wizard masking controls + mask preview overlay | built; the preview call path is tested by pf360hosttest, the ImGui controls were **not clicked through** |
 
 ### Findings from the first real run (fixed)
 

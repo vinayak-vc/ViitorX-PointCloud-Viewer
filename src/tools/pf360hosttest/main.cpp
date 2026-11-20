@@ -115,6 +115,52 @@ static void testManifest(const fs::path& tmp) {
     CHECK(std::abs(j["processing"]["cropBottom"].get<double>() - 0.2) < 1e-6);
     CHECK(j["options"]["stopAfter"] == "frame_extraction");
     CHECK(!j["training"].contains("cullAlphaThresh"));                     // unset custom fields omitted
+    CHECK(j["processing"]["masking"]["enabled"] == false);                 // masking off by default
+
+    // Masking fields: groups in a fixed order, dilation clamped, enabled only with >= 1 group.
+    sp.jobId = "hosttest_manifest_mask";
+    sp.maskEnabled = true;
+    sp.maskPeople = true; sp.maskVehicles = false; sp.maskAnimals = false; sp.maskSky = true;
+    sp.maskDilatePx = 500;
+    CHECK(recon360WriteManifest(sp, st, path, err));
+    std::ifstream f2(fs::u8path(path));
+    auto j2 = nlohmann::json::parse(f2);
+    CHECK(j2["processing"]["masking"]["enabled"] == true);
+    CHECK(j2["processing"]["masking"]["groups"] == nlohmann::json::array({"people", "sky"}));
+    CHECK(j2["processing"]["masking"]["dilatePx"] == 64);
+    sp.maskPeople = sp.maskSky = false;
+    CHECK(recon360WriteManifest(sp, st, path, err));
+    std::ifstream f3(fs::u8path(path));
+    CHECK(nlohmann::json::parse(f3)["processing"]["masking"]["enabled"] == false);
+}
+
+// Mask preview through the real worker + segmentation model; skipped (not failed)
+// when the optional masking add-on is not installed on this machine.
+static void testMaskPreview() {
+    Recon360Settings st;
+    const int w = 256, h = 128;
+    std::vector<unsigned char> rgb((size_t)w * h * 3);
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x) {
+            unsigned char* p = &rgb[((size_t)y * w + x) * 3];
+            const bool sky = y < h / 2;          // blue top half, grey bottom half
+            p[0] = sky ? 110 : 120; p[1] = sky ? 160 : 120; p[2] = sky ? 230 : 120;
+        }
+    std::vector<unsigned char> ov;
+    float frac = -1;
+    std::string err;
+    const bool ok = recon360MaskPreview(st, rgb, w, h, "sky", 0, ov, frac, err);
+    if (!ok && err.find("not installed") != std::string::npos) {
+        std::printf("pf360hosttest: SKIPPED mask preview (%s)\n", err.c_str());
+        return;
+    }
+    if (!ok) std::fprintf(stderr, "mask preview error: %s\n", err.c_str());
+    CHECK(ok);
+    CHECK(ov.size() == rgb.size());
+    CHECK(frac >= 0.0f && frac <= 1.0f);
+    std::vector<unsigned char> dummy;
+    CHECK(!recon360MaskPreview(st, rgb, w, h, "people;rm -rf", 0, dummy, frac, err));   // groups validated
+    std::fprintf(stderr, "mask preview: %.1f%% masked as sky\n", frac * 100.0f);
 }
 
 static void testProbe(const fs::path& video) {
@@ -230,6 +276,7 @@ int main() {
         testRunFramesOnly(tmp, video);
         testFailurePropagation(tmp, video);
         testCancel(tmp, longVideo);
+        testMaskPreview();
     } else {
         std::printf("pf360hosttest: SKIPPED process tests (need ffmpeg on PATH and Python 3)\n");
     }

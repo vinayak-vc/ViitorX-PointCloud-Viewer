@@ -94,6 +94,11 @@ def _colmap_models(sparse_dir: Path) -> List[tuple]:
     return out
 
 
+def _masking_on(manifest: Dict[str, Any]) -> bool:
+    mk = (manifest.get("processing") or {}).get("masking") or {}
+    return bool(mk.get("enabled")) and bool(mk.get("groups"))
+
+
 def _count_images(d: Path) -> int:
     if not d.is_dir():
         return 0
@@ -125,11 +130,19 @@ class NerfstudioBackend(ReconstructionBackend):
         self._help_cache: Dict[str, str] = {}
 
     def stages(self) -> Sequence[str]:
-        return ("panorama_projection", "camera_reconstruction", "training", "export")
+        return ("panorama_projection", "masking", "camera_reconstruction", "training", "export")
+
+    def stage_enabled(self, stage: str, ctx: StageContext) -> bool:
+        if stage == "masking":
+            return _masking_on(ctx.manifest)
+        return True
 
     # ------------------------------------------------------------------ env
     def check_environment(self, tools, manifest) -> List[str]:
         p: List[str] = []
+        if _masking_on(manifest) and not tools.mask_model:
+            p.append("Masking is enabled but the segmentation model is not installed "
+                     "(run scripts\\pf360\\setup_masking.ps1, ~0.5 GB, or turn masking off).")
         if not tools.ns_python:
             p.append("No Nerfstudio Python environment found (run `python -m pf360 doctor`).")
         for t in ("ns-process-data", "ns-train", "ns-export"):
@@ -167,9 +180,15 @@ class NerfstudioBackend(ReconstructionBackend):
         if stage == "panorama_projection":
             return {"views": pr["imagesPerEquirect"],
                     "crop": [pr["cropTop"], pr["cropBottom"], pr["cropLeft"], pr["cropRight"]]}
+        if stage == "masking":
+            mk = pr.get("masking") or {}
+            if not _masking_on(ctx.manifest):
+                return {"enabled": False}
+            return {"enabled": True, "groups": sorted(mk.get("groups", [])), "dilatePx": mk.get("dilatePx", 8),
+                    "model": environment.MASK_MODEL_DIRNAME, "helper": "mask-v1"}
         if stage == "camera_reconstruction":
             return {"matching": pr["matchingMethod"], "colmap": ctx.tools.colmap, "numDownscales": 3,
-                    "sfm": "pf360-fixed-pinhole-v1"}
+                    "sfm": "pf360-fixed-pinhole-v1", "masks": _masking_on(ctx.manifest)}
         if stage == "training":
             keys = ("method", "iterations", "downscaleFactor", "shDegree", "randomSeed", "useScaleRegularization",
                     "cullAlphaThresh", "densifyGradThresh", "cullScaleThresh")
@@ -182,6 +201,9 @@ class NerfstudioBackend(ReconstructionBackend):
         ws = ctx.workspace
         if stage == "panorama_projection":
             return _count_images(ws.planar_dir) > 0
+        if stage == "masking":
+            n = _count_images(ws.planar_dir)
+            return n > 0 and ws.masks_dir.is_dir() and sum(1 for _ in ws.masks_dir.glob("*.png")) == n
         if stage == "camera_reconstruction":
             return (ws.processed_dir / "transforms.json").is_file()
         if stage == "training":
@@ -236,6 +258,50 @@ class NerfstudioBackend(ReconstructionBackend):
             raise StageFailed("Panorama projection produced no images.")
         return {"frames": n_frames, "viewsPerFrame": vpf, "perspectiveImages": got,
                 "perspectiveSize": result.get("size")}
+
+    def _masking(self, ctx: StageContext) -> Dict[str, Any]:
+        """Semantic masks (people / vehicles / animals / sky) for every planar view,
+        computed in the Nerfstudio env by ns_helpers/mask.py. Used by COLMAP
+        (features ignored) and Splatfacto (pixels excluded from the loss)."""
+        ws, mk = ctx.workspace, ctx.manifest["processing"]["masking"]
+        if not ctx.tools.mask_model:
+            raise StageFailed("Masking model not installed - run scripts\\pf360\\setup_masking.ps1 or turn masking off.")
+        total = _count_images(ws.planar_dir)
+        if total == 0:
+            raise StageFailed("No perspective images to mask.")
+        ws.reset_dir(ws.masks_dir)
+        stats: Dict[str, Any] = {}
+
+        def on_line(l: str) -> None:
+            if l.startswith("PF360MASKDONE"):
+                stats.update(json.loads(l[len("PF360MASKDONE"):]))
+            elif l.startswith("PF360MASK"):
+                try:
+                    d = json.loads(l[len("PF360MASK"):])
+                    ctx.emitter.progress("masking", 100.0 * d["done"] / max(1, d["total"]),
+                                         "%d / %d views" % (d["done"], d["total"]))
+                except (ValueError, KeyError):
+                    pass
+        args = [ctx.tools.ns_python, str(HELPERS / "mask.py"), "--model", ctx.tools.mask_model,
+                "--images", str(ws.planar_dir), "--out", str(ws.masks_dir),
+                "--groups", ",".join(mk["groups"]), "--dilate", str(int(mk.get("dilatePx", 8)))]
+        ctx.emitter.progress("masking", None, "loading segmentation model")
+        with ws.open_log("masking.log") as log:
+            rc = procrun.run(args, cancel=ctx.cancel, on_line=on_line, log=log, env=self._env(ctx))
+        got = sum(1 for _ in ws.masks_dir.glob("*.png")) if ws.masks_dir.is_dir() else 0
+        if rc != 0 or got != total:
+            raise StageFailed("Masking failed (exit %d, %d of %d masks) - see logs/masking.log" % (rc, got, total))
+        mean = float(stats.get("meanMaskedFraction") or 0.0)
+        if mean > 0.4:
+            ctx.emitter.warning("On average %.0f%% of each view is masked; COLMAP and training have little left to "
+                                "work with. Consider fewer mask categories." % (100 * mean), stage="masking")
+        heavy = int(stats.get("imagesMaskedOver60Percent") or 0)
+        if heavy:
+            ctx.emitter.warning("%d view(s) are more than 60%% masked." % heavy, stage="masking")
+        out = {"enabled": True, "groups": list(mk["groups"]), "dilatePx": int(mk.get("dilatePx", 8)), "masks": got}
+        out.update({k: stats[k] for k in ("meanMaskedFraction", "maxMaskedFraction", "imagesMaskedOver60Percent",
+                                          "device") if k in stats})
+        return out
 
     def _camera_reconstruction(self, ctx: StageContext) -> Dict[str, Any]:
         """COLMAP with KNOWN intrinsics, then ns-process-data --skip-colmap.
@@ -299,12 +365,18 @@ class NerfstudioBackend(ReconstructionBackend):
             matcher += ["--SequentialMatching.overlap", str(max(10, 3 * vpf))]
         elif method == "vocab_tree":
             matcher += ["--VocabTreeMatching.vocab_tree_path", self._vocab_tree(ctx, env)]
+        masks_on = _masking_on(ctx.manifest)
+        if masks_on and sum(1 for _ in ws.masks_dir.glob("*.png")) != total:
+            raise StageFailed("Masking is enabled but the masks are incomplete - re-run the job.")
+        extract = [colmap, "feature_extractor", "--database_path", str(db), "--image_path", str(ws.planar_dir),
+                   "--ImageReader.single_camera", "1", "--ImageReader.camera_model", "PINHOLE",
+                   "--ImageReader.camera_params", ",".join("%.6f" % v for v in intr),
+                   "--SiftExtraction.use_gpu", gpu]
+        if masks_on:
+            # COLMAP: mask file "<image name>.png", features in 0-valued pixels are dropped.
+            extract += ["--ImageReader.mask_path", str(ws.masks_dir)]
         steps = [
-            ("feature extraction",
-             [colmap, "feature_extractor", "--database_path", str(db), "--image_path", str(ws.planar_dir),
-              "--ImageReader.single_camera", "1", "--ImageReader.camera_model", "PINHOLE",
-              "--ImageReader.camera_params", ",".join("%.6f" % v for v in intr),
-              "--SiftExtraction.use_gpu", gpu]),
+            ("feature extraction", extract),
             ("feature matching", matcher),
             ("registering images",
              [colmap, "mapper", "--database_path", str(db), "--image_path", str(ws.planar_dir),
@@ -334,9 +406,19 @@ class NerfstudioBackend(ReconstructionBackend):
             args += flags.boolean("--skip-colmap", True)
             args += flags.boolean("--verbose", True)
             rc = procrun.run(args, cancel=ctx.cancel, log=log, env=env, cwd=str(ws.root))
-        if rc != 0:
-            raise StageFailed("ns-process-data failed (exit %d) - see logs/colmap.log" % rc)
-        return self._validate_reconstruction(ctx, total, models, best[0])
+            if rc != 0:
+                raise StageFailed("ns-process-data failed (exit %d) - see logs/colmap.log" % rc)
+            if masks_on:
+                # Splatfacto: per-frame mask_path + masks_N matching images_N sizes.
+                ctx.emitter.progress("camera_reconstruction", 96.0, "attaching masks for training")
+                rc = procrun.run([ctx.tools.ns_python, str(HELPERS / "mask.py"), "--attach", str(ws.processed_dir),
+                                  "--masks", str(ws.masks_dir), "--planar", str(ws.planar_dir)],
+                                 cancel=ctx.cancel, log=log, env=env)
+                if rc != 0:
+                    raise StageFailed("Attaching masks to the training data failed (exit %d) - see logs/colmap.log" % rc)
+        data = self._validate_reconstruction(ctx, total, models, best[0])
+        data["trainingMasks"] = masks_on
+        return data
 
     def _vocab_tree(self, ctx: StageContext, env: Dict[str, str]) -> str:
         """Nerfstudio's cached vocabulary tree (downloaded by Nerfstudio on first use)."""

@@ -222,6 +222,7 @@ class Tools:
     colmap: Optional[str] = None
     ffmpeg: Optional[str] = None
     ffprobe: Optional[str] = None
+    mask_model: Optional[str] = None   # local segmentation model dir (optional masking add-on)
 
     def ns(self, tool: str) -> Optional[str]:
         if not self.ns_bin:
@@ -260,7 +261,23 @@ def resolve_tools(cfg: Optional[Dict[str, Any]] = None) -> Tools:
     t.ffprobe = _file(cfg.get("ffprobeExe")) or _file(os.environ.get("PF360_FFPROBE")) or shutil.which("ffprobe")
     if not t.ffprobe and t.ffmpeg:
         t.ffprobe = _file(str(Path(t.ffmpeg).with_name("ffprobe" + EXE)))
+    t.mask_model = (_model_dir(cfg.get("maskModelDir")) or _model_dir(os.environ.get("PF360_MASK_MODEL"))
+                    or _model_dir(str(engines_root() / "models" / MASK_MODEL_DIRNAME)))
     return t
+
+
+# Installed by scripts/pf360/setup_masking.ps1 (see compat.json "masking").
+MASK_MODEL_DIRNAME = "upernet-convnext-base-ade20k"
+
+
+def _model_dir(p: Optional[str]) -> Optional[str]:
+    """A local segmentation model directory: config.json + safetensors weights."""
+    if not p:
+        return None
+    d = Path(p)
+    if (d / "config.json").is_file() and any(d.glob("*.safetensors")):
+        return str(d)
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -283,6 +300,7 @@ class Report:
     methods: List[str] = field(default_factory=list)
     tools: Dict[str, Optional[str]] = field(default_factory=dict)
     nerfstudio_version: Optional[str] = None
+    masking: bool = False   # optional masking add-on usable
 
     @property
     def ready(self) -> bool:
@@ -325,7 +343,7 @@ try:
     out["nerfstudio"] = md.version("nerfstudio")
 except Exception:
     pass
-for mod in ("gsplat", "tinycudann"):
+for mod in ("gsplat", "tinycudann", "transformers"):
     try:
         m = __import__(mod)
         out[mod] = getattr(m, "__version__", "present")
@@ -401,7 +419,7 @@ INSTALL_HINT = ("Run scripts\\pf360\\setup_environment.ps1 (creates an isolated 
 def doctor(cfg: Optional[Dict[str, Any]] = None, deep: bool = True) -> Report:
     t = resolve_tools(cfg)
     r = Report(tools={"nerfstudioPython": t.ns_python, "nerfstudioBin": t.ns_bin, "colmap": t.colmap,
-                      "ffmpeg": t.ffmpeg, "ffprobe": t.ffprobe})
+                      "ffmpeg": t.ffmpeg, "ffprobe": t.ffprobe, "maskModel": t.mask_model})
     r.checks.append(Check("Worker Python", "PASS", "%s (%s)" % (sys.version.split()[0], sys.executable)))
     r.checks.append(Check("FFmpeg", "PASS" if t.ffmpeg else "FAIL", t.ffmpeg or "not found",
                           "" if t.ffmpeg else "winget install Gyan.FFmpeg  (or put ffmpeg.exe on PATH)"))
@@ -474,6 +492,16 @@ def doctor(cfg: Optional[Dict[str, Any]] = None, deep: bool = True) -> Report:
             r.methods = list_methods(t) if not missing else []
             if r.methods and "splatfacto" not in r.methods:
                 r.checks.append(Check("Splatfacto method", "FAIL", "ns-train does not list splatfacto", INSTALL_HINT))
+        # Optional add-on: never FAIL (jobs without masking do not need it).
+        has_tf = "transformers" in tinfo if deep else True
+        if t.mask_model and has_tf:
+            r.masking = True
+            r.checks.append(Check("Masking (optional)", "PASS", "%s%s" % (
+                Path(t.mask_model).name, (", transformers %s" % tinfo["transformers"]) if tinfo.get("transformers") else "")))
+        else:
+            why = "segmentation model not installed" if not t.mask_model else "transformers not installed in the env"
+            r.checks.append(Check("Masking (optional)", "SKIP", why + " - run scripts\\pf360\\setup_masking.ps1 "
+                                  "(~0.5 GB) to enable people/vehicle/sky masking"))
 
     smi = query_nvidia_smi()
     r.gpu = smi

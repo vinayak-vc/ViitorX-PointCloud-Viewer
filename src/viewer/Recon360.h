@@ -32,6 +32,7 @@ struct Recon360Settings {
     std::string colmapExe;
     std::string ffmpegExe;
     std::string ffprobeExe;
+    std::string maskModelDir;   // optional masking add-on (scripts/pf360/setup_masking.ps1)
 };
 
 // Folder that contains the `pf360` package (worker root), or "" if missing.
@@ -66,6 +67,8 @@ struct Recon360Doctor {
     bool ran = false;          // worker executed and returned JSON
     bool ready = false;        // every check PASS/WARN/SKIP
     bool cuda = false;
+    bool masking = false;      // optional masking add-on installed + importable
+    std::string maskModelDir, nsPython;   // resolved by the worker (for the mask preview)
     std::string error;         // why the doctor itself could not run
     std::vector<Recon360Check> checks;
     std::vector<std::string> methods;   // splatfacto variants the install registers
@@ -110,16 +113,30 @@ struct Recon360JobSpec {
     float cullAlphaThresh = -1, densifyGradThresh = -1, cullScaleThresh = -1;
     std::string stopAfter;           // "" = full pipeline
     bool allowCache = true;
+    // Automatic masking (optional add-on): pixels of these categories are ignored
+    // by COLMAP and by Splatfacto's loss.
+    bool maskEnabled = false;
+    bool maskPeople = true, maskVehicles = false, maskAnimals = false, maskSky = false;
+    int  maskDilatePx = 8;
 };
+
+// Writes masked-out pixels of one image tinted red into `overlayRgb` (same size as
+// `rgb`, RGB24) using the masking add-on. Slow (loads the model): background
+// thread only. `groups` is e.g. "people,vehicles".
+bool recon360MaskPreview(const Recon360Settings& s, const std::vector<unsigned char>& rgb, int w, int h,
+                         const std::string& groups, int dilatePx, std::vector<unsigned char>& overlayRgb,
+                         float& maskedFraction, std::string& err);
 
 // Live job state shared between the job worker thread (writer) and UI (reader).
 struct Recon360Live {
-    static constexpr const char* kStages[7] = {"video_validation", "frame_extraction", "panorama_projection",
-                                               "camera_reconstruction", "training", "export", "validation"};
-    enum class StageState { Waiting, Running, Done, Skipped, Failed };
+    static constexpr int kStageCount = 8;
+    static constexpr const char* kStages[kStageCount] = {"video_validation", "frame_extraction",
+                                                         "panorama_projection", "masking", "camera_reconstruction",
+                                                         "training", "export", "validation"};
+    enum class StageState { Waiting, Running, Done, Skipped, Failed, Off };   // Off = optional stage disabled
 
     std::mutex mu;
-    StageState stage[7] = {};
+    StageState stage[kStageCount] = {};
     int   currentStage = -1;
     float stagePercent = -1;       // -1 = indeterminate
     std::string stageMessage;

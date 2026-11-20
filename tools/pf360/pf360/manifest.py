@@ -22,7 +22,7 @@ PRESETS_PATH = Path(__file__).with_name("presets.json")
 SUPPORTED_CONTAINERS = (".mp4", ".mov", ".mkv")
 JOB_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,80}$")
 PLY_NAME_RE = re.compile(r"^[^<>:\"/\\|?*\x00-\x1f]{1,120}\.ply$", re.IGNORECASE)
-STOP_AFTER = ("frame_extraction", "panorama_projection", "camera_reconstruction", "training", "export")
+STOP_AFTER = ("frame_extraction", "panorama_projection", "masking", "camera_reconstruction", "training", "export")
 
 
 class ManifestError(ValueError):
@@ -85,6 +85,11 @@ def resolve(raw: Dict[str, Any], video_duration: Optional[float] = None) -> Dict
     pr.setdefault("matchingMethod", base["matchingMethod"])
     for k in ("cropTop", "cropBottom", "cropLeft", "cropRight"):
         pr.setdefault(k, 0.0)
+    mk = pr.setdefault("masking", {})
+    if isinstance(mk, dict):
+        mk.setdefault("enabled", False)
+        mk.setdefault("groups", ["people"])
+        mk.setdefault("dilatePx", 8)
     if "targetFrames" not in pr and video_duration:
         start = float(m["input"].get("startTimeSeconds") or 0.0)
         end = m["input"].get("endTimeSeconds")
@@ -147,6 +152,21 @@ def validate(m: Dict[str, Any], check_files: bool = True) -> Dict[str, Any]:
         except ValueError as e:
             problems.append(str(e))
 
+    mk = pr.get("masking", {})
+    if not isinstance(mk, dict):
+        problems.append("processing.masking must be an object")
+    else:
+        if not isinstance(mk.get("enabled", False), bool):
+            problems.append("processing.masking.enabled must be true/false")
+        groups = mk.get("groups", [])
+        if not isinstance(groups, list) or any(g not in limits["maskGroups"] for g in groups) \
+                or len(set(groups)) != len(groups):
+            problems.append("processing.masking.groups must be a list of distinct values from %s"
+                            % limits["maskGroups"])
+        elif mk.get("enabled") and not groups:
+            problems.append("processing.masking.groups must not be empty when masking is enabled")
+        _in(problems, "processing.masking.dilatePx", mk.get("dilatePx", 8), *limits["maskDilatePx"], integer=True)
+
     tr = m.get("training") or {}
     if tr.get("method") not in limits["method"]:
         problems.append("training.method must be one of %s" % limits["method"])
@@ -185,6 +205,9 @@ def validate(m: Dict[str, Any], check_files: bool = True) -> Dict[str, Any]:
         v = env.get(k)
         if v not in (None, "") and (not isinstance(v, str) or (check_files and not os.path.isfile(v))):
             problems.append("environment.%s is not an existing file: %s" % (k, v))
+    v = env.get("maskModelDir")
+    if v not in (None, "") and (not isinstance(v, str) or (check_files and not os.path.isdir(v))):
+        problems.append("environment.maskModelDir is not an existing directory: %s" % v)
 
     opts = m.get("options") or {}
     sa = opts.get("stopAfter")

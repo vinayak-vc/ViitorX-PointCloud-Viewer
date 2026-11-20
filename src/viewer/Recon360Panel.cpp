@@ -152,6 +152,19 @@ void Recon360Panel::pollAsync() {
         }
     }
     if (ready(doctorFut)) doctor = doctorFut.get();
+    if (ready(maskFut)) {
+        MaskResult r = maskFut.get();
+        if (r.ok && r.rgb.size() == frameRgb.size()) {
+            maskRgb = std::move(r.rgb);
+            maskKey = r.key;
+            maskFraction = r.masked;
+            maskErr.clear();
+            showMaskOverlay = true;
+            frameDirty = true;
+        } else {
+            maskErr = r.ok ? "preview frame changed" : r.err;
+        }
+    }
     if (ready(frameFut)) {
         FrameResult r = frameFut.get();
         if (r.ok) {
@@ -159,6 +172,9 @@ void Recon360Panel::pollAsync() {
             frameW = r.w;
             frameH = r.h;
             frameDirty = true;
+            maskRgb.clear();          // overlay belongs to the previous frame
+            maskKey.clear();
+            showMaskOverlay = false;
         } else {
             frameErr = "Preview unavailable: " + r.err;
         }
@@ -242,6 +258,12 @@ void Recon360Panel::enqueue(Recon360PanelHost& host) {
         if (useCullScale) sp.cullScaleThresh = cullScale;
     }
     sp.stopAfter = preprocessOnly ? "camera_reconstruction" : "";
+    sp.maskEnabled = maskEnabled && doctor.masking && !maskGroups().empty();
+    sp.maskPeople = maskPeople;
+    sp.maskVehicles = maskVehicles;
+    sp.maskAnimals = maskAnimals;
+    sp.maskSky = maskSky;
+    sp.maskDilatePx = maskDilate;
     job = host.jobs->enqueueRecon360(sp, *host.settings, autoLoad);
     jobStart = nowSec();
     jobEnd = 0;
@@ -259,6 +281,7 @@ void Recon360Panel::enqueue(Recon360PanelHost& host) {
 void Recon360Panel::uploadPreview() {
     if (!frameDirty || frameRgb.empty()) return;
     frameDirty = false;
+    const bool overlay = showMaskOverlay && maskRgb.size() == frameRgb.size();
     if (!frameTex) glGenTextures(1, &frameTex);
     glBindTexture(GL_TEXTURE_2D, frameTex);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
@@ -266,7 +289,8 @@ void Recon360Panel::uploadPreview() {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, frameW, frameH, 0, GL_RGB, GL_UNSIGNED_BYTE, frameRgb.data());
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, frameW, frameH, 0, GL_RGB, GL_UNSIGNED_BYTE,
+                 overlay ? maskRgb.data() : frameRgb.data());
     glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
     glBindTexture(GL_TEXTURE_2D, 0);
 }
@@ -310,21 +334,27 @@ void Recon360Panel::drawPreview(float width) {
 // ---------------------------------------------------------------------------
 void Recon360Panel::drawEnvironmentSettings(Recon360PanelHost& host) {
     pollAsync();
-    std::string* fields[5] = {&host.settings->workerPython, &host.settings->nsPython, &host.settings->colmapExe,
-                              &host.settings->ffmpegExe, &host.settings->ffprobeExe};
-    static const char* labels[5] = {"Worker Python", "Nerfstudio Python", "COLMAP", "FFmpeg", "FFprobe"};
-    static const char* tips[5] = {
+    constexpr int kFields = 6;
+    std::string* fields[kFields] = {&host.settings->workerPython, &host.settings->nsPython, &host.settings->colmapExe,
+                                    &host.settings->ffmpegExe, &host.settings->ffprobeExe,
+                                    &host.settings->maskModelDir};
+    static const char* labels[kFields] = {"Worker Python", "Nerfstudio Python", "COLMAP", "FFmpeg", "FFprobe",
+                                          "Masking model"};
+    static const char* tips[kFields] = {
         "Interpreter that runs the pf360 worker (Python 3.8+, standard library only). Empty = py launcher / PATH.",
         "python.exe of the environment where Nerfstudio + CUDA PyTorch are installed. Empty = "
         "%LOCALAPPDATA%\\ViitorX\\PointForge\\engines\\pf360-env, then PATH.",
-        "colmap.exe. Empty = PATH, then the photogrammetry engine install.",
-        "ffmpeg.exe. Empty = PATH.", "ffprobe.exe. Empty = next to ffmpeg / PATH."};
+        "colmap.exe (3.11.x for Nerfstudio 1.1.5). Empty = PATH, then engines\\colmap-conda, engines\\colmap.",
+        "ffmpeg.exe. Empty = PATH.", "ffprobe.exe. Empty = next to ffmpeg / PATH.",
+        "Folder of the optional segmentation model (config.json + model.safetensors). Empty = "
+        "%LOCALAPPDATA%\\ViitorX\\PointForge\\engines\\models\\upernet-convnext-base-ade20k, installed by "
+        "scripts\\pf360\\setup_masking.ps1."};
     if (!pathBufsLoaded) {
-        for (int i = 0; i < 5; ++i) snprintf(pathBufs[i], sizeof(pathBufs[i]), "%s", fields[i]->c_str());
+        for (int i = 0; i < kFields; ++i) snprintf(pathBufs[i], sizeof(pathBufs[i]), "%s", fields[i]->c_str());
         pathBufsLoaded = true;
     }
     bool changed = false;
-    for (int i = 0; i < 5; ++i) {
+    for (int i = 0; i < kFields; ++i) {
         ImGui::PushID(i);
         ImGui::SetNextItemWidth(-90.0f * host.uiScale);
         if (ImGui::InputTextWithHint(labels[i], "auto-detect", pathBufs[i], sizeof(pathBufs[i]))) {
@@ -332,6 +362,10 @@ void Recon360Panel::drawEnvironmentSettings(Recon360PanelHost& host) {
             changed = true;
         }
         ImGui::SetItemTooltip("%s", tips[i]);
+        if (i == 5) {               // a folder: type or paste it
+            ImGui::PopID();
+            continue;
+        }
         ImGui::SameLine();
         if (ImGui::SmallButton("...")) {
             std::string f = openFileDialog("Executables\0*.exe\0All Files\0*.*\0");
@@ -527,6 +561,83 @@ void Recon360Panel::drawStepProcessing(Recon360PanelHost& host) {
     helpMarker("sequential: matches neighbouring images in capture order (Nerfstudio's default for video, fast).\n"
                "exhaustive: every pair (robust, slow beyond ~500 images).\n"
                "vocab_tree: scalable retrieval (Nerfstudio downloads a vocabulary file on first use).");
+    drawMasking(host);
+}
+
+std::string Recon360Panel::maskGroups() const {
+    std::string g;
+    auto add = [&](bool on, const char* name) { if (on) { if (!g.empty()) g += ","; g += name; } };
+    add(maskPeople, "people");
+    add(maskVehicles, "vehicles");
+    add(maskAnimals, "animals");
+    add(maskSky, "sky");
+    return g;
+}
+
+void Recon360Panel::drawMasking(Recon360PanelHost& host) {
+    ImGui::SeparatorText("Masking (optional)");
+    if (!doctor.ran && !doctorFut.valid() && doctor.error.empty()) startDoctor(host, false);
+    if (doctorFut.valid() && !doctor.ran) {
+        ImGui::TextDisabled("Checking whether the masking add-on is installed...");
+        return;
+    }
+    if (!doctor.masking) {
+        wrapped(kDim, "Masking is not installed. It removes people, vehicles, animals or sky from the "
+                      "reconstruction (moving objects otherwise leave ghosts and floaters). Install it with "
+                      "scripts\\pf360\\setup_masking.ps1 (~0.5 GB: UperNet-ConvNeXt segmentation model, MIT "
+                      "licence), then run the Full diagnostic again.");
+        maskEnabled = false;
+        return;
+    }
+    ImGui::Checkbox("Mask out moving / unwanted content", &maskEnabled);
+    helpMarker("Every perspective view is segmented on the GPU (ADE20K classes). Masked pixels are ignored by "
+               "COLMAP feature extraction and excluded from Gaussian training, so people walking past or passing "
+               "traffic do not turn into ghosts.");
+    ImGui::BeginDisabled(!maskEnabled);
+    ImGui::Checkbox("People", &maskPeople);
+    ImGui::SetItemTooltip("Includes what they ride (bicycles, motorbikes).");
+    ImGui::SameLine();
+    ImGui::Checkbox("Vehicles", &maskVehicles);
+    ImGui::SetItemTooltip("Cars, buses, trucks, vans, bikes, boats. Also removes PARKED vehicles.");
+    ImGui::SameLine();
+    ImGui::Checkbox("Animals", &maskAnimals);
+    ImGui::SameLine();
+    ImGui::Checkbox("Sky", &maskSky);
+    ImGui::SetItemTooltip("Sky is infinitely far and adds floaters. Masking it leaves the sky empty in the splat.");
+    ImGui::SetNextItemWidth(160.0f * host.uiScale);
+    ImGui::SliderInt("Grow mask (px)", &maskDilate, 0, 64, "%d", ImGuiSliderFlags_AlwaysClamp);
+    helpMarker("Expands every masked region so edges (motion blur, shadows close to people) are excluded too.");
+    const std::string groups = maskGroups();
+    if (maskEnabled && groups.empty()) wrapped(kWarn, "Select at least one category, or turn masking off.");
+    const std::string key = groups + "|" + std::to_string(maskDilate);
+    if (maskFut.valid()) {
+        ImGui::TextDisabled("Segmenting the preview frame (first run loads the model)...");
+    } else {
+        ImGui::BeginDisabled(frameRgb.empty() || groups.empty());
+        if (ImGui::Button("Preview masks on this frame")) {
+            const Recon360Settings s = *host.settings;
+            const std::vector<unsigned char> rgb = frameRgb;
+            const int w = frameW, h = frameH, dil = maskDilate;
+            maskErr.clear();
+            maskFut = std::async(std::launch::async, [s, rgb, w, h, groups, dil, key]() {
+                MaskResult r;
+                r.key = key;
+                r.ok = recon360MaskPreview(s, rgb, w, h, groups, dil, r.rgb, r.masked, r.err);
+                return r;
+            });
+        }
+        ImGui::EndDisabled();
+        if (!maskRgb.empty()) {
+            ImGui::SameLine();
+            if (ImGui::Checkbox("Show overlay", &showMaskOverlay)) frameDirty = true;
+            if (maskKey == key)
+                ImGui::TextDisabled("%.1f%% of the panorama is masked (red).", maskFraction * 100.0f);
+            else
+                ImGui::TextDisabled("Settings changed since the preview - preview again.");
+        }
+    }
+    if (!maskErr.empty()) wrapped(kBad, "Mask preview failed: " + maskErr);
+    ImGui::EndDisabled();
 }
 
 void Recon360Panel::drawStepQuality(Recon360PanelHost& host) {
@@ -674,7 +785,7 @@ void Recon360Panel::drawStepRun(Recon360PanelHost& host) {
     if (!L.stageMessage.empty()) ImGui::TextDisabled("%s", L.stageMessage.c_str());
     ImGui::Spacing();
     if (ImGui::BeginTable("##stages", 2, ImGuiTableFlags_SizingFixedFit)) {
-        for (int i = 0; i < 7; ++i) {
+        for (int i = 0; i < Recon360Live::kStageCount; ++i) {
             ImGui::TableNextRow();
             ImGui::TableNextColumn();
             ImGui::TextUnformatted(recon360StageLabel(i));
@@ -684,6 +795,7 @@ void Recon360Panel::drawStepRun(Recon360PanelHost& host) {
                 case Recon360Live::StageState::Running: ImGui::TextColored(ImVec4(0.4f, 0.8f, 1, 1), "RUNNING"); break;
                 case Recon360Live::StageState::Done:    ImGui::TextColored(kGood, "COMPLETED"); break;
                 case Recon360Live::StageState::Skipped: ImGui::TextColored(kGood, "REUSED (cached)"); break;
+                case Recon360Live::StageState::Off:     ImGui::TextColored(kDim, "OFF"); break;
                 case Recon360Live::StageState::Failed:  ImGui::TextColored(kBad, "FAILED"); break;
             }
         }

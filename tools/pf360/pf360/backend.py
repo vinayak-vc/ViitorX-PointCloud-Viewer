@@ -45,6 +45,10 @@ class ReconstructionBackend:
         """Backend-owned stage ids, in execution order."""
         raise NotImplementedError
 
+    def stage_enabled(self, stage: str, ctx: StageContext) -> bool:
+        """False -> the worker reports stage_skipped (optional stages such as masking)."""
+        return True
+
     def check_environment(self, tools: Tools, manifest: Dict[str, Any]) -> List[str]:
         """Problems that make this backend unable to run the manifest (empty = OK)."""
         raise NotImplementedError

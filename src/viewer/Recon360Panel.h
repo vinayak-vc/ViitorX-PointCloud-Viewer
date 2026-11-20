@@ -81,6 +81,20 @@ private:
     float crop[4] = {0, 0, 0, 0};   // top, bottom, left, right
     int matchingIdx = 0;         // sequential, exhaustive, vocab_tree
 
+    // masking (optional add-on)
+    bool maskEnabled = false;
+    bool maskPeople = true, maskVehicles = false, maskAnimals = false, maskSky = false;
+    int maskDilate = 8;
+    struct MaskResult { bool ok = false; std::vector<unsigned char> rgb; float masked = 0; std::string err, key; };
+    std::future<MaskResult> maskFut;
+    std::vector<unsigned char> maskRgb;   // overlay for the current preview frame
+    std::string maskKey;                  // groups/dilate the overlay was computed with
+    std::string maskErr;
+    float maskFraction = 0;
+    bool showMaskOverlay = false;
+    std::string maskGroups() const;
+    void drawMasking(Recon360PanelHost& host);
+
     // quality
     std::vector<Recon360Preset> presets;
     std::string presetErr;
@@ -96,7 +110,7 @@ private:
     Recon360Doctor doctor;
     std::future<Recon360Doctor> doctorFut;
     bool doctorDeep = false;
-    char pathBufs[5][1024] = {};
+    char pathBufs[6][1024] = {};
     bool pathBufsLoaded = false;
 
     // output

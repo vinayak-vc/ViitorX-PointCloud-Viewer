@@ -165,6 +165,10 @@ class Job:
                               " Run `python -m pf360 doctor` for details.")
         for stage in self.backend.stages():
             fp = fingerprint(fp, self.backend.stage_inputs(stage, self._ctx()))
+            if not self.backend.stage_enabled(stage, self._ctx()):
+                self.results[stage] = {"enabled": False}
+                self.em.emit("stage_skipped", stage=stage, message="not enabled for this job", data={"enabled": False})
+                continue
             self._stage(stage, lambda s=stage: self.backend.run_stage(s, self._ctx()), fp)
             if self._stop_after(stage):
                 return
@@ -362,7 +366,8 @@ class Job:
                            "registeredImages": cr.get("registeredImages"),
                            "registrationRatio": cr.get("registrationRatio"),
                            "distinctCameraPositions": cr.get("distinctCameraPositions"),
-                           "sparsePointCloud": cr.get("sparsePointCloud")},
+                           "sparsePointCloud": cr.get("sparsePointCloud"),
+                           "masking": r.get("masking") or {"enabled": False}},
             "training": {"method": tr.get("method") or mt.get("method"), "iterations": tr.get("iterations"),
                          "qualityPreset": mt.get("qualityPreset"), "downscaleFactor": mt.get("downscaleFactor"),
                          "gpu": (r.get("_env") or {}).get("device")},
@@ -371,7 +376,7 @@ class Job:
                        "shDegree": va.get("shDegree"), "numericCheck": va.get("numericCheck"),
                        "upAxis": "z_up" if va.get("ok") else None},
             "timings": {"validationSeconds": s("video_validation"),
-                        "preprocessingSeconds": s("frame_extraction", "panorama_projection"),
+                        "preprocessingSeconds": s("frame_extraction", "panorama_projection", "masking"),
                         "reconstructionSeconds": s("camera_reconstruction"), "trainingSeconds": s("training"),
                         "exportSeconds": s("export", "validation")},
             "warnings": self.warnings,

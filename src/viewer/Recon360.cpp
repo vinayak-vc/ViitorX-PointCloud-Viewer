@@ -33,20 +33,22 @@ namespace pf {
 // stage labels / weights
 // ---------------------------------------------------------------------------
 const char* recon360StageLabel(int i) {
-    static const char* labels[7] = {"Video validation", "Frame extraction", "Panorama projection",
-                                    "Camera reconstruction (COLMAP)", "Gaussian training", "Gaussian export",
-                                    "PLY validation"};
-    return (i >= 0 && i < 7) ? labels[i] : "Preparing";
+    constexpr int n = Recon360Live::kStageCount;
+    static const char* labels[n] = {"Video validation", "Frame extraction", "Panorama projection",
+                                    "Masking (people / vehicles / sky)", "Camera reconstruction (COLMAP)",
+                                    "Gaussian training", "Gaussian export", "PLY validation"};
+    return (i >= 0 && i < n) ? labels[i] : "Preparing";
 }
 
 float recon360Overall(int stage, float pct) {
     // Rough share of wall-clock per stage: only used to place the overall bar;
     // the per-stage percent shown next to it is the backend's real value.
-    static const float w[7] = {0.02f, 0.05f, 0.08f, 0.20f, 0.60f, 0.03f, 0.02f};
+    constexpr int n = Recon360Live::kStageCount;
+    static const float w[n] = {0.02f, 0.05f, 0.07f, 0.03f, 0.19f, 0.60f, 0.02f, 0.02f};
     if (stage < 0) return 0.0f;
     float acc = 0;
-    for (int i = 0; i < stage && i < 7; ++i) acc += w[i];
-    if (stage < 7 && pct >= 0) acc += w[stage] * std::min(100.0f, pct) / 100.0f;
+    for (int i = 0; i < stage && i < n; ++i) acc += w[i];
+    if (stage < n && pct >= 0) acc += w[stage] * std::min(100.0f, pct) / 100.0f;
     return std::min(1.0f, acc);
 }
 
@@ -181,6 +183,7 @@ std::vector<wchar_t> buildEnv(const Recon360Settings& s, const std::wstring& wor
     if (!s.colmapExe.empty())  extra.push_back({L"PF360_COLMAP", widen(s.colmapExe)});
     if (!s.ffmpegExe.empty())  extra.push_back({L"PF360_FFMPEG", widen(s.ffmpegExe)});
     if (!s.ffprobeExe.empty()) extra.push_back({L"PF360_FFPROBE", widen(s.ffprobeExe)});
+    if (!s.maskModelDir.empty()) extra.push_back({L"PF360_MASK_MODEL", widen(s.maskModelDir)});
     std::vector<wchar_t> block;
     LPWCH cur = GetEnvironmentStringsW();
     for (LPWCH p = cur; p && *p;) {
@@ -429,6 +432,10 @@ Recon360Doctor recon360RunDoctor(const Recon360Settings& s, bool quick) {
         for (const auto& c : j.value("checks", json::array()))
             d.checks.push_back({str(c, "name"), str(c, "status"), str(c, "detail"), str(c, "fix")});
         d.methods = strList(j, "methods");
+        d.masking = boolean(j, "masking");
+        const json tools = j.value("tools", json::object());
+        d.maskModelDir = str(tools, "maskModel");
+        d.nsPython = str(tools, "nerfstudioPython");
         const json t = j.value("torch", json::object());
         d.cuda = boolean(t, "cuda");
         d.torchVersion = str(t, "torch");
@@ -513,6 +520,43 @@ bool recon360ExtractFrame(const Recon360Settings& s, const std::string& video, d
     }
 }
 
+bool recon360MaskPreview(const Recon360Settings& s, const std::vector<unsigned char>& rgb, int w, int h,
+                         const std::string& groups, int dilatePx, std::vector<unsigned char>& overlayRgb,
+                         float& maskedFraction, std::string& err) {
+    if (w <= 0 || h <= 0 || (int)rgb.size() != w * h * 3) { err = "no preview frame"; return false; }
+    const std::string tag = std::to_string(GetCurrentProcessId()) + "_" + std::to_string(GetTickCount64());
+    const fs::path in = fs::temp_directory_path() / widen("pf360_mask_in_" + tag + ".rgb");
+    const fs::path out = fs::temp_directory_path() / widen("pf360_mask_out_" + tag + ".rgb");
+    std::error_code ec;
+    {
+        std::ofstream f(in, std::ios::binary | std::ios::trunc);
+        if (!f) { err = "cannot write temp image"; return false; }
+        f.write((const char*)rgb.data(), (std::streamsize)rgb.size());
+    }
+    std::string res;
+    const bool ran = runWorkerCapture(s, {L"mask-preview", L"--in", in.wstring(), L"--size", std::to_wstring(w),
+                                          std::to_wstring(h), L"--out", out.wstring(), L"--groups", widen(groups),
+                                          L"--dilate", std::to_wstring(dilatePx)},
+                                      600000, res, err);
+    fs::remove(in, ec);
+    if (!ran) { fs::remove(out, ec); return false; }
+    try {
+        json j = json::parse(res);
+        if (!boolean(j, "ok")) { err = str(j, "error"); fs::remove(out, ec); return false; }
+        maskedFraction = (float)num(j, "maskedFraction");
+        std::ifstream f(out, std::ios::binary);
+        overlayRgb.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+        f.close();
+        fs::remove(out, ec);
+        if ((int)overlayRgb.size() != w * h * 3) { err = "mask preview has the wrong size"; return false; }
+        return true;
+    } catch (const std::exception& e) {
+        fs::remove(out, ec);
+        err = e.what();
+        return false;
+    }
+}
+
 bool recon360WriteManifest(const Recon360JobSpec& sp, const Recon360Settings& s, std::string& path,
                            std::string& err) {
     json m;
@@ -525,6 +569,15 @@ bool recon360WriteManifest(const Recon360JobSpec& sp, const Recon360Settings& s,
     m["processing"] = {{"targetFrames", sp.targetFrames}, {"imagesPerEquirect", sp.imagesPerEquirect},
                        {"cropTop", sp.cropTop}, {"cropBottom", sp.cropBottom}, {"cropLeft", sp.cropLeft},
                        {"cropRight", sp.cropRight}, {"matchingMethod", sp.matchingMethod}};
+    {
+        json groups = json::array();
+        if (sp.maskPeople)   groups.push_back("people");
+        if (sp.maskVehicles) groups.push_back("vehicles");
+        if (sp.maskAnimals)  groups.push_back("animals");
+        if (sp.maskSky)      groups.push_back("sky");
+        m["processing"]["masking"] = {{"enabled", sp.maskEnabled && !groups.empty()}, {"groups", groups},
+                                      {"dilatePx", std::max(0, std::min(64, sp.maskDilatePx))}};
+    }
     json tr = {{"qualityPreset", sp.qualityPreset}, {"method", sp.method}, {"iterations", sp.iterations},
                {"downscaleFactor", sp.downscaleFactor}, {"shDegree", sp.shDegree}, {"randomSeed", sp.randomSeed},
                {"useScaleRegularization", sp.useScaleRegularization}};
@@ -540,6 +593,7 @@ bool recon360WriteManifest(const Recon360JobSpec& sp, const Recon360Settings& s,
     if (!s.colmapExe.empty())  env["colmapExe"] = s.colmapExe;
     if (!s.ffmpegExe.empty())  env["ffmpegExe"] = s.ffmpegExe;
     if (!s.ffprobeExe.empty()) env["ffprobeExe"] = s.ffprobeExe;
+    if (!s.maskModelDir.empty()) env["maskModelDir"] = s.maskModelDir;
     m["environment"] = env;
     json opts = {{"allowCache", sp.allowCache}};
     if (!sp.stopAfter.empty()) opts["stopAfter"] = sp.stopAfter;
@@ -591,7 +645,7 @@ bool recon360Run(const Recon360JobSpec& spec, const Recon360Settings& s, std::at
         if (num(ev, "v", 0) != 1) return;           // unknown protocol version: ignore
         const std::string type = str(ev, "type"), stage = str(ev, "stage"), msg = str(ev, "message");
         int si = -1;
-        for (int i = 0; i < 7; ++i) if (stage == Recon360Live::kStages[i]) si = i;
+        for (int i = 0; i < Recon360Live::kStageCount; ++i) if (stage == Recon360Live::kStages[i]) si = i;
         float overall = -2;
         std::string status;
         {
@@ -611,10 +665,13 @@ bool recon360Run(const Recon360JobSpec& spec, const Recon360Settings& s, std::at
                 overall = live.stagePercent >= 0 ? recon360Overall(si, live.stagePercent) : -1.0f;
                 status = std::string(recon360StageLabel(si)) + (msg.empty() ? "" : ": " + msg);
             } else if ((type == "stage_completed" || type == "stage_skipped") && si >= 0) {
+                // stage_skipped carries data.enabled == false for optional stages that are off.
+                const bool off = type == "stage_skipped" && ev.contains("data") && ev["data"].is_object() &&
+                                 ev["data"].value("enabled", true) == false;
                 live.stage[si] = type == "stage_completed" ? Recon360Live::StageState::Done
-                                                           : Recon360Live::StageState::Skipped;
+                                 : off ? Recon360Live::StageState::Off : Recon360Live::StageState::Skipped;
                 live.addLog(std::string(recon360StageLabel(si)) +
-                            (type == "stage_completed" ? " - done" : " - reused cached result"));
+                            (type == "stage_completed" ? " - done" : off ? " - off" : " - reused cached result"));
                 overall = recon360Overall(si + 1, 0);
             } else if (type == "log") {
                 live.addLog(msg);
@@ -727,6 +784,10 @@ Recon360Probe recon360ProbeVideo(const Recon360Settings&, const std::string&, do
 }
 bool recon360ExtractFrame(const Recon360Settings&, const std::string&, double, int, std::vector<unsigned char>&,
                           int&, int&, std::string& err) { err = "Windows only"; return false; }
+bool recon360MaskPreview(const Recon360Settings&, const std::vector<unsigned char>&, int, int, const std::string&,
+                         int, std::vector<unsigned char>&, float&, std::string& err) {
+    err = "Windows only"; return false;
+}
 bool recon360WriteManifest(const Recon360JobSpec&, const Recon360Settings&, std::string&, std::string& err) {
     err = "Windows only"; return false;
 }

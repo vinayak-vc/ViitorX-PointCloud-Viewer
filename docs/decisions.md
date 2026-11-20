@@ -303,3 +303,12 @@ This document records major design decisions.
 - **Decision**: the worker refuses non-empty output folders it does not own (no `state.json`), clears stage folders only inside its own workspace, never copies/modifies the source video, and never deletes data on failure/cancel. Stage reuse requires a matching SHA-256 fingerprint chain (video size/mtime/head+tail hash + all affecting settings) AND existing outputs.
 - **Reason**: reconstruction runs take hours; retries must be cheap but must never silently mix stale intermediates or overwrite a user's folder.
 
+
+## pf360 masking: semantic segmentation, MIT model, optional add-on
+- **Decision**: automatic masking uses `openmmlab/upernet-convnext-base` (UperNet + ConvNeXt-Base, ADE20K, 150 classes) through `transformers`, loaded from **safetensors only** at a pinned revision, installed by an explicit opt-in script (`scripts/pf360/setup_masking.ps1`, ~0.5 GB) into the existing pf360 env. Masks feed both COLMAP (`--ImageReader.mask_path`) and Splatfacto (`mask_path` per frame).
+- **Reason**: one network covers people, vehicles, animals and sky automatically (no clicks). Licence checked on the model card (MIT) because PointForge is commercial — SegFormer (NVIDIA research-only) and Mask2Former ("other") were rejected. torch 2.1 must not unpickle `.bin` weights, so pickle files are never loaded. SAM 2.1 (Apache-2.0) remains the candidate for interactive click/box/lasso masks later; it needs prompts, so it is not the automatic path.
+- **Consequences**: masking is a stage of its own (`masking`, between projection and COLMAP), cached like the others and reported as `stage_skipped` + `data.enabled=false` when off; the worker never downloads models. Sky masking misfires on some indoor ceilings, so Sky is opt-in.
+
+## pf360 runs COLMAP itself (fixed pinhole intrinsics)
+- **Decision**: the camera stage calls COLMAP directly with a single shared `PINHOLE` camera whose focal/principal point are computed from Nerfstudio's planar-view geometry, intrinsics frozen in BA, largest model selected; `ns-process-data --skip-colmap` only converts the model to `transforms.json`.
+- **Reason**: Nerfstudio's own COLMAP call starts from COLMAP's EXIF-less focal guess (~4x too long for 110-120 degree views) and registered 2 of 240 views on the first real run; with known intrinsics: 240/240.

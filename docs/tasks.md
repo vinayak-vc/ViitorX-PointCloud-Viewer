@@ -314,7 +314,13 @@ Recommended order; update newdev.md status board as these move:
         visibility/active/close/add rows)
 
 ## Open - 360 Reconstruction Studio
-- `[ ]` Install the Nerfstudio env (`scripts\pf360\setup_environment.ps1`, ~8 GB, needs user consent) + COLMAP, then run a real stitched equirectangular clip end-to-end (Preview, then High Quality); set `compat.json` `verified: true` with machine/date.
+- `[x]` Nerfstudio env + COLMAP 3.11.1 installed; full chain verified on a synthetic clip (240/240 registered, PLY loads Z-up). `compat.json` verified.
+- `[x]` Automatic masking (people / vehicles / animals / sky): optional add-on, `masking` stage, COLMAP + Splatfacto masks, wizard controls + mask preview. Verified end to end on the synthetic clip.
+- `[ ]` Run real stitched 360 footage (with people / traffic) through Preview, then High Quality; judge masking on moving content.
+- `[ ]` Click through the wizard (Processing > Masking, preview overlay) on a real display.
+- `[ ]` Interactive masks (SAM 2.1, Apache-2.0: click / box / lasso + propagation) for objects the semantic classes miss.
+- `[ ]` Sharp-keyframe selection (Laplacian score per window) instead of uniform fps; Splatfacto exposure compensation (`use_bilateral_grid`) + antialiased rasterization.
+- `[ ]` COLMAP rig constraint (COLMAP >= 3.12 rigs) for the 8/14 views of one panorama.
 - `[ ]` Confirm a real export opens upright (Z-up) and at sensible scale in PointForge.
 - `[ ]` Click through the wizard UI on a real display (only startup/shutdown was smoke-tested).
 - `[ ]` Optional: WSL2 / Docker execution backends (`environment.backend`), per-frame masks, fisheye stitching backend.

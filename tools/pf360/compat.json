@@ -20,6 +20,16 @@
     "verified": true,
     "verifiedOn": "2026-11-21, Windows 11, RTX 3060 12 GB, driver 617.42, Python 3.10.7, CUDA Toolkit 11.8, MSVC 14.38: torch 2.1.2+cu118, nerfstudio 1.1.5, gsplat 1.4.0+pt21cu118 (prebuilt wheel), setuptools 69.5.1, COLMAP 3.11.1 (conda-forge cuda_126), FFmpeg 9.0.2. Preview preset on a SYNTHETIC 2880x1440 30 s clip (scripts/pf360/make_synthetic_360.py): 240/240 views registered, 7000 its, 259,599 Gaussians, PLY validated and loaded Z-up in PointForge. Not yet run on real 360 footage."
   },
+  "masking": {
+    "_comment": "OPTIONAL add-on installed by scripts/pf360/setup_masking.ps1 into the pf360 env. Model: semantic segmentation on ADE20K (150 classes incl. person, car, bus, truck, van, bicycle, minibike, animal, sky). Licence checked on the model card (MIT). Safetensors only: torch 2.1 must not unpickle .bin weights.",
+    "packages": ["transformers==4.46.3", "safetensors>=0.4.3", "huggingface_hub>=0.24,<1.0"],
+    "model": "openmmlab/upernet-convnext-base",
+    "revision": "13a9c410ff779f25236a8d24802d2742e4694e9c",
+    "licence": "MIT",
+    "files": ["config.json", "preprocessor_config.json", "model.safetensors"],
+    "modelDirName": "upernet-convnext-base-ade20k",
+    "approxDownloadMB": 520
+  },
   "nerfstudioCliFacts": {
     "_source": "nerfstudio 1.1.5 source, re-checked at run time via --help",
     "equirectViewsPerFrame": [8, 14],

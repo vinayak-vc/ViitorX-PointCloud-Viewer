@@ -55,6 +55,7 @@ class Workspace:
         self.root = Path(root)
         self.frames_dir = self.root / "frames"
         self.planar_dir = self.frames_dir / "planar_projections"
+        self.masks_dir = self.frames_dir / "masks"   # "<planar view name>.png", 255 keep / 0 ignore
         self.processed_dir = self.root / "processed"
         self.training_dir = self.root / "training"
         self.export_dir = self.root / "export"

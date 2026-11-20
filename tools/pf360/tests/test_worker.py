@@ -94,7 +94,10 @@ class WorkerTests(unittest.TestCase):
         code, ev = self.run_job(be2)
         self.assertEqual(code, 0)
         self.assertEqual(be2.ran, [])
-        self.assertEqual(sum(1 for e in ev if e["type"] == "stage_skipped"), 5)
+        # frames, projection, masking (off), reconstruction, training, export
+        self.assertEqual(sum(1 for e in ev if e["type"] == "stage_skipped"), 6)
+        off = [e for e in ev if e["type"] == "stage_skipped" and e.get("stage") == "masking"]
+        self.assertEqual(off[0]["data"], {"enabled": False})
         # changing a training setting re-runs training + export only
         raw = json.loads(json.dumps(self.raw))
         raw["training"]["iterations"] = 1234
@@ -102,6 +105,40 @@ class WorkerTests(unittest.TestCase):
         code, ev = self.run_job(be3, raw=raw)
         self.assertEqual(code, 0)
         self.assertEqual(be3.ran, ["training", "export"])
+
+    def test_masking_stage_runs_and_invalidates_downstream(self):
+        raw = json.loads(json.dumps(self.raw))
+        raw["processing"]["masking"] = {"enabled": True, "groups": ["people"], "dilatePx": 4}
+        be = FakeBackend()
+        code, ev = self.run_job(be, raw=raw)
+        self.assertEqual(code, 0, [e.get("message") for e in ev if e["type"] in ("job_failed", "error")])
+        self.assertEqual(be.ran, ["panorama_projection", "masking", "camera_reconstruction", "training", "export"])
+        self.assertEqual(ev[-1]["data"]["processing"]["masking"], {"stage": "masking"})
+        # Changing the mask categories re-runs masking and everything after it, not the projection.
+        raw["processing"]["masking"]["groups"] = ["people", "vehicles"]
+        be2 = FakeBackend()
+        code, ev = self.run_job(be2, raw=raw)
+        self.assertEqual(code, 0)
+        self.assertEqual(be2.ran, ["masking", "camera_reconstruction", "training", "export"])
+        # Turning masking off again: reconstruction must not reuse the masked result.
+        raw["processing"]["masking"]["enabled"] = False
+        be3 = FakeBackend()
+        code, ev = self.run_job(be3, raw=raw)
+        self.assertEqual(be3.ran, ["camera_reconstruction", "training", "export"])
+
+    def test_masking_without_model_fails_before_gpu_work(self):
+        raw = json.loads(json.dumps(self.raw))
+        raw["processing"]["masking"] = {"enabled": True, "groups": ["sky"]}
+
+        class NoModel(FakeBackend):
+            def check_environment(self, tools, manifest):
+                tools.mask_model = None
+                return NerfstudioBackend.check_environment(self, tools, manifest)[:1]
+        be = NoModel()
+        code, ev = self.run_job(be, raw=raw)
+        self.assertEqual(code, worker.EXIT_FAILED)
+        self.assertIn("setup_masking.ps1", ev[-1]["message"])
+        self.assertEqual(be.ran, [])
 
     def test_stage_failure_reports_job_failed(self):
         code, ev = self.run_job(FakeBackend(fail_at="camera_reconstruction"))

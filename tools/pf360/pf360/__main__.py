@@ -56,6 +56,13 @@ def main(argv=None) -> int:
     fr.add_argument("--out", required=True)
     fr.add_argument("--ffmpeg")
 
+    mp = sub.add_parser("mask-preview", help="mask overlay for one raw RGB24 image (needs the masking add-on)")
+    mp.add_argument("--in", dest="inp", required=True, help="raw RGB24 file")
+    mp.add_argument("--size", type=int, nargs=2, required=True, metavar=("W", "H"))
+    mp.add_argument("--out", required=True, help="raw RGB24 overlay output (same size)")
+    mp.add_argument("--groups", default="people")
+    mp.add_argument("--dilate", type=int, default=8)
+
     sub.add_parser("presets", help="print the quality presets JSON")
 
     v = sub.add_parser("validate-ply", help="validate a 3DGS PLY")
@@ -119,6 +126,32 @@ def main(argv=None) -> int:
         with open(a.out, "wb") as f:
             f.write(cp.stdout)
         _print_json({"ok": True, "width": w, "height": h, "path": a.out})
+        return 0
+
+    if a.cmd == "mask-preview":
+        from pathlib import Path
+        from . import procrun
+        t = environment.resolve_tools({})
+        if not (t.ns_python and t.mask_model):
+            _print_json({"ok": False, "error": "Masking add-on not installed (scripts\\pf360\\setup_masking.ps1)"})
+            return 2
+        groups = [g for g in a.groups.split(",") if g]
+        if not groups or any(g not in manifest.load_presets()["limits"]["maskGroups"] for g in groups):
+            _print_json({"ok": False, "error": "invalid mask groups: %s" % a.groups})
+            return 2
+        helper = Path(__file__).with_name("ns_helpers") / "mask.py"
+        cp = procrun.capture([t.ns_python, str(helper), "--model", t.mask_model, "--image", a.inp,
+                              "--raw-size", str(a.size[0]), str(a.size[1]), "--overlay", a.out,
+                              "--groups", ",".join(groups), "--dilate", str(max(0, min(64, a.dilate)))],
+                             timeout=600, env=procrun.child_env())
+        text = cp.stdout.decode("utf-8", "replace")
+        done = [l for l in text.splitlines() if l.startswith("PF360MASKDONE")]
+        if cp.returncode != 0 or not done:
+            _print_json({"ok": False, "error": (cp.stderr.decode("utf-8", "replace")[-400:] or "mask preview failed")})
+            return 2
+        res = json.loads(done[-1][len("PF360MASKDONE"):])
+        res["ok"] = True
+        _print_json(res)
         return 0
 
     if a.cmd == "presets":
