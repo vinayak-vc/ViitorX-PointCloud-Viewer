@@ -1,0 +1,5 @@
+# pf360 worker: no third-party Python packages (standard library only).
+# The reconstruction tools live in a separate environment created by
+# scripts\pf360\setup_environment.ps1 - versions in compat.json:
+#   nerfstudio==1.1.5, torch==2.1.2+cu118, torchvision==0.16.2+cu118 (gsplat 1.4.0 via nerfstudio)
+# plus FFmpeg and COLMAP executables.

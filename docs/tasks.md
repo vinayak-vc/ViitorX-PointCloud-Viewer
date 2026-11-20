@@ -1,6 +1,7 @@
 # Tasks
 
 ## Completed
+- `[x]` 360 Reconstruction Studio (360 video -> 3DGS PLY), milestones 0-4 + most of 5: standalone stdlib-only Python worker `tools/pf360` (doctor/probe/frame/estimate/presets/validate-ply/run; JSONL protocol v1; manifest schema v1 + presets.json; Nerfstudio backend behind `ReconstructionBackend`; stage cache with SHA-256 fingerprint chain; report json/txt; PLY validation mirroring SplatReader rules) + host bridge `src/viewer/Recon360.{h,cpp}` (CreateProcessW + Job Object, stdin cancel, JSONL parsing) + `Recon360Panel` 6-step wizard + `ConvertJob::Kind::Recon360` + menus/Ctrl+R/drag-drop/palette/Prefs tab + Z-up load of pf360 outputs. Tests: 62 Python + `pf360hosttest` 46/46; static build + pftest PASS. See docs/360-reconstruction.md.
 - `[x]` FBX (ASCII) export: `FbxWriter` in pfcore (`src/io/FbxWriter.{h,cpp}`) — dependency-free ASCII FBX 7400. Each cloud = a Mesh with control points (no polygons) + per-point `LayerElementColor` (ByControlPoint/Direct), like CloudCompare; imports as vertices into Unity/Blender/Unreal. Gaussian splats degrade to coloured points; intensity/classification dropped (no FBX slot; GLB stays lossless). Z-up→Y-up baked into vertices + `GlobalSettings.UpAxis`; metres (`UnitScaleFactor=100`); true origin in Model `PF_WorldOrigin`. Shares the Export dialog (Format combo) + `meshExportWorker` pipeline with GLB. `--export-fbx <out.fbx>` smoke hook. Verified dynamic (`v1076`) + static single-file (`v1077`) on `Tikal-13.vxpc`.
 - `[x]` GLB (glTF 2.0) export: `GlbWriter` in pfcore (`src/io/GlbWriter.{h,cpp}`) — dependency-free streaming writer. Point clouds → `POINTS` (POSITION + COLOR_0 + optional `_INTENSITY`/`_CLASSIFICATION`); Gaussian splats → `KHR_gaussian_splatting` extension (lossless rotation/scale/opacity/SH0). Z-up→Y-up via single root node; true origin in `asset.extras`. Viewer: File▸Export▸GLB dialog (Ctrl+E) + command palette, reusing slice job/progress/cancel plumbing; options = scope (all/visible/active), multi-cloud layout (separate nodes / merge / one file per cloud), region (whole/clip box), decimation (LOD depth OR voxel + max-point budget), Y-up + attrs toggles. Permanent `--export-glb <out.glb>` smoke hook. Verified dynamic + static single-file (`ViitorXPCViewer_v1075.exe`) on `Tikal-13.vxpc` + standalone writer unit test. FBX deferred behind the same `SliceExportFormat::Glb` enum.
 - `[x]` 3D Gaussian Splatting (3DGS) Phase 4 & 5: Registered `CloudType::GaussianSplat` in `SceneCloud`, integrated 3DGS file loading in `loadOctree`/`appendCloud`, and composited rendering into offscreen scene FBO (`edlFbo`) for seamless EDL post-processing and Web Remote video streaming.
@@ -311,3 +312,10 @@ Recommended order; update newdev.md status board as these move:
 - `[ ]` Recent-files pin/unpin + cached point-count/size metadata
 - `[x]` Scene panel (multi-cloud) — shipped with newdev.md #6 (left dock,
         visibility/active/close/add rows)
+
+## Open - 360 Reconstruction Studio
+- `[ ]` Install the Nerfstudio env (`scripts\pf360\setup_environment.ps1`, ~8 GB, needs user consent) + COLMAP, then run a real stitched equirectangular clip end-to-end (Preview, then High Quality); set `compat.json` `verified: true` with machine/date.
+- `[ ]` Confirm a real export opens upright (Z-up) and at sensible scale in PointForge.
+- `[ ]` Click through the wizard UI on a real display (only startup/shutdown was smoke-tested).
+- `[ ]` Optional: WSL2 / Docker execution backends (`environment.backend`), per-frame masks, fisheye stitching backend.
+

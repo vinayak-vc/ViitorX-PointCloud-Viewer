@@ -1,0 +1,35 @@
+{
+  "_comment": "Dependency compatibility manifest for the pf360 Nerfstudio backend. 'verified' stays false until a full reconstruction (video -> PLY -> PointForge) has passed with exactly these versions on a real machine; record the machine + date in 'verifiedOn' when that happens. Sources: nerfstudio 1.1.5 wheel metadata (Requires-Python >=3.8, torch >=1.13.1, gsplat ==1.4.0) and the Nerfstudio install docs (torch 2.1.2 + CUDA 11.8).",
+  "schemaVersion": 1,
+  "recommended": {
+    "nerfstudio": "nerfstudio==1.1.5",
+    "torch": "torch==2.1.2+cu118",
+    "torchvision": "torchvision==0.16.2+cu118",
+    "torchIndexUrl": "https://download.pytorch.org/whl/cu118",
+    "setuptools": "setuptools<70",
+    "gsplat": "gsplat==1.4.0 (pulled in by nerfstudio); replaced by the prebuilt +pt21cu118 wheel because the JIT build fails on Windows with CUDA 11.8",
+    "gsplatWheelSpec": "gsplat==1.4.0",
+    "gsplatWheelIndex": "https://docs.gsplat.studio/whl/pt21cu118",
+    "cudaToolkitForGsplatJit": "CUDA Toolkit 11.8 + MSVC C++ build tools",
+    "pythonPreferred": ["3.10", "3.9"],
+    "pythonSupported": ["3.8", "3.9", "3.10", "3.11"],
+    "colmap": "COLMAP 3.11.x (3.11.1 verified). pf360 runs COLMAP itself with --SiftExtraction.*/--SiftMatching.* options and a fixed PINHOLE camera",
+    "ffmpeg": "FFmpeg 5.0+ (9.0.2 used for pf360 tests)",
+    "approxDownloadGB": 8,
+    "approxDiskGB": 12,
+    "verified": true,
+    "verifiedOn": "2026-11-21, Windows 11, RTX 3060 12 GB, driver 617.42, Python 3.10.7, CUDA Toolkit 11.8, MSVC 14.38: torch 2.1.2+cu118, nerfstudio 1.1.5, gsplat 1.4.0+pt21cu118 (prebuilt wheel), setuptools 69.5.1, COLMAP 3.11.1 (conda-forge cuda_126), FFmpeg 9.0.2. Preview preset on a SYNTHETIC 2880x1440 30 s clip (scripts/pf360/make_synthetic_360.py): 240/240 views registered, 7000 its, 259,599 Gaussians, PLY validated and loaded Z-up in PointForge. Not yet run on real 360 footage."
+  },
+  "nerfstudioCliFacts": {
+    "_source": "nerfstudio 1.1.5 source, re-checked at run time via --help",
+    "equirectViewsPerFrame": [8, 14],
+    "equirectCropOrder": "top, bottom, left, right (fractions; top/bottom drop elevation rings, left/right narrow yaw)",
+    "methods": ["splatfacto", "splatfacto-big"],
+    "splatfactoBigOverrides": {"cull_alpha_thresh": 0.005, "densify_grad_thresh": 0.0005},
+    "noMaxGaussianBudget": true,
+    "exportCommand": "ns-export gaussian-splat --load-config <config.yml> --output-dir <dir> --output-filename <name>.ply",
+    "exportLayout": "binary_little_endian float: x y z, f_dc_0..2, f_rest_*, opacity(logit), scale_0..2(log), rot_0..3(w,x,y,z)",
+    "worldUpAxis": "+Z (nerfstudio dataparser orientation_method='up')",
+    "trainProgressLine": "<step> (<percent>%) ..."
+  }
+}

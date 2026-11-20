@@ -1,0 +1,65 @@
+{
+  "_comment": "Single source of truth for 360 reconstruction quality presets. Read by the pf360 worker AND by the PointForge viewer (Reconstruction wizard). Every key maps to a real backend flag - see pf360/nerfstudio_backend.py. framesPerSecond is converted to a target frame count from the selected time window and clamped to [minFrames, maxFrames].",
+  "schemaVersion": 1,
+  "presets": {
+    "preview": {
+      "label": "Preview",
+      "description": "Fast check of whether the footage reconstructs at all. Standard Splatfacto, quarter-resolution training images, few frames, short training.",
+      "method": "splatfacto",
+      "framesPerSecond": 1.0,
+      "minFrames": 20,
+      "maxFrames": 60,
+      "imagesPerEquirect": 8,
+      "matchingMethod": "sequential",
+      "downscaleFactor": 4,
+      "iterations": 7000,
+      "shDegree": 3,
+      "useScaleRegularization": false,
+      "costNote": "Lowest GPU time and VRAM. Expect a soft, low-detail result."
+    },
+    "balanced": {
+      "label": "Balanced",
+      "description": "Standard Splatfacto at half-resolution training images, ~3 sampled frames per second, 8 perspective views per frame.",
+      "method": "splatfacto",
+      "framesPerSecond": 3.0,
+      "minFrames": 30,
+      "maxFrames": 300,
+      "imagesPerEquirect": 8,
+      "matchingMethod": "sequential",
+      "downscaleFactor": 2,
+      "iterations": 30000,
+      "shDegree": 3,
+      "useScaleRegularization": false,
+      "costNote": "Moderate GPU time. Typical 8-12 GB GPUs handle it for short clips."
+    },
+    "high": {
+      "label": "High Quality",
+      "description": "Splatfacto-Big (lower cull alpha + densify thresholds = more Gaussians), full-resolution perspective images, 14 views per frame, longer training.",
+      "method": "splatfacto-big",
+      "fallbackMethod": "splatfacto",
+      "framesPerSecond": 3.0,
+      "minFrames": 30,
+      "maxFrames": 400,
+      "imagesPerEquirect": 14,
+      "matchingMethod": "sequential",
+      "downscaleFactor": 1,
+      "iterations": 40000,
+      "shDegree": 3,
+      "useScaleRegularization": true,
+      "costNote": "Highest GPU time and VRAM; many more Gaussians. Reduce frames or raise the downscale factor if training runs out of memory."
+    }
+  },
+  "limits": {
+    "targetFrames": [2, 2000],
+    "iterations": [500, 200000],
+    "downscaleFactor": [1, 2, 4, 8],
+    "imagesPerEquirect": [8, 14],
+    "shDegree": [0, 3],
+    "crop": [0.0, 0.45],
+    "cullAlphaThresh": [0.0001, 0.5],
+    "densifyGradThresh": [0.00001, 0.01],
+    "cullScaleThresh": [0.01, 5.0],
+    "matchingMethod": ["sequential", "exhaustive", "vocab_tree"],
+    "method": ["splatfacto", "splatfacto-big"]
+  }
+}

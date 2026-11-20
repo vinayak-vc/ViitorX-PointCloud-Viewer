@@ -288,3 +288,18 @@ This document records major design decisions.
   - Render LiDAR point clouds via `PointRenderer` (writing depth to framebuffer) and Gaussian Splats via a dedicated `SplatRenderer` (depth-test ON, depth-write OFF) so LiDAR points correctly occlude splats when in front.
   - Bypass Eye-Dome Lighting (`EdlPass`) post-processing for 3DGS layers while retaining EDL for uncoloured LiDAR clouds.
   - Leverage desktop-side rendering so Web Remote WebRTC/JPEG streaming and Stereoscopic SBS work out of the box without requiring mobile-client GPU splatting.
+
+## 360 Video -> Gaussian Splat: External Python Worker (2026-11-20)
+- **Decision**: 360 reconstruction is orchestrated by a standalone, stdlib-only Python worker (`tools/pf360`) that drives FFmpeg, COLMAP and Nerfstudio Splatfacto as child processes and talks to PointForge over a versioned JSON Lines protocol (stdout) with a `cancel` line on stdin. PointForge owns UI, job queueing, process lifetime (Windows Job Object, kill-on-close) and loading the result on the existing splat path.
+- **Reason**: Gaussian training needs PyTorch + CUDA + gsplat; linking any of that into the C++ app would explode the build and break the single-file static release. A separate worker is reusable by other apps (`python -m pf360 run --manifest`), testable without a GPU, and isolates Nerfstudio version churn. Same Level-2 "orchestrate, don't embed" stance as photogrammetry (ODM/COLMAP).
+- **Details**: equirect->perspective uses Nerfstudio's own `equirect_utils` via `ns_helpers/planar.py` (not `ns-process-data images --camera-type equirectangular`, which re-applies the crop as a pixel crop) so pf360 controls frame extraction (time range, exact count). Tyro boolean flag spelling is detected from the installed CLI's `--help`. Splatfacto-Big falls back to Splatfacto only when the installed Nerfstudio lacks it, with a warning.
+- **Consequences**: success is judged by content (registration ratio, distinct camera positions, PLY validation), never by exit code alone; progress is reported only where a tool exposes it (else `percent: null` -> indeterminate bar). Only the `native` execution backend exists; WSL2/Docker are an extension point of `environment.backend`, not exposed in the UI.
+
+## pf360 outputs load Z-up regardless of the Splat up-axis preference
+- **Decision**: `appendCloud` treats a splat PLY as Z-up when `recon360IsZUpOutput()` finds the pf360 workspace report beside it naming that file; all other splats keep using the global `splatUpAxis` preference (default Y-down).
+- **Reason**: Nerfstudio's dataparser (`orientation_method="up"`) makes +Z the camera-average up and `ns-export` writes model-space means; downloaded 3DGS files are mostly COLMAP Y-down. A per-file signal avoids a second global toggle and keeps Recent/drag-drop/toast loads consistent.
+
+## pf360 workspace safety
+- **Decision**: the worker refuses non-empty output folders it does not own (no `state.json`), clears stage folders only inside its own workspace, never copies/modifies the source video, and never deletes data on failure/cancel. Stage reuse requires a matching SHA-256 fingerprint chain (video size/mtime/head+tail hash + all affecting settings) AND existing outputs.
+- **Reason**: reconstruction runs take hours; retries must be cheap but must never silently mix stale intermediates or overwrite a user's folder.
+

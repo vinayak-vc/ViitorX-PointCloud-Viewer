@@ -316,6 +316,21 @@ format-agnostic — a single generic fill loop in `meshExportWorker` drives eith
 `GlbWriter` or `FbxWriter` — and the `--export-fbx <out.fbx>` smoke hook mirrors
 `--export-glb`.
 
+## 9b. 360 Reconstruction Studio (external worker)
+
+360 video -> Gaussian Splat is orchestrated, not embedded: `Recon360Panel`
+(wizard) enqueues `ConvertJob::Kind::Recon360`; the job thread runs
+`recon360Run` (`src/viewer/Recon360.cpp`), which launches
+`python -m pf360 run --stdin-control --manifest <json>` inside a Windows Job
+Object, parses JSON Lines events into `Recon360Live` (stage states, percent or
+indeterminate, log ring) and cancels via a `cancel` stdin line + 20 s grace +
+`TerminateJobObject`. The worker (`tools/pf360`, copied beside the exe by a
+pfview post-build step) drives FFmpeg, Nerfstudio's equirect projection, COLMAP
+(`ns-process-data`), `ns-train` and `ns-export`, validates the PLY against
+SplatReader's rules and writes a report. Results load through the normal
+`loadOctree` -> `SplatReader` -> `SplatRenderer` path; pf360 outputs are read as
+Z-up. Full design, protocol and manifest: `docs/360-reconstruction.md`.
+
 ## 10. Extension points (deliberate TODOs)
 
 * **LAZ via PDAL**: `laszip_api` covers LAS/LAZ directly; swap to PDAL if you need

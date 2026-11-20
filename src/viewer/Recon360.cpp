@@ -1,0 +1,741 @@
+#include "Recon360.h"
+#include "common/Log.h"
+#include "io/SplatReader.h"
+
+#include <nlohmann/json.hpp>
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
+#include <thread>
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <shellapi.h>
+#endif
+
+namespace fs = std::filesystem;
+using json = nlohmann::json;
+
+namespace pf {
+
+// ---------------------------------------------------------------------------
+// stage labels / weights
+// ---------------------------------------------------------------------------
+const char* recon360StageLabel(int i) {
+    static const char* labels[7] = {"Video validation", "Frame extraction", "Panorama projection",
+                                    "Camera reconstruction (COLMAP)", "Gaussian training", "Gaussian export",
+                                    "PLY validation"};
+    return (i >= 0 && i < 7) ? labels[i] : "Preparing";
+}
+
+float recon360Overall(int stage, float pct) {
+    // Rough share of wall-clock per stage: only used to place the overall bar;
+    // the per-stage percent shown next to it is the backend's real value.
+    static const float w[7] = {0.02f, 0.05f, 0.08f, 0.20f, 0.60f, 0.03f, 0.02f};
+    if (stage < 0) return 0.0f;
+    float acc = 0;
+    for (int i = 0; i < stage && i < 7; ++i) acc += w[i];
+    if (stage < 7 && pct >= 0) acc += w[stage] * std::min(100.0f, pct) / 100.0f;
+    return std::min(1.0f, acc);
+}
+
+// ---------------------------------------------------------------------------
+// view geometry (port of pf360/views.py == Nerfstudio 1.1.5 equirect_utils)
+// ---------------------------------------------------------------------------
+std::vector<std::pair<float, float>> recon360ViewDirections(int ipe, float top, float bottom, float left,
+                                                            float right, bool& unsupported) {
+    unsupported = false;
+    std::vector<std::pair<float, float>> out;
+    if (ipe != 8 && ipe != 14) return out;
+    const double fov = ipe == 8 ? 120.0 : 110.0;
+    const double steps[3] = {ipe == 8 ? 180.0 : 90.0, ipe == 8 ? 90.0 : 60.0, ipe == 8 ? 180.0 : 90.0};
+    double lb = -180, rb = 180;
+    if (right > 0) lb = -180 + 360.0 * right;
+    if (left > 0)  rb = 180 - 360.0 * left;
+    double b[3] = {-45, 0, 45};
+    bool alive[3] = {true, true, true};
+    if (bottom > 0) {
+        const double start = 90 - 180.0 * bottom - fov / 2;
+        for (int i = 2; i >= 0; --i) {
+            if (b[i] > start + fov / 2) { alive[i] = false; continue; }
+            if (b[i] > start) {
+                const double diff = b[i] - start;
+                b[i] = start;
+                for (int j = i - 1; j >= 0; --j) b[j] -= diff / std::pow(2.0, i - j);
+                break;
+            }
+        }
+    }
+    if (top > 0) {
+        const double start = -90 + 180.0 * top + fov / 2;
+        for (int i = 0; i < 3; ++i) {
+            if (!alive[i]) { unsupported = true; return {}; }      // Nerfstudio: None < float
+            if (b[i] < start - fov / 2) { alive[i] = false; continue; }
+            if (b[i] < start) {
+                const double diff = start - b[i];
+                b[i] = start;
+                for (int j = i + 1; j < 3; ++j) {
+                    if (!alive[j]) { unsupported = true; return {}; }  // Nerfstudio: None += float
+                    b[j] += diff / std::pow(2.0, j - i);
+                }
+                break;
+            }
+        }
+    }
+    for (int ring : {1, 2, 0}) {
+        if (!alive[ring]) continue;
+        const int n = std::max(0, (int)std::ceil((rb - lb) / steps[ring]));
+        for (int k = 0; k < n; ++k) out.push_back({(float)(lb + k * steps[ring]), (float)b[ring]});
+    }
+    return out;
+}
+
+int recon360ViewsPerFrame(int ipe, float top, float bottom, float left, float right) {
+    bool unsupported = false;
+    auto v = recon360ViewDirections(ipe, top, bottom, left, right, unsupported);
+    return unsupported ? -1 : (int)v.size();
+}
+
+int recon360PerspectiveSize(int w, int h, int ipe) {
+    if (w <= 0 || h <= 0 || ipe <= 0) return 0;
+    return (int)std::sqrt((double)w * (double)h / (double)ipe);
+}
+
+#ifdef _WIN32
+// ---------------------------------------------------------------------------
+// UTF-8 <-> UTF-16 + argument quoting (MSVCRT CommandLineToArgvW rules)
+// ---------------------------------------------------------------------------
+namespace {
+
+std::wstring widen(const std::string& s) {
+    if (s.empty()) return {};
+    int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), nullptr, 0);
+    std::wstring w((size_t)n, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), w.data(), n);
+    return w;
+}
+
+std::string narrow(const std::wstring& w) {
+    if (w.empty()) return {};
+    int n = WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(), nullptr, 0, nullptr, nullptr);
+    std::string s((size_t)n, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(), s.data(), n, nullptr, nullptr);
+    return s;
+}
+
+std::wstring quoteArg(const std::wstring& a) {
+    if (!a.empty() && a.find_first_of(L" \t\n\v\"") == std::wstring::npos) return a;
+    std::wstring out = L"\"";
+    for (auto it = a.begin();; ++it) {
+        size_t backslashes = 0;
+        while (it != a.end() && *it == L'\\') { ++it; ++backslashes; }
+        if (it == a.end()) { out.append(backslashes * 2, L'\\'); break; }
+        if (*it == L'"') { out.append(backslashes * 2 + 1, L'\\'); out.push_back(L'"'); }
+        else { out.append(backslashes, L'\\'); out.push_back(*it); }
+    }
+    out.push_back(L'"');
+    return out;
+}
+
+fs::path exeDir() {
+    wchar_t buf[MAX_PATH * 4];
+    DWORD n = GetModuleFileNameW(nullptr, buf, (DWORD)(sizeof(buf) / sizeof(buf[0])));
+    return fs::path(std::wstring(buf, n)).parent_path();
+}
+
+fs::path localAppData() {
+    const wchar_t* v = _wgetenv(L"LOCALAPPDATA");
+    if (!v || !*v) v = _wgetenv(L"TEMP");
+    return fs::path(v ? v : L".");
+}
+
+bool isFile(const std::wstring& p) {
+    std::error_code ec;
+    return !p.empty() && fs::is_regular_file(fs::path(p), ec);
+}
+
+std::wstring searchPath(const wchar_t* name) {
+    wchar_t buf[MAX_PATH * 4];
+    DWORD n = SearchPathW(nullptr, name, L".exe", (DWORD)(sizeof(buf) / sizeof(buf[0])), buf, nullptr);
+    return n ? std::wstring(buf, n) : std::wstring();
+}
+
+// Child environment: current env + UTF-8 Python + worker on PYTHONPATH +
+// explicit tool overrides (read by pf360.environment.resolve_tools).
+std::vector<wchar_t> buildEnv(const Recon360Settings& s, const std::wstring& workerRoot) {
+    std::vector<std::pair<std::wstring, std::wstring>> extra = {
+        {L"PYTHONUTF8", L"1"}, {L"PYTHONIOENCODING", L"utf-8"}, {L"PYTHONUNBUFFERED", L"1"},
+        {L"PYTHONPATH", workerRoot}};
+    if (!s.nsPython.empty())   extra.push_back({L"PF360_NS_PYTHON", widen(s.nsPython)});
+    if (!s.colmapExe.empty())  extra.push_back({L"PF360_COLMAP", widen(s.colmapExe)});
+    if (!s.ffmpegExe.empty())  extra.push_back({L"PF360_FFMPEG", widen(s.ffmpegExe)});
+    if (!s.ffprobeExe.empty()) extra.push_back({L"PF360_FFPROBE", widen(s.ffprobeExe)});
+    std::vector<wchar_t> block;
+    LPWCH cur = GetEnvironmentStringsW();
+    for (LPWCH p = cur; p && *p;) {
+        std::wstring e(p);
+        p += e.size() + 1;
+        const size_t eq = e.find(L'=', 1);
+        const std::wstring key = eq == std::wstring::npos ? e : e.substr(0, eq);
+        bool overridden = false;
+        for (const auto& kv : extra)
+            if (_wcsicmp(kv.first.c_str(), key.c_str()) == 0) overridden = true;
+        if (overridden) continue;
+        block.insert(block.end(), e.begin(), e.end());
+        block.push_back(L'\0');
+    }
+    if (cur) FreeEnvironmentStringsW(cur);
+    for (const auto& kv : extra) {
+        std::wstring e = kv.first + L"=" + kv.second;
+        block.insert(block.end(), e.begin(), e.end());
+        block.push_back(L'\0');
+    }
+    block.push_back(L'\0');
+    return block;
+}
+
+// A child process tree confined to a Job Object (KILL_ON_JOB_CLOSE).
+struct Child {
+    HANDLE process = nullptr, job = nullptr, outRd = nullptr, errRd = nullptr, inWr = nullptr;
+    ~Child() { close(); }
+    void close() {
+        for (HANDLE* h : {&inWr, &outRd, &errRd, &process}) if (*h) { CloseHandle(*h); *h = nullptr; }
+        if (job) { CloseHandle(job); job = nullptr; }   // kills anything still alive in the job
+    }
+    void terminateTree() { if (job) TerminateJobObject(job, 1); else if (process) TerminateProcess(process, 1); }
+};
+
+bool spawn(const std::vector<std::wstring>& argv, const std::wstring& cwd, const std::vector<wchar_t>& env,
+           bool wantStdin, Child& c, std::string& err) {
+    SECURITY_ATTRIBUTES sa{sizeof(sa), nullptr, TRUE};
+    HANDLE outWr = nullptr, errWr = nullptr, inRd = nullptr;
+    if (!CreatePipe(&c.outRd, &outWr, &sa, 0) || !CreatePipe(&c.errRd, &errWr, &sa, 0)) {
+        err = "CreatePipe failed";
+        return false;
+    }
+    SetHandleInformation(c.outRd, HANDLE_FLAG_INHERIT, 0);
+    SetHandleInformation(c.errRd, HANDLE_FLAG_INHERIT, 0);
+    if (wantStdin) {
+        if (!CreatePipe(&inRd, &c.inWr, &sa, 0)) { err = "CreatePipe failed"; return false; }
+        SetHandleInformation(c.inWr, HANDLE_FLAG_INHERIT, 0);
+    }
+    c.job = CreateJobObjectW(nullptr, nullptr);
+    if (c.job) {
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION li{};
+        li.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        SetInformationJobObject(c.job, JobObjectExtendedLimitInformation, &li, sizeof(li));
+    }
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    si.hStdOutput = outWr;
+    si.hStdError = errWr;
+    si.hStdInput = wantStdin ? inRd : nullptr;
+    std::wstring cmd;
+    for (size_t i = 0; i < argv.size(); ++i) { if (i) cmd += L' '; cmd += quoteArg(argv[i]); }
+    std::vector<wchar_t> cmdBuf(cmd.begin(), cmd.end());
+    cmdBuf.push_back(L'\0');
+    PROCESS_INFORMATION pi{};
+    const BOOL ok = CreateProcessW(argv[0].c_str(), cmdBuf.data(), nullptr, nullptr, TRUE,
+                                   CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED,
+                                   (LPVOID)env.data(), cwd.empty() ? nullptr : cwd.c_str(), &si, &pi);
+    CloseHandle(outWr);
+    CloseHandle(errWr);
+    if (inRd) CloseHandle(inRd);
+    if (!ok) {
+        err = "could not start " + narrow(argv[0]) + " (error " + std::to_string(GetLastError()) + ")";
+        return false;
+    }
+    if (c.job && !AssignProcessToJobObject(c.job, pi.hProcess))
+        logWarn("[pf360] AssignProcessToJobObject failed; child tree cleanup falls back to the worker");
+    ResumeThread(pi.hThread);
+    CloseHandle(pi.hThread);
+    c.process = pi.hProcess;
+    return true;
+}
+
+// Reads a pipe to EOF on its own thread, line by line.
+std::thread lineReader(HANDLE h, std::function<void(const std::string&)> onLine) {
+    return std::thread([h, onLine]() {
+        std::string pending;
+        char buf[8192];
+        DWORD got = 0;
+        while (ReadFile(h, buf, sizeof(buf), &got, nullptr) && got > 0) {
+            pending.append(buf, got);
+            size_t nl;
+            while ((nl = pending.find('\n')) != std::string::npos) {
+                std::string line = pending.substr(0, nl);
+                pending.erase(0, nl + 1);
+                while (!line.empty() && (line.back() == '\r')) line.pop_back();
+                if (!line.empty()) onLine(line);
+            }
+            if (pending.size() > (1u << 20)) { onLine(pending); pending.clear(); }
+        }
+        if (!pending.empty()) onLine(pending);
+    });
+}
+
+std::vector<std::wstring> pythonLauncher(const Recon360Settings& s) {
+    if (isFile(widen(s.workerPython))) return {widen(s.workerPython)};
+    // The worker is stdlib-only: any CPython >= 3.8 works, including the Nerfstudio env's.
+    const std::wstring envPy = (localAppData() / L"ViitorX" / L"PointForge" / L"engines" / L"pf360-env" /
+                                L"Scripts" / L"python.exe").wstring();
+    std::wstring py = searchPath(L"py");
+    if (!py.empty()) return {py, L"-3"};
+    py = searchPath(L"python");
+    // Skip the Microsoft Store alias stub (it opens the Store instead of running).
+    if (!py.empty() && py.find(L"WindowsApps") == std::wstring::npos) return {py};
+    if (isFile(widen(s.nsPython))) return {widen(s.nsPython)};
+    if (isFile(envPy)) return {envPy};
+    return {};
+}
+
+// Runs `python -m pf360 <args>` and returns stdout (bounded) — for short commands.
+bool runWorkerCapture(const Recon360Settings& s, const std::vector<std::wstring>& args, int timeoutMs,
+                      std::string& out, std::string& err) {
+    const std::string root = recon360WorkerRoot();
+    if (root.empty()) { err = "pf360 worker files not found next to PointForge (pf360\\pf360\\__main__.py)"; return false; }
+    std::vector<std::wstring> argv = pythonLauncher(s);
+    if (argv.empty()) { err = "No Python 3 interpreter found. Install Python 3.8+ or set one in Preferences > 360 Reconstruction."; return false; }
+    argv.push_back(L"-m");
+    argv.push_back(L"pf360");
+    argv.insert(argv.end(), args.begin(), args.end());
+    Child c;
+    if (!spawn(argv, widen(root), buildEnv(s, widen(root)), false, c, err)) return false;
+    std::string errText;
+    std::mutex m;
+    std::thread te = lineReader(c.errRd, [&](const std::string& l) {
+        std::lock_guard<std::mutex> lk(m);
+        if (errText.size() < 16384) errText += l + "\n";
+    });
+    std::thread to = lineReader(c.outRd, [&](const std::string& l) {
+        if (out.size() < (8u << 20)) out += l + "\n";
+    });
+    const DWORD w = WaitForSingleObject(c.process, (DWORD)timeoutMs);
+    c.terminateTree();      // timeout, or stray grandchildren still holding the pipes
+    WaitForSingleObject(c.process, 5000);
+    to.join();
+    te.join();
+    DWORD code = 1;
+    GetExitCodeProcess(c.process, &code);
+    if (w != WAIT_OBJECT_0) { err = "worker timed out"; return false; }
+    if (out.empty()) {
+        err = errText.empty() ? "worker produced no output (exit " + std::to_string(code) + ")" : errText.substr(0, 600);
+        return false;
+    }
+    return true;
+}
+
+std::string str(const json& j, const char* k) {
+    auto it = j.find(k);
+    return (it != j.end() && it->is_string()) ? it->get<std::string>() : std::string();
+}
+double num(const json& j, const char* k, double def = 0) {
+    auto it = j.find(k);
+    return (it != j.end() && it->is_number()) ? it->get<double>() : def;
+}
+bool boolean(const json& j, const char* k) {
+    auto it = j.find(k);
+    return it != j.end() && it->is_boolean() && it->get<bool>();
+}
+std::vector<std::string> strList(const json& j, const char* k) {
+    std::vector<std::string> v;
+    auto it = j.find(k);
+    if (it != j.end() && it->is_array())
+        for (const auto& e : *it) if (e.is_string()) v.push_back(e.get<std::string>());
+    return v;
+}
+
+} // namespace
+
+std::string recon360WorkerRoot() {
+    std::error_code ec;
+    const fs::path exe = exeDir();
+    if (fs::exists(exe / L"pf360" / L"pf360" / L"__main__.py", ec)) return narrow((exe / L"pf360").wstring());
+    // Dev builds (build\Release\...): walk up to the repo's tools/pf360.
+    fs::path p = exe;
+    for (int i = 0; i < 5 && !p.empty(); ++i, p = p.parent_path())
+        if (fs::exists(p / L"tools" / L"pf360" / L"pf360" / L"__main__.py", ec))
+            return narrow((p / L"tools" / L"pf360").wstring());
+    return {};
+}
+
+std::string recon360FindPython(const Recon360Settings& s) {
+    auto v = pythonLauncher(s);
+    return v.empty() ? std::string() : narrow(v[0]) + (v.size() > 1 ? " " + narrow(v[1]) : "");
+}
+
+std::vector<Recon360Preset> recon360LoadPresets(std::string& err) {
+    std::vector<Recon360Preset> out;
+    const std::string root = recon360WorkerRoot();
+    if (root.empty()) { err = "pf360 worker not found"; return out; }
+    try {
+        std::ifstream f(fs::path(widen(root)) / L"pf360" / L"presets.json");
+        json j = json::parse(f);
+        for (const char* key : {"preview", "balanced", "high"}) {
+            const json& p = j.at("presets").at(key);
+            Recon360Preset r;
+            r.key = key;
+            r.label = str(p, "label");
+            r.description = str(p, "description");
+            r.method = str(p, "method");
+            r.fallbackMethod = str(p, "fallbackMethod");
+            r.matchingMethod = str(p, "matchingMethod");
+            r.costNote = str(p, "costNote");
+            r.framesPerSecond = num(p, "framesPerSecond", 3.0);
+            r.minFrames = (int)num(p, "minFrames", 30);
+            r.maxFrames = (int)num(p, "maxFrames", 300);
+            r.imagesPerEquirect = (int)num(p, "imagesPerEquirect", 8);
+            r.downscaleFactor = (int)num(p, "downscaleFactor", 2);
+            r.iterations = (int)num(p, "iterations", 30000);
+            r.shDegree = (int)num(p, "shDegree", 3);
+            r.useScaleRegularization = boolean(p, "useScaleRegularization");
+            out.push_back(r);
+        }
+    } catch (const std::exception& e) {
+        err = std::string("presets.json: ") + e.what();
+        out.clear();
+    }
+    return out;
+}
+
+int recon360FramesForWindow(const Recon360Preset& p, double window) {
+    if (window <= 0) return p.minFrames;
+    return (int)std::max<double>(p.minFrames, std::min<double>(p.maxFrames, std::round(p.framesPerSecond * window)));
+}
+
+Recon360Doctor recon360RunDoctor(const Recon360Settings& s, bool quick) {
+    Recon360Doctor d;
+    std::string out, err;
+    std::vector<std::wstring> args = {L"doctor", L"--json"};
+    if (quick) args.push_back(L"--quick");
+    if (!runWorkerCapture(s, args, quick ? 60000 : 300000, out, err)) { d.error = err; return d; }
+    try {
+        json j = json::parse(out);
+        d.ran = true;
+        d.ready = boolean(j, "ready");
+        for (const auto& c : j.value("checks", json::array()))
+            d.checks.push_back({str(c, "name"), str(c, "status"), str(c, "detail"), str(c, "fix")});
+        d.methods = strList(j, "methods");
+        const json t = j.value("torch", json::object());
+        d.cuda = boolean(t, "cuda");
+        d.torchVersion = str(t, "torch");
+        d.nerfstudioVersion = str(t, "nerfstudio");
+        const json g = j.value("gpu", json::object());
+        if (g.contains("gpus") && g["gpus"].is_array() && !g["gpus"].empty()) {
+            const json& g0 = g["gpus"][0];
+            d.gpuName = str(g0, "name");
+            d.gpuTotalMB = (int)num(g0, "totalMB");
+            d.gpuFreeMB = (int)num(g0, "freeMB");
+        }
+    } catch (const std::exception& e) {
+        d.ran = false;
+        d.error = std::string("could not parse doctor output: ") + e.what();
+    }
+    return d;
+}
+
+Recon360Probe recon360ProbeVideo(const Recon360Settings& s, const std::string& video, double start, double end) {
+    Recon360Probe p;
+    std::string out, err;
+    std::vector<std::wstring> args = {L"probe", widen(video), L"--json", L"--quality"};
+    char b[64];
+    if (start > 0) { snprintf(b, sizeof(b), "%.3f", start); args.push_back(L"--start"); args.push_back(widen(b)); }
+    if (end > 0)   { snprintf(b, sizeof(b), "%.3f", end);   args.push_back(L"--end");   args.push_back(widen(b)); }
+    if (!runWorkerCapture(s, args, 300000, out, err)) { p.error = err; return p; }
+    try {
+        json j = json::parse(out);
+        p.errors = strList(j, "errors");
+        p.warnings = strList(j, "warnings");
+        p.ok = boolean(j, "ok");
+        p.fileName = str(j, "fileName");
+        p.codec = str(j, "codec");
+        p.pixelFormat = str(j, "pixelFormat");
+        p.width = (int)num(j, "width");
+        p.height = (int)num(j, "height");
+        p.fps = num(j, "fps");
+        p.durationSeconds = num(j, "durationSeconds");
+        p.frameCount = (long long)num(j, "frameCount", -1);
+        p.fileSizeBytes = (uint64_t)num(j, "fileSizeBytes");
+        p.hasAudio = boolean(j, "hasAudio");
+        if (j.contains("classification")) {
+            const json& c = j["classification"];
+            p.projection = str(c, "projection");
+            p.projectionConfidence = str(c, "confidence");
+            p.supported = boolean(c, "supported");
+            p.requiresConfirmation = boolean(c, "requiresConfirmation");
+            p.reasons = strList(c, "reasons");
+        }
+        if (!p.ok && p.error.empty() && !p.errors.empty()) p.error = p.errors.front();
+    } catch (const std::exception& e) {
+        p.ok = false;
+        p.error = std::string("could not parse probe output: ") + e.what();
+    }
+    return p;
+}
+
+bool recon360ExtractFrame(const Recon360Settings& s, const std::string& video, double t, int width,
+                          std::vector<unsigned char>& rgb, int& outW, int& outH, std::string& err) {
+    const fs::path tmp = fs::temp_directory_path() / widen("pf360_preview_" + std::to_string(GetCurrentProcessId()) + ".rgb");
+    char tb[32];
+    snprintf(tb, sizeof(tb), "%.3f", t);
+    std::string out;
+    if (!runWorkerCapture(s, {L"frame", widen(video), L"--time", widen(tb), L"--width", std::to_wstring(width),
+                              L"--out", tmp.wstring()}, 120000, out, err))
+        return false;
+    try {
+        json j = json::parse(out);
+        if (!boolean(j, "ok")) { err = str(j, "error"); return false; }
+        outW = (int)num(j, "width");
+        outH = (int)num(j, "height");
+        std::ifstream f(tmp, std::ios::binary);
+        rgb.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+        f.close();
+        std::error_code ec;
+        fs::remove(tmp, ec);
+        if ((int)rgb.size() != outW * outH * 3) { err = "preview frame has the wrong size"; return false; }
+        return true;
+    } catch (const std::exception& e) {
+        err = e.what();
+        return false;
+    }
+}
+
+bool recon360WriteManifest(const Recon360JobSpec& sp, const Recon360Settings& s, std::string& path,
+                           std::string& err) {
+    json m;
+    m["schemaVersion"] = 1;
+    m["jobId"] = sp.jobId;
+    m["jobType"] = "360_video_to_gaussian_splat";
+    m["input"] = {{"videoPath", sp.videoPath}, {"projection", "equirectangular"},
+                  {"projectionConfirmed", sp.projectionConfirmed}, {"startTimeSeconds", sp.startSeconds},
+                  {"endTimeSeconds", sp.endSeconds > 0 ? json(sp.endSeconds) : json(nullptr)}};
+    m["processing"] = {{"targetFrames", sp.targetFrames}, {"imagesPerEquirect", sp.imagesPerEquirect},
+                       {"cropTop", sp.cropTop}, {"cropBottom", sp.cropBottom}, {"cropLeft", sp.cropLeft},
+                       {"cropRight", sp.cropRight}, {"matchingMethod", sp.matchingMethod}};
+    json tr = {{"qualityPreset", sp.qualityPreset}, {"method", sp.method}, {"iterations", sp.iterations},
+               {"downscaleFactor", sp.downscaleFactor}, {"shDegree", sp.shDegree}, {"randomSeed", sp.randomSeed},
+               {"useScaleRegularization", sp.useScaleRegularization}};
+    if (!sp.fallbackMethod.empty()) tr["fallbackMethod"] = sp.fallbackMethod;
+    if (sp.cullAlphaThresh > 0)   tr["cullAlphaThresh"] = sp.cullAlphaThresh;
+    if (sp.densifyGradThresh > 0) tr["densifyGradThresh"] = sp.densifyGradThresh;
+    if (sp.cullScaleThresh > 0)   tr["cullScaleThresh"] = sp.cullScaleThresh;
+    m["training"] = tr;
+    m["output"] = {{"directory", sp.outputDir}, {"format", "ply"}, {"keepIntermediate", true}};
+    if (!sp.plyFileName.empty()) m["output"]["plyFileName"] = sp.plyFileName;
+    json env = {{"backend", "native"}};
+    if (!s.nsPython.empty())   env["nerfstudioPython"] = s.nsPython;
+    if (!s.colmapExe.empty())  env["colmapExe"] = s.colmapExe;
+    if (!s.ffmpegExe.empty())  env["ffmpegExe"] = s.ffmpegExe;
+    if (!s.ffprobeExe.empty()) env["ffprobeExe"] = s.ffprobeExe;
+    m["environment"] = env;
+    json opts = {{"allowCache", sp.allowCache}};
+    if (!sp.stopAfter.empty()) opts["stopAfter"] = sp.stopAfter;
+    m["options"] = opts;
+
+    std::error_code ec;
+    const fs::path dir = localAppData() / L"ViitorX" / L"PointForge" / L"pf360-jobs";
+    fs::create_directories(dir, ec);
+    const fs::path p = dir / widen(sp.jobId + ".json");
+    std::ofstream f(p, std::ios::binary | std::ios::trunc);
+    if (!f) { err = "cannot write manifest " + narrow(p.wstring()); return false; }
+    f << m.dump(2);
+    path = narrow(p.wstring());
+    return (bool)f;
+}
+
+bool recon360Run(const Recon360JobSpec& spec, const Recon360Settings& s, std::atomic<bool>& cancel,
+                 Recon360Live& live, const std::function<void(float, const std::string&)>& progress,
+                 std::string& err) {
+    std::string manifest;
+    if (!recon360WriteManifest(spec, s, manifest, err)) return false;
+    const std::string root = recon360WorkerRoot();
+    if (root.empty()) { err = "pf360 worker files not found"; return false; }
+    std::vector<std::wstring> argv = pythonLauncher(s);
+    if (argv.empty()) { err = "No Python 3 interpreter found (Preferences > 360 Reconstruction)"; return false; }
+    for (const wchar_t* a : {L"-m", L"pf360", L"run", L"--stdin-control", L"--manifest"}) argv.push_back(a);
+    argv.push_back(widen(manifest));
+
+    Child c;
+    if (!spawn(argv, widen(root), buildEnv(s, widen(root)), true, c, err)) return false;
+    logInfo("[pf360] job " + spec.jobId + " started (manifest " + manifest + ")");
+
+    // stderr = human diagnostics (tracebacks, tool noise) -> Console + live log
+    std::thread te = lineReader(c.errRd, [&](const std::string& l) {
+        logDebug("[pf360] " + l);
+        std::lock_guard<std::mutex> lk(live.mu);
+        live.addLog(l);
+    });
+
+    bool completed = false, failed = false, cancelled = false;
+    std::string failMsg;
+    std::thread to = lineReader(c.outRd, [&](const std::string& line) {
+        json ev;
+        try { ev = json::parse(line); } catch (...) {
+            std::lock_guard<std::mutex> lk(live.mu);
+            live.addLog(line);                      // tolerate stray non-JSON output
+            return;
+        }
+        if (num(ev, "v", 0) != 1) return;           // unknown protocol version: ignore
+        const std::string type = str(ev, "type"), stage = str(ev, "stage"), msg = str(ev, "message");
+        int si = -1;
+        for (int i = 0; i < 7; ++i) if (stage == Recon360Live::kStages[i]) si = i;
+        float overall = -2;
+        std::string status;
+        {
+            std::lock_guard<std::mutex> lk(live.mu);
+            if (type == "stage_started" && si >= 0) {
+                live.stage[si] = Recon360Live::StageState::Running;
+                live.currentStage = si;
+                live.stagePercent = -1;
+                live.stageMessage.clear();
+                live.addLog(std::string("> ") + recon360StageLabel(si));
+                overall = recon360Overall(si, 0);
+                status = recon360StageLabel(si);
+            } else if (type == "progress" && si >= 0) {
+                const auto it = ev.find("percent");
+                live.stagePercent = (it != ev.end() && it->is_number()) ? it->get<float>() : -1.0f;
+                live.stageMessage = msg;
+                overall = live.stagePercent >= 0 ? recon360Overall(si, live.stagePercent) : -1.0f;
+                status = std::string(recon360StageLabel(si)) + (msg.empty() ? "" : ": " + msg);
+            } else if ((type == "stage_completed" || type == "stage_skipped") && si >= 0) {
+                live.stage[si] = type == "stage_completed" ? Recon360Live::StageState::Done
+                                                           : Recon360Live::StageState::Skipped;
+                live.addLog(std::string(recon360StageLabel(si)) +
+                            (type == "stage_completed" ? " - done" : " - reused cached result"));
+                overall = recon360Overall(si + 1, 0);
+            } else if (type == "log") {
+                live.addLog(msg);
+            } else if (type == "warning") {
+                live.warnings.push_back(msg);
+                live.addLog("WARNING: " + msg);
+            } else if (type == "error") {
+                if (si >= 0) live.stage[si] = Recon360Live::StageState::Failed;
+                live.addLog("ERROR: " + msg);
+            } else if (type == "cancellation_requested") {
+                live.addLog("Cancellation requested...");
+            } else if (type == "job_completed" || type == "job_failed" || type == "job_cancelled") {
+                live.finalMessage = msg;
+                if (ev.contains("data")) {
+                    const json& d = ev["data"];
+                    live.reportJson = d.dump(2);
+                    live.workspace = str(d, "workspace");
+                    if (d.contains("output")) {
+                        live.gaussianCount = (uint64_t)num(d["output"], "gaussianCount");
+                        live.plyBytes = (uint64_t)num(d["output"], "fileSizeBytes");
+                    }
+                }
+                if (type == "job_completed") { completed = true; live.outputPly = str(ev, "outputPath"); }
+                if (type == "job_failed") { failed = true; failMsg = msg; }
+                if (type == "job_cancelled") cancelled = true;
+                live.addLog(msg);
+            }
+        }
+        if (overall > -2 && progress) progress(overall, status.empty() ? msg : status);
+        if (type == "warning") logWarn("[pf360] " + msg);
+        if (type == "job_failed") logError("[pf360] " + msg);
+    });
+
+    // Poll for cancellation while the worker runs.
+    bool cancelSent = false;
+    auto cancelAt = std::chrono::steady_clock::time_point{};
+    for (;;) {
+        if (WaitForSingleObject(c.process, 150) == WAIT_OBJECT_0) break;
+        if (cancel.load() && !cancelSent) {
+            cancelSent = true;
+            cancelAt = std::chrono::steady_clock::now();
+            const char msg[] = "cancel\n";
+            DWORD wr = 0;
+            WriteFile(c.inWr, msg, sizeof(msg) - 1, &wr, nullptr);
+            logInfo("[pf360] cancel sent to worker");
+        }
+        // Grace period for the worker to stop its children and write its report.
+        if (cancelSent && std::chrono::steady_clock::now() - cancelAt > std::chrono::seconds(20)) {
+            logWarn("[pf360] worker did not stop in 20 s; terminating its process tree");
+            c.terminateTree();
+            WaitForSingleObject(c.process, 5000);
+            break;
+        }
+    }
+    // The worker exited: anything it left behind in the job dies now.
+    c.terminateTree();
+    to.join();
+    te.join();
+    DWORD code = 1;
+    GetExitCodeProcess(c.process, &code);
+    logInfo("[pf360] job " + spec.jobId + " exited with code " + std::to_string(code));
+
+    if (cancel.load() || cancelled) { err = "Canceled"; return false; }
+    if (failed) { err = failMsg; return false; }
+    if (!completed) { err = "Worker exited unexpectedly (code " + std::to_string(code) + ") - see Console"; return false; }
+    if (!spec.stopAfter.empty() && live.outputPly.empty()) return true;   // partial run requested
+    // Host-side compatibility check with the existing reader (header sniff).
+    if (live.outputPly.empty() ||
+        SplatReader::detectFormat(live.outputPly) != SplatFileFormat::PlyGaussians) {
+        err = "Worker reported success but the output is not a Gaussian-splat PLY readable by PointForge";
+        return false;
+    }
+    return true;
+}
+
+bool recon360IsZUpOutput(const std::string& plyPath) {
+    std::error_code ec;
+    const fs::path ply = fs::path(widen(plyPath));
+    const fs::path report = ply.parent_path().parent_path() / L"reconstruction_report.json";
+    if (!fs::exists(report, ec)) return false;
+    try {
+        std::ifstream f(report);
+        json j = json::parse(f);
+        const json& o = j.at("output");
+        if (str(o, "upAxis") != "z_up") return false;
+        return fs::equivalent(fs::path(widen(str(o, "path"))), ply, ec);
+    } catch (...) {
+        return false;
+    }
+}
+
+void recon360Reveal(const std::string& path, bool selectFile) {
+    std::wstring w = widen(path);
+    if (selectFile) {
+        std::wstring args = L"/select,\"" + w + L"\"";
+        ShellExecuteW(nullptr, L"open", L"explorer.exe", args.c_str(), nullptr, SW_SHOWNORMAL);
+    } else {
+        ShellExecuteW(nullptr, L"open", w.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    }
+}
+
+#else  // ---------------------------------------------------------------- stubs
+std::string recon360WorkerRoot() { return {}; }
+std::string recon360FindPython(const Recon360Settings&) { return {}; }
+std::vector<Recon360Preset> recon360LoadPresets(std::string& err) { err = "Windows only"; return {}; }
+int recon360FramesForWindow(const Recon360Preset& p, double) { return p.minFrames; }
+Recon360Doctor recon360RunDoctor(const Recon360Settings&, bool) { Recon360Doctor d; d.error = "Windows only"; return d; }
+Recon360Probe recon360ProbeVideo(const Recon360Settings&, const std::string&, double, double) {
+    Recon360Probe p; p.error = "Windows only"; return p;
+}
+bool recon360ExtractFrame(const Recon360Settings&, const std::string&, double, int, std::vector<unsigned char>&,
+                          int&, int&, std::string& err) { err = "Windows only"; return false; }
+bool recon360WriteManifest(const Recon360JobSpec&, const Recon360Settings&, std::string&, std::string& err) {
+    err = "Windows only"; return false;
+}
+bool recon360Run(const Recon360JobSpec&, const Recon360Settings&, std::atomic<bool>&, Recon360Live&,
+                 const std::function<void(float, const std::string&)>&, std::string& err) {
+    err = "360 reconstruction is only implemented on Windows"; return false;
+}
+bool recon360IsZUpOutput(const std::string&) { return false; }
+void recon360Reveal(const std::string&, bool) {}
+#endif
+
+} // namespace pf

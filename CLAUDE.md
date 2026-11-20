@@ -33,7 +33,11 @@ src/tools/pfconvert/main.cpp   importer CLI entry point
 src/viewer/    Camera, Shader, OctreeStore (load + async streaming),
                  PointRenderer (GPU VBO cache + eviction), main.cpp (pfview),
                  Jobs.h (background convert job queue), UiLog.h (Console ring
-                 buffer fed by pf::setLogSink)
+                 buffer fed by pf::setLogSink), Recon360 (pf360 worker bridge:
+                 process/Job Object/JSONL), Recon360Panel (360 wizard)
+tools/pf360/   standalone Python worker: 360 video -> FFmpeg -> Nerfstudio
+                 projection -> COLMAP -> Splatfacto -> 3DGS PLY (stdlib-only;
+                 copied beside the exe by a pfview post-build step)
 shaders/       point.vert / point.frag (GLSL 330 core)
 docs/ARCHITECTURE.md   the why: 3-phase out-of-core build, MNO LOD, on-disk format
 ```
@@ -61,7 +65,13 @@ Keys: LMB orbit, 2xLMB focus, RMB look, WASD+QE fly (Shift fast), wheel zoom,
 Ctrl+wheel point size, F frame, M measure, C clip, 1/3/7 view presets, 5 ortho,
 F1 shortcuts, Ctrl+P command palette, F3 stats HUD, F5 or Shift+Space hide UI,
 F9 stereoscopic SBS (hides ALL UI; F9/Esc exits), F11 fullscreen, Ctrl+O open,
-Ctrl+I convert, Ctrl+E export GLB, Ctrl+, preferences, Esc Esc quit.
+Ctrl+I convert, Ctrl+R 360 video -> Gaussian Splat, Ctrl+E export GLB,
+Ctrl+, preferences, Esc Esc quit.
+
+360 Reconstruction Studio (docs/360-reconstruction.md): wizard -> JobQueue
+`Kind::Recon360` -> `python -m pf360 run` (JSONL events). Worker tests:
+`cd tools/pf360; python -m unittest discover -s tests -t .`; host tests:
+`pf360hosttest`. Nerfstudio env: `scripts/pf360/setup_environment.ps1`.
 
 Export: 2D slice → DXF/PNG/CSV (Properties > Clip). 3D mesh → GLB/glTF 2.0 or
 FBX (File > Export > GLB/FBX, Ctrl+E; Format combo in the dialog). GLB: point

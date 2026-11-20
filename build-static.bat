@@ -9,6 +9,7 @@ rem MSVC toolset mismatch otherwise causes LNK2019 on __std_* STL symbols).
 rem Builds into "build-static\" at the project root, regardless of the
 rem directory this script is invoked from.
 cd /d "%~dp0"
+set "VCPKG_ROOT=C:\Unity\ProjectionMappingC\third_party\vcpkg"
 
 if not defined VCPKG_ROOT (
     if exist "C:\vcpkg\scripts\buildsystems\vcpkg.cmake" (

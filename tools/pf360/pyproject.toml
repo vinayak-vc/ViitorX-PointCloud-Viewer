@@ -1,0 +1,21 @@
+[project]
+name = "pf360"
+version = "0.1.0"
+description = "PointForge 360-degree video to 3D Gaussian Splat reconstruction worker"
+requires-python = ">=3.8"
+# The worker is standard-library only. Nerfstudio / PyTorch / COLMAP / FFmpeg are
+# external tools in their own environment (see compat.json), never imported here.
+dependencies = []
+
+[project.scripts]
+pf360 = "pf360.__main__:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["pf360", "pf360.ns_helpers"]
+
+[tool.setuptools.package-data]
+pf360 = ["presets.json"]

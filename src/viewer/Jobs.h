@@ -7,6 +7,7 @@
 // fields are atomics or mutex-guarded).
 #include "indexer/OctreeIndexer.h"
 #include "viewer/Photogrammetry.h"
+#include "viewer/Recon360.h"
 
 #include <algorithm>
 #include <atomic>
@@ -24,7 +25,9 @@ struct ConvertJob {
     // Convert: input scan -> octree. Photogrammetry: image folder -> external
     // reconstruction engine -> octree (input is filled with the produced point
     // file mid-job). EngineSetup: one-time ODM+COLMAP auto-install.
-    enum class Kind { Convert, Photogrammetry, EngineSetup };
+    // Recon360: 360 video -> pf360 worker (FFmpeg/COLMAP/Nerfstudio) -> 3DGS .ply
+    // (output = the produced .ply; loaded on the existing Gaussian-splat path).
+    enum class Kind { Convert, Photogrammetry, EngineSetup, Recon360 };
 
     Kind         kind = Kind::Convert;
     std::string  input;               // source scan file
@@ -37,6 +40,10 @@ struct ConvertJob {
     std::string     workDir;          // engine workspace (kept for inspection)
     PhotogramEngine engine  = PhotogramEngine::ODM;
     int             quality = 1;      // 0 draft, 1 balanced, 2 high
+    // Recon360 only:
+    std::shared_ptr<Recon360JobSpec> recon;
+    std::shared_ptr<Recon360Live>    reconLive;   // stage/log state shared with the UI
+    Recon360Settings                 reconSettings;
 
     std::atomic<State> state{State::Queued};
     std::atomic<float> progress{0.0f};
@@ -103,6 +110,25 @@ public:
         job->kind = ConvertJob::Kind::EngineSetup;
         job->name = "Photogrammetry setup";
         job->loadWhenDone = false;
+        submit(job);
+        return job;
+    }
+
+    // 360 video -> Gaussian Splat reconstruction. Runs on the same single worker
+    // thread as conversions, so at most one heavy GPU job runs at a time.
+    std::shared_ptr<ConvertJob> enqueueRecon360(const Recon360JobSpec& spec, const Recon360Settings& settings,
+                                                bool loadWhenDone) {
+        auto job = std::make_shared<ConvertJob>();
+        job->kind = ConvertJob::Kind::Recon360;
+        job->recon = std::make_shared<Recon360JobSpec>(spec);
+        job->reconLive = std::make_shared<Recon360Live>();
+        job->reconSettings = settings;
+        job->input = spec.videoPath;
+        job->output = spec.outputDir;   // replaced by the .ply path on success
+        job->loadWhenDone = loadWhenDone;
+        size_t slash = spec.videoPath.find_last_of("/\\");
+        job->name = ((slash == std::string::npos) ? spec.videoPath : spec.videoPath.substr(slash + 1)) +
+                    " (360 -> splat)";
         submit(job);
         return job;
     }
@@ -181,7 +207,21 @@ private:
             ConvertJob* raw = job.get();
             bool ok = false;
             try {
-                if (job->kind == ConvertJob::Kind::EngineSetup) {
+                if (job->kind == ConvertJob::Kind::Recon360) {
+                    std::string err;
+                    ok = recon360Run(*job->recon, job->reconSettings, job->cancelFlag, *job->reconLive,
+                                     [raw](float pct, const std::string& msg) {
+                                         if (pct >= 0) raw->progress = pct;
+                                         raw->setMessage(msg);
+                                     },
+                                     err);
+                    if (ok && !job->reconLive->outputPly.empty()) job->output = job->reconLive->outputPly;
+                    if (!ok && !err.empty()) job->setMessage(err);
+                    if (ok) {
+                        std::lock_guard<std::mutex> lk(job->reconLive->mu);
+                        job->setMessage(job->reconLive->finalMessage.empty() ? "Done" : job->reconLive->finalMessage);
+                    }
+                } else if (job->kind == ConvertJob::Kind::EngineSetup) {
                     std::string err;
                     ok = installEngines(/*wantColmap=*/true, /*wantOdm=*/true, job->cancelFlag,
                                         [raw](float pct, const std::string& msg) {
@@ -230,7 +270,7 @@ private:
                 job->state = ConvertJob::State::Canceled;
             } else if (ok) {
                 job->progress = 1.0f;
-                job->setMessage("Done");
+                if (job->kind != ConvertJob::Kind::Recon360) job->setMessage("Done");
                 job->state = ConvertJob::State::Succeeded;
             } else {
                 job->state = ConvertJob::State::Failed;

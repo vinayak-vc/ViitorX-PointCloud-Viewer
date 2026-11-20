@@ -28,6 +28,12 @@
   (status bar, exe file-version metadata, and the exe's own filename) so a
   tester can identify exactly which build they're running.
 
+- **360 Reconstruction Studio** — File > Gaussian Splat from 360 Video (Ctrl+R):
+  stitched equirectangular video -> FFmpeg frames -> Nerfstudio perspective views
+  -> COLMAP -> Splatfacto / Splatfacto-Big -> validated 3DGS PLY loaded on the
+  existing splat path. Orchestrated by the standalone `tools/pf360` worker.
+  *(implemented + tested without GPU; real end-to-end GPU run pending - docs/360-reconstruction.md §11)*
+
 ## Short-term Goals
 - **Web Remote status-bar clipping**: a flex-overflow audit of
   `.app-shell`/`.workspace` is still needed so the in-app status bar can't be

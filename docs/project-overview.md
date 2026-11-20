@@ -25,6 +25,12 @@ labels). Two viewport streaming engines, switchable at runtime via
    **hardware encoding** (NVENC/QuickSync/VCE via async MFT) and automatic
    software-encoder fallback; quality-based VBR at a 12 Mbps hint.
 
+**360 Reconstruction Studio**: turns a stitched equirectangular 360 video into
+a 3D Gaussian Splat (.ply) from inside the app (File > Gaussian Splat from 360
+Video, Ctrl+R) by orchestrating FFmpeg, COLMAP and Nerfstudio Splatfacto through
+the standalone `tools/pf360` Python worker; the result opens on the existing
+Gaussian-splat renderer. See `docs/360-reconstruction.md`.
+
 A Unity integration (branch `library/unity`) exposes the streaming core and
 converter as flat C-API DLLs (`pfunity`, `pfconvert_dll`).
 

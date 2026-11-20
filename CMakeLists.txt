@@ -339,6 +339,17 @@ if(PF_BUILD_TESTS)
     endif()
     enable_testing()
     add_test(NAME octree_roundtrip COMMAND pftest --points 500000)
+
+    # pf360hosttest - 360 Reconstruction Studio host bridge (Recon360.cpp):
+    # manifest writing, worker launch + JSONL parsing, probe, cancellation /
+    # process-tree teardown. GL/SDL-free; needs Python 3 + ffmpeg at run time.
+    add_executable(pf360hosttest
+        src/tools/pf360hosttest/main.cpp
+        src/viewer/Recon360.cpp
+    )
+    target_link_libraries(pf360hosttest PRIVATE pfcore Threads::Threads nlohmann_json::nlohmann_json)
+    add_dependencies(pf360hosttest pfview)   # pfview's post-build copies the worker beside the exes
+    add_test(NAME pf360_host COMMAND pf360hosttest)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -356,6 +367,8 @@ add_executable(pfview WIN32
     src/viewer/RemoteServer.cpp
     src/viewer/VideoExporter.cpp
     src/viewer/Photogrammetry.cpp
+    src/viewer/Recon360.cpp
+    src/viewer/Recon360Panel.cpp
     src/viewer/qrcodegen.cpp
     src/viewer/app.rc
 )
@@ -372,6 +385,18 @@ target_link_libraries(pfview PRIVATE
     $<IF:$<TARGET_EXISTS:libjpeg-turbo::turbojpeg>,libjpeg-turbo::turbojpeg,libjpeg-turbo::turbojpeg-static>
 )
 add_dependencies(pfview version_header)
+# 360 Reconstruction Studio: ship the standalone pf360 Python worker beside the
+# exe (<exe dir>/pf360/pf360/...). Recon360.cpp also finds tools/pf360 in the
+# source tree for dev builds. The worker is stdlib-only Python; nothing is compiled.
+add_custom_command(TARGET pfview POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+            ${CMAKE_SOURCE_DIR}/tools/pf360/pf360
+            $<TARGET_FILE_DIR:pfview>/pf360/pf360
+    COMMAND ${CMAKE_COMMAND} -E remove_directory
+            $<TARGET_FILE_DIR:pfview>/pf360/pf360/__pycache__
+    COMMAND ${CMAKE_COMMAND} -E remove_directory
+            $<TARGET_FILE_DIR:pfview>/pf360/pf360/ns_helpers/__pycache__
+    COMMENT "Copying pf360 reconstruction worker")
 if(WIN32)
     target_link_libraries(pfview PRIVATE ws2_32 iphlpapi)
 endif()

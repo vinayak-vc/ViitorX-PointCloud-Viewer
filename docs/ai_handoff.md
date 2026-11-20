@@ -1,5 +1,24 @@
 # AI Handoff - PointForge (C++ repo)
 
+## Session (2026-11-20) - 360 Reconstruction Studio: 360 video -> 3DGS PLY (branch `splat-generator`)
+
+New feature: File > **Gaussian Splat from 360 Video...** (Ctrl+R; Tools menu, palette, drop a .mp4/.mov/.mkv). Full doc: **docs/360-reconstruction.md**.
+
+- **Worker** `tools/pf360/` (stdlib-only Python >= 3.8, independently runnable): `python -m pf360 doctor|probe|frame|estimate|presets|validate-ply|run`. JSONL protocol v1 on stdout, manifest schema v1, `presets.json` (single source of truth, also read by the wizard), `NerfstudioBackend` behind `ReconstructionBackend`, SHA-256 stage cache + Retry, report json/txt, PLY validation mirroring SplatReader rules. Nerfstudio facts were taken from the **1.1.5 source** (pip-downloaded wheel): crop = (top,bottom,left,right) where left/right narrow the yaw span; no max-Gaussian setting exists; splatfacto-big = cull_alpha 0.005 + densify 0.0005; training progress rows are `step (pct%)`. The `views.py` port is verified identical to Nerfstudio on 1,800 crop combinations (combos where Nerfstudio itself crashes are rejected up front).
+- **Host** `src/viewer/Recon360.{h,cpp}`: UTF-16 `CreateProcessW`, Job Object kill-on-close, stderr reader thread, stdin `cancel` + 20 s grace + TerminateJobObject; `Recon360Live` state for the UI. `Recon360Panel.{h,cpp}`: 6-step wizard (video / processing / quality / output / run / done) with preview frame + crop + view-centre overlay, doctor table, VRAM guidance. `Jobs.h`: `Kind::Recon360`, `enqueueRecon360`. `main.cpp`: menus, Ctrl+R, drop routing, palette, Jobs panel indeterminate bar + Details, Preferences tab "360 Reconstruction" (`r360*` keys in pfview_config.txt), completion toast / auto-load, Z-up load of pf360 outputs (`recon360IsZUpOutput`). CMake: new sources, post-build copy of the worker to `<exe dir>/pf360/`, test target `pf360hosttest`.
+- **Scripts** `scripts/pf360/`: `setup_environment.ps1` (isolated venv under `%LOCALAPPDATA%/ViitorX/PointForge/engines/pf360-env`, consent prompt, versions from `tools/pf360/compat.json`, which says `verified: false`), `doctor.ps1`, `check_environment.ps1`.
+- **Verified**: Python 62/62 (`cd tools/pf360; python -m unittest discover -s tests -t .`); `pf360hosttest` 46/46 (real worker launch, frames-only job, cache reuse, failure propagation, cancel with no orphaned ffmpeg); static Release build of all targets (viewer `v1099`, pfconvert, pftest, PointForgeNative.dll, PointForgeUnity.dll); `pftest: PASS`; viewer starts and exits cleanly.
+- **NOT verified**: the GPU chain (Nerfstudio + COLMAP are not installed on this machine; setup downloads ~8 GB and needs the user's go-ahead), orientation of a real export, interactive click-through of the wizard.
+- **Build env note**: VS 2022 BuildTools (MSVC 14.44, pinned in `triplets/`) is no longer installed; only VS 18 Community (14.38 / 14.51). The old `build*/` caches point at `C:/UnrealProject/PointForge` and a `Z:` vcpkg drive. This session built in a fresh **`build-r360/`** with VS 18's bundled CMake 4.3, `subst Z: C:/Unity/ProjectionMappingC/third_party/vcpkg`, `-DVCPKG_MANIFEST_INSTALL=OFF -DVCPKG_INSTALLED_DIR=<repo>/build-static/vcpkg_installed`, triplet x64-windows-static (prebuilt libs, nothing rebuilt).
+
+### Modified / new files
+- NEW: `tools/pf360/**` (package, tests, README, pyproject, requirements, compat.json), `scripts/pf360/*.ps1`, `src/viewer/Recon360.{h,cpp}`, `src/viewer/Recon360Panel.{h,cpp}`, `src/tools/pf360hosttest/main.cpp`, `docs/360-reconstruction.md`
+- MODIFIED: `src/viewer/Jobs.h`, `src/viewer/main.cpp`, `CMakeLists.txt`, `.gitignore`, `CLAUDE.md`, `docs/{project-overview,architecture,roadmap,tasks,decisions,ai_handoff}.md`
+- `VERSION` was bumped by the build itself (tools/bump_version.cmake).
+
+### Next recommended task
+Run `scripts/pf360/setup_environment.ps1` (plus COLMAP via the photogrammetry engine setup), then reconstruct a real 20-60 s stitched equirectangular walk-through with the Preview preset, then High Quality. Fix whatever the real Nerfstudio CLI disagrees with (see the workspace `logs/*.log`), confirm the result loads upright (Z-up), and set `compat.json` `verified: true`.
+
 ## Session (2026-08-12b) - FBX (ASCII) export (branch `testing-application`)
 
 Added FBX export beside GLB; the pipeline is now format-agnostic.

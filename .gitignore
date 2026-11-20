@@ -1,6 +1,7 @@
 /build/
 /build-static/
 /build-static-ninja/
+/build-r360/
 /release/
 /out/
 *.log
@@ -27,3 +28,7 @@ compile_commands.json
 build-dll/
 scratch/
 docs/ppt/
+
+# Python bytecode (tools/pf360)
+__pycache__/
+*.pyc
