@@ -323,6 +323,8 @@ target_link_libraries(pfconvert PRIVATE pfcore)
 # parallel byte-identity + hierarchy invariants). Uses OctreeStore for the
 # read-back; OctreeStore is GL-free (same pattern as pfunity).
 # ---------------------------------------------------------------------------
+set(PF_ENGINE_CATALOG_URL "" CACHE STRING
+    "Signed 360 engine-pack catalog URL (https://huggingface.co/<repo>/resolve/main/catalog.json); empty = unset")
 option(PF_BUILD_TESTS "Build the pftest round-trip test executable" ON)
 if(PF_BUILD_TESTS)
     add_executable(pftest
@@ -346,8 +348,10 @@ if(PF_BUILD_TESTS)
     add_executable(pf360hosttest
         src/tools/pf360hosttest/main.cpp
         src/viewer/Recon360.cpp
+        src/viewer/EnginePacks.cpp
     )
     target_link_libraries(pf360hosttest PRIVATE pfcore Threads::Threads nlohmann_json::nlohmann_json)
+    target_compile_definitions(pf360hosttest PRIVATE PF_ENGINE_CATALOG_URL="${PF_ENGINE_CATALOG_URL}")
     add_dependencies(pf360hosttest pfview)   # pfview's post-build copies the worker beside the exes
     add_test(NAME pf360_host COMMAND pf360hosttest)
 endif()
@@ -369,6 +373,7 @@ add_executable(pfview WIN32
     src/viewer/Photogrammetry.cpp
     src/viewer/Recon360.cpp
     src/viewer/Recon360Panel.cpp
+    src/viewer/EnginePacks.cpp
     src/viewer/qrcodegen.cpp
     src/viewer/app.rc
 )
@@ -385,6 +390,10 @@ target_link_libraries(pfview PRIVATE
     $<IF:$<TARGET_EXISTS:libjpeg-turbo::turbojpeg>,libjpeg-turbo::turbojpeg,libjpeg-turbo::turbojpeg-static>
 )
 add_dependencies(pfview version_header)
+# Downloadable 360 engine packs (src/viewer/EnginePacks.h): the signed catalog's
+# location, e.g. https://huggingface.co/<org>/<repo>/resolve/main/catalog.json.
+# Users can override it in Preferences; the signature key is in EnginePackKey.h.
+target_compile_definitions(pfview PRIVATE PF_ENGINE_CATALOG_URL="${PF_ENGINE_CATALOG_URL}")
 # 360 Reconstruction Studio: ship the standalone pf360 Python worker beside the
 # exe (<exe dir>/pf360/pf360/...). Recon360.cpp also finds tools/pf360 in the
 # source tree for dev builds. The worker is stdlib-only Python; nothing is compiled.

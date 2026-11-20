@@ -133,7 +133,8 @@ def main(argv=None) -> int:
         from . import procrun
         t = environment.resolve_tools({})
         if not (t.ns_python and t.mask_model):
-            _print_json({"ok": False, "error": "Masking add-on not installed (scripts\\pf360\\setup_masking.ps1)"})
+            _print_json({"ok": False, "error": "Masking add-on not installed (wizard: Environment > Engines > "
+                                               "Masking model)"})
             return 2
         groups = [g for g in a.groups.split(",") if g]
         if not groups or any(g not in manifest.load_presets()["limits"]["maskGroups"] for g in groups):
@@ -143,7 +144,7 @@ def main(argv=None) -> int:
         cp = procrun.capture([t.ns_python, str(helper), "--model", t.mask_model, "--image", a.inp,
                               "--raw-size", str(a.size[0]), str(a.size[1]), "--overlay", a.out,
                               "--groups", ",".join(groups), "--dilate", str(max(0, min(64, a.dilate)))],
-                             timeout=600, env=procrun.child_env())
+                             timeout=600, env=procrun.child_env(extra=t.ns_env()))
         text = cp.stdout.decode("utf-8", "replace")
         done = [l for l in text.splitlines() if l.startswith("PF360MASKDONE")]
         if cp.returncode != 0 or not done:

@@ -106,6 +106,21 @@ private:
     float cullAlpha = 0.1f, densifyGrad = 0.0008f, cullScale = 0.5f;
     bool preprocessOnly = false;
 
+    // engine packs (downloadable engines, EnginePacks.h)
+    void drawEngines(Recon360PanelHost& host);
+    void refreshPackStatus();
+    struct CatalogResult { bool ok = false; EngineCatalog cat; std::string err; };
+    std::future<CatalogResult> catalogFut;
+    EngineCatalog catalog;
+    bool catalogOk = false;
+    std::string catalogErr;
+    std::vector<EnginePackStatus> packStatus;   // parallel to catalog.packs
+    std::vector<char> packSel;                  // parallel to catalog.packs
+    std::shared_ptr<ConvertJob> engineJob;
+    bool engineConfirmOpen = false;
+    char catalogUrlBuf[512] = {};
+    bool catalogUrlLoaded = false;
+
     // environment
     Recon360Doctor doctor;
     std::future<Recon360Doctor> doctorFut;

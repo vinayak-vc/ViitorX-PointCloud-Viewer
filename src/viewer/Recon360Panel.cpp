@@ -330,10 +330,184 @@ void Recon360Panel::drawPreview(float width) {
 }
 
 // ---------------------------------------------------------------------------
+// engine packs: download the reconstruction engines (signed catalog on Hugging Face)
+// ---------------------------------------------------------------------------
+void Recon360Panel::refreshPackStatus() {
+    const std::string root = engineRoot();
+    packStatus.clear();
+    packSel.clear();
+    for (const auto& p : catalog.packs) {
+        const EnginePackStatus st = engineStatus(root, p);
+        packStatus.push_back(st);
+        // Preselect what a fresh PC needs; never preselect over a manual (developer) setup.
+        const bool need = st.state == EnginePackStatus::State::Missing ||
+                          st.state == EnginePackStatus::State::UpdateAvailable;
+        packSel.push_back(p.required && need ? 1 : 0);
+    }
+}
+
+void Recon360Panel::drawEngines(Recon360PanelHost& host) {
+    ImGui::SeparatorText("Engines (download)");
+    if (!catalogUrlLoaded) {
+        snprintf(catalogUrlBuf, sizeof(catalogUrlBuf), "%s", host.settings->engineCatalogUrl.c_str());
+        catalogUrlLoaded = true;
+    }
+    if (ready(catalogFut)) {
+        CatalogResult r = catalogFut.get();
+        catalogOk = r.ok;
+        catalogErr = r.err;
+        if (r.ok) catalog = std::move(r.cat);
+        refreshPackStatus();
+    }
+    // A running / finished install job
+    if (engineJob) {
+        if (!engineJob->finished()) {
+            ImGui::ProgressBar(engineJob->progress.load(), ImVec2(-1, 0));
+            ImGui::TextWrapped("%s", engineJob->message().c_str());
+            if (ImGui::Button("Pause download")) JobQueue::cancel(engineJob);
+            ImGui::SetItemTooltip("Stops now. Downloaded parts are kept; Install again resumes where it stopped.");
+            return;
+        }
+        const bool ok = engineJob->state.load() == ConvertJob::State::Succeeded;
+        if (!ok) catalogErr = engineJob->message();
+        engineJob.reset();
+        refreshPackStatus();
+        doctor = Recon360Doctor{};
+        startDoctor(host, false);           // re-check with the new engines
+    }
+
+    const std::string url = host.settings->engineCatalogUrl.empty() ? engineDefaultCatalogUrl()
+                                                                    : host.settings->engineCatalogUrl;
+    if (!engineHasSigningKey()) {
+        wrapped(kDim, "This build has no engine signing key, so it cannot download engines. Developers: run "
+                      "scripts\\pf360\\engine_packs.py keygen and rebuild (docs/360-reconstruction.md, Engine packs).");
+    } else if (url.empty()) {
+        wrapped(kDim, "No engine download location configured. Set the catalog URL under 'Download source' below.");
+    } else if (catalogFut.valid()) {
+        ImGui::TextDisabled("Checking available engines...");
+    } else if (!catalogOk) {
+        ImGui::TextWrapped("Download the engines that turn 360 video into Gaussian splats (Python + PyTorch + "
+                           "Nerfstudio, COLMAP, FFmpeg; about 5 GB download). An NVIDIA GPU is required for training.");
+        if (ImGui::Button("Check available engines")) {
+            const std::string u = url;
+            catalogErr.clear();
+            catalogFut = std::async(std::launch::async, [u]() {
+                CatalogResult r;
+                r.ok = engineFetchCatalog(u, engineRoot(), r.cat, r.err);
+                return r;
+            });
+        }
+    } else {
+        uint64_t dl = 0;
+        std::vector<std::string> ids;
+        if (ImGui::BeginTable("##packs", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
+            ImGui::TableSetupColumn("##sel", ImGuiTableColumnFlags_WidthFixed);
+            ImGui::TableSetupColumn("Engine");
+            ImGui::TableSetupColumn("Status");
+            ImGui::TableSetupColumn("Download", ImGuiTableColumnFlags_WidthFixed);
+            ImGui::TableHeadersRow();
+            for (size_t i = 0; i < catalog.packs.size() && i < packStatus.size(); ++i) {
+                const EnginePack& p = catalog.packs[i];
+                const EnginePackStatus& st = packStatus[i];
+                ImGui::PushID((int)i);
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn();
+                bool sel = packSel[i] != 0;
+                if (ImGui::Checkbox("##s", &sel)) packSel[i] = sel ? 1 : 0;
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted(p.title.c_str());
+                ImGui::SetItemTooltip("%s\n\nVersion %s\nLicence: %s", p.description.c_str(), p.version.c_str(),
+                                      p.license.c_str());
+                ImGui::TableNextColumn();
+                switch (st.state) {
+                    case EnginePackStatus::State::Installed: ImGui::TextColored(kGood, "Installed"); break;
+                    case EnginePackStatus::State::UpdateAvailable: ImGui::TextColored(kWarn, "Update available"); break;
+                    case EnginePackStatus::State::SelfManaged:
+                        ImGui::TextColored(kDim, "Present (manual setup)");
+                        ImGui::SetItemTooltip("This folder was set up outside the installer. Installing the pack keeps "
+                                              "it as a .backup-<date> folder next to the new one.");
+                        break;
+                    default: ImGui::TextColored(p.required ? kBad : kDim, p.required ? "Not installed" : "Optional"); break;
+                }
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted(fmtBytes(p.downloadBytes()).c_str());
+                if (sel) { dl += p.downloadBytes(); ids.push_back(p.id); }
+                ImGui::PopID();
+            }
+            ImGui::EndTable();
+        }
+        const uint64_t need = engineRequiredBytes(catalog, ids);
+        const uint64_t freeB = engineFreeBytes(engineRoot());
+        ImGui::BeginDisabled(ids.empty());
+        if (ImGui::Button(ids.empty() ? "Install selected" : ("Install selected (" + fmtBytes(dl) + " download)").c_str()))
+            engineConfirmOpen = true;
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        if (ImGui::Button("Refresh")) { catalogOk = false; catalogErr.clear(); }
+        if (!ids.empty()) {
+            ImGui::TextDisabled("Needs about %s free disk space (%s free).", fmtBytes(need).c_str(),
+                                freeB ? fmtBytes(freeB).c_str() : "unknown");
+        }
+
+        if (engineConfirmOpen) { ImGui::OpenPopup("Install 360 engines?"); engineConfirmOpen = false; }
+        if (ImGui::BeginPopupModal("Install 360 engines?", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::Text("Download %s and install into:", fmtBytes(dl).c_str());
+            ImGui::TextDisabled("%s", engineRoot().c_str());
+            for (const auto& id : ids) {
+                const EnginePack* p = catalog.find(id);
+                ImGui::BulletText("%s - %s", p->title.c_str(), fmtBytes(p->downloadBytes()).c_str());
+                ImGui::Indent();
+                ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + 520.0f * host.uiScale);
+                ImGui::TextDisabled("Licence: %s", p->license.c_str());
+                ImGui::PopTextWrapPos();
+                ImGui::Unindent();
+            }
+            ImGui::Spacing();
+            ImGui::PushTextWrapPos(560.0f * host.uiScale);
+            ImGui::TextWrapped("The catalog is signed and every file is checked (size + SHA-256) before anything is "
+                               "unpacked or run. Downloads resume if interrupted. Existing folders set up by hand are "
+                               "kept as .backup copies, not deleted.");
+            ImGui::PopTextWrapPos();
+            const bool enough = !freeB || freeB >= need;
+            if (!enough) wrapped(kBad, "Not enough disk space: " + fmtBytes(need) + " needed, " + fmtBytes(freeB) + " free.");
+            ImGui::BeginDisabled(!enough);
+            if (ImGui::Button("Download and install")) {
+                if (host.jobs) {
+                    engineJob = host.jobs->enqueueEnginePacks(catalog, ids);
+                    if (host.showJobsPanel) host.showJobsPanel();
+                }
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
+            ImGui::EndPopup();
+        }
+    }
+    if (!catalogErr.empty()) wrapped(kBad, catalogErr);
+
+    if (ImGui::TreeNode("Download source")) {
+        ImGui::SetNextItemWidth(-1);
+        if (ImGui::InputTextWithHint("##caturl", engineDefaultCatalogUrl().empty() ? "https://huggingface.co/.../catalog.json"
+                                                                                    : engineDefaultCatalogUrl().c_str(),
+                                     catalogUrlBuf, sizeof(catalogUrlBuf))) {
+            host.settings->engineCatalogUrl = catalogUrlBuf;
+            catalogOk = false;
+            if (host.saveSettings) host.saveSettings();
+        }
+        ImGui::TextDisabled("Empty = built-in location. Any mirror works: the catalog's signature is checked against "
+                            "the key built into PointForge.");
+        ImGui::TreePop();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // environment settings (wizard + Preferences)
 // ---------------------------------------------------------------------------
 void Recon360Panel::drawEnvironmentSettings(Recon360PanelHost& host) {
     pollAsync();
+    drawEngines(host);
+    ImGui::SeparatorText("Tool locations");
     constexpr int kFields = 6;
     std::string* fields[kFields] = {&host.settings->workerPython, &host.settings->nsPython, &host.settings->colmapExe,
                                     &host.settings->ffmpegExe, &host.settings->ffprobeExe,
@@ -408,8 +582,8 @@ void Recon360Panel::drawEnvironmentSettings(Recon360PanelHost& host) {
         }
         ImGui::TextColored(doctor.ready ? kGood : kBad, "Overall: %s", doctor.ready ? "READY" : "NOT READY");
         if (!doctor.ready)
-            ImGui::TextWrapped("Hover a FAIL row for the fix. scripts\\pf360\\setup_environment.ps1 creates an "
-                               "isolated Nerfstudio environment (asks before downloading ~10 GB).");
+            ImGui::TextWrapped("Hover a FAIL row for the fix. Missing engines: use 'Engines (download)' above. "
+                               "Developers can instead run scripts\\pf360\\setup_environment.ps1.");
     }
 }
 
@@ -658,7 +832,8 @@ void Recon360Panel::drawStepQuality(Recon360PanelHost& host) {
             ImGui::TextDisabled("Installed training methods: %s", m.c_str());
         }
         if (!doctor.ready) {
-            wrapped(kBad, "The reconstruction environment is not ready - see Environment below.");
+            wrapped(kBad, "The reconstruction environment is not ready - open Environment below to download the "
+                          "engines.");
         }
     } else if (!doctor.error.empty()) wrapped(kBad, doctor.error);
 
@@ -738,6 +913,8 @@ void Recon360Panel::drawStepQuality(Recon360PanelHost& host) {
                            std::to_string(need) + " MB for these settings. Reduce resolution, frames, use standard "
                            "Splatfacto, or close GPU-heavy applications. (VRAM alone does not guarantee a fit.)");
     }
+    // Open by default while the engines are missing, so the download is one click away.
+    if ((doctor.ran && !doctor.ready) || !doctor.error.empty()) ImGui::SetNextItemOpen(true, ImGuiCond_Once);
     if (ImGui::CollapsingHeader("Environment")) drawEnvironmentSettings(host);
 }
 

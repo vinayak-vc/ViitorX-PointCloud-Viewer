@@ -8,6 +8,7 @@
 // (used to synthesize test videos). Tests that need ffmpeg are skipped with a
 // message when it is missing. No GPU / Nerfstudio is needed: jobs stop after
 // frame extraction.
+#include "viewer/EnginePacks.h"
 #include "viewer/Recon360.h"
 
 #include <nlohmann/json.hpp>
@@ -16,14 +17,22 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 
 #ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
+#include <bcrypt.h>
 #include <tlhelp32.h>
+#pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "bcrypt.lib")
 #endif
 
 namespace fs = std::filesystem;
@@ -255,7 +264,357 @@ static void testZUpDetection(const fs::path& tmp) {
     CHECK(!recon360IsZUpOutput((tmp / "elsewhere.ply").u8string()));
 }
 
-int main() {
+#ifdef _WIN32
+// ---------------------------------------------------------------------------
+// Engine packs: signed catalog, resumable download, SHA-256, staging/swap.
+// A tiny loopback HTTP server (byte ranges + a deliberately dropped first
+// connection) and a throw-away ECDSA key stand in for Hugging Face + the
+// release key.
+// ---------------------------------------------------------------------------
+namespace {
+
+struct TestKey {
+    BCRYPT_ALG_HANDLE alg = nullptr;
+    BCRYPT_KEY_HANDLE key = nullptr;
+    std::string pubHex;
+    TestKey() {
+        BCryptOpenAlgorithmProvider(&alg, BCRYPT_ECDSA_P256_ALGORITHM, nullptr, 0);
+        BCryptGenerateKeyPair(alg, &key, 256, 0);
+        BCryptFinalizeKeyPair(key, 0);
+        unsigned char blob[sizeof(BCRYPT_ECCKEY_BLOB) + 64];
+        ULONG cb = 0;
+        BCryptExportKey(key, nullptr, BCRYPT_ECCPUBLIC_BLOB, blob, sizeof(blob), &cb, 0);
+        char h[3];
+        for (int i = 0; i < 64; ++i) { std::snprintf(h, 3, "%02x", blob[sizeof(BCRYPT_ECCKEY_BLOB) + i]); pubHex += h; }
+    }
+    ~TestKey() { if (key) BCryptDestroyKey(key); if (alg) BCryptCloseAlgorithmProvider(alg, 0); }
+    std::string sign(const std::string& data) const {
+        unsigned char digest[32], sig[64];
+        BCRYPT_ALG_HANDLE sha = nullptr;
+        BCryptOpenAlgorithmProvider(&sha, BCRYPT_SHA256_ALGORITHM, nullptr, 0);
+        BCryptHash(sha, nullptr, 0, (PUCHAR)data.data(), (ULONG)data.size(), digest, 32);
+        BCryptCloseAlgorithmProvider(sha, 0);
+        ULONG cb = 0;
+        BCryptSignHash(key, nullptr, digest, 32, sig, 64, &cb, 0);
+        static const char* t = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        std::string out;
+        for (int i = 0; i < 64; i += 3) {
+            const unsigned v = (sig[i] << 16) | ((i + 1 < 64 ? sig[i + 1] : 0) << 8) | (i + 2 < 64 ? sig[i + 2] : 0);
+            out += t[(v >> 18) & 63];
+            out += t[(v >> 12) & 63];
+            out += i + 1 < 64 ? t[(v >> 6) & 63] : '=';
+            out += i + 2 < 64 ? t[v & 63] : '=';
+        }
+        return out;
+    }
+};
+
+struct TestServer {
+    SOCKET ls = INVALID_SOCKET;
+    int port = 0;
+    fs::path dir;
+    std::thread th;
+    std::mutex mu;
+    std::set<std::string> dropOnce;     // paths whose first GET is cut after half the body
+    int requests = 0, rangeRequests = 0;
+
+    explicit TestServer(const fs::path& d) : dir(d) {
+        WSADATA w;
+        WSAStartup(MAKEWORD(2, 2), &w);
+        ls = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        sockaddr_in a{};
+        a.sin_family = AF_INET;
+        a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        bind(ls, (sockaddr*)&a, sizeof(a));
+        int len = sizeof(a);
+        getsockname(ls, (sockaddr*)&a, &len);
+        port = ntohs(a.sin_port);
+        listen(ls, 8);
+        th = std::thread([this] { loop(); });
+    }
+    ~TestServer() {
+        closesocket(ls);
+        if (th.joinable()) th.join();
+        WSACleanup();
+    }
+    std::string url(const std::string& name) const { return "http://127.0.0.1:" + std::to_string(port) + "/" + name; }
+
+    void loop() {
+        for (;;) {
+            SOCKET c = accept(ls, nullptr, nullptr);
+            if (c == INVALID_SOCKET) return;
+            serve(c);
+            closesocket(c);
+        }
+    }
+    void serve(SOCKET c) {
+        std::string req;
+        char b[2048];
+        while (req.find("\r\n\r\n") == std::string::npos) {
+            const int n = recv(c, b, sizeof(b), 0);
+            if (n <= 0) return;
+            req.append(b, (size_t)n);
+        }
+        const size_t sp1 = req.find(' '), sp2 = req.find(' ', sp1 + 1);
+        std::string path = req.substr(sp1 + 2, sp2 - sp1 - 2);
+        uint64_t from = 0;
+        bool ranged = false;
+        const size_t r = req.find("Range: bytes=");
+        if (r != std::string::npos) { from = std::strtoull(req.c_str() + r + 13, nullptr, 10); ranged = true; }
+        bool drop = false;
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            ++requests;
+            if (ranged) ++rangeRequests;
+            if (dropOnce.erase(path)) drop = true;
+        }
+        const fs::path f = dir / path;
+        std::error_code ec;
+        if (path.find("..") != std::string::npos || !fs::is_regular_file(f, ec)) {
+            const char* nf = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            send(c, nf, (int)std::strlen(nf), 0);
+            return;
+        }
+        std::ifstream in(f, std::ios::binary);
+        std::string body((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        const uint64_t size = body.size();
+        std::string hdr;
+        if (ranged && from < size) {
+            hdr = "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes " + std::to_string(from) + "-" +
+                  std::to_string(size - 1) + "/" + std::to_string(size) + "\r\n";
+            body = body.substr((size_t)from);
+        } else {
+            hdr = "HTTP/1.1 200 OK\r\n";
+        }
+        hdr += "Content-Length: " + std::to_string(body.size()) + "\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n";
+        send(c, hdr.data(), (int)hdr.size(), 0);
+        const size_t n = drop ? body.size() / 2 : body.size();
+        for (size_t off = 0; off < n;) {
+            const int s = send(c, body.data() + off, (int)std::min<size_t>(65536, n - off), 0);
+            if (s <= 0) break;
+            off += (size_t)s;
+        }
+    }
+};
+
+std::string sha256Of(const fs::path& p) {
+    std::string h;
+    engineSha256File(p.u8string(), h);
+    return h;
+}
+
+void writeText(const fs::path& p, const std::string& s) {
+    fs::create_directories(p.parent_path());
+    std::ofstream(p, std::ios::binary) << s;
+}
+
+std::string readText(const fs::path& p) {
+    std::ifstream f(p, std::ios::binary);
+    return std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+}
+
+} // namespace
+
+static void testEnginePacks(const fs::path& tmp) {
+    std::error_code ec;
+    const fs::path srv = tmp / "pack-server", root = tmp / u8"engines ü", src = tmp / "pack-src";
+    fs::remove_all(srv, ec);
+    fs::remove_all(root, ec);
+    fs::remove_all(src, ec);
+    fs::create_directories(srv);
+
+    // A zip pack (unpacked into engines/testpack) with ~3 MB of incompressible data so the
+    // dropped-connection resume path really runs, and a "file" pack into a nested dir.
+    std::string big(3u << 20, '\0');
+    uint32_t x = 12345;
+    for (char& ch : big) { x = x * 1664525u + 1013904223u; ch = (char)(x >> 24); }
+    writeText(src / "testpack" / "hello.txt", "hello pack\n");
+    writeText(src / "testpack" / "data.bin", big);
+    const std::wstring tarCmd = L"tar.exe -a -c -f \"" + (srv / "testpack.zip").wstring() + L"\" -C \"" +
+                                src.wstring() + L"\" testpack";
+    CHECK(_wsystem(tarCmd.c_str()) == 0);
+    writeText(srv / "model.json", "{\"m\":1}\n");
+
+    TestKey key;
+    CHECK(key.pubHex.size() == 128);
+    auto catalogJson = [&](int64_t seq, const std::string& zipSha) {
+        nlohmann::json j = {
+            {"schema", 1}, {"sequence", seq}, {"created", "test"},
+            {"packs", {
+                {{"id", "testpack"}, {"title", "Test pack"}, {"version", "1.0"}, {"installDir", "testpack"},
+                 {"postInstall", ""}, {"required", true}, {"installedBytes", big.size() + 11},
+                 {"files", {{{"name", "testpack.zip"}, {"kind", "zip"}, {"url", "PLACEHOLDER_ZIP"},
+                             {"size", fs::file_size(srv / "testpack.zip")}, {"sha256", zipSha}, {"fileCount", 3}}}}},
+                {{"id", "model"}, {"title", "Model"}, {"version", "7"}, {"installDir", "models/m1"},
+                 {"postInstall", ""}, {"required", false}, {"installedBytes", 8},
+                 {"files", {{{"name", "model.json"}, {"kind", "file"}, {"url", "PLACEHOLDER_MODEL"},
+                             {"size", fs::file_size(srv / "model.json")}, {"sha256", sha256Of(srv / "model.json")}}}}}}}};
+        return j;
+    };
+    TestServer server(srv);
+    auto publish = [&](nlohmann::json j) {
+        j["packs"][0]["files"][0]["url"] = server.url("testpack.zip");
+        j["packs"][1]["files"][0]["url"] = server.url("model.json");
+        const std::string body = j.dump(1);
+        writeText(srv / "catalog.json", body);
+        writeText(srv / "catalog.json.sig", key.sign(body) + "\n");
+        return body;
+    };
+    const std::string zipSha = sha256Of(srv / "testpack.zip");
+
+    // --- signature + parser hardening
+    {
+        const std::string body = publish(catalogJson(100, zipSha));
+        std::string err;
+        CHECK(engineVerifySignature(body, key.sign(body), key.pubHex, err));
+        CHECK(!engineVerifySignature(body + " ", key.sign(body), key.pubHex, err));          // tampered
+        TestKey other;
+        CHECK(!engineVerifySignature(body, key.sign(body), other.pubHex, err));              // wrong key
+        CHECK(!engineVerifySignature(body, "AAAA", key.pubHex, err));                       // malformed
+        CHECK(!engineVerifySignature(body, key.sign(body), "", err));                       // no key
+        EngineCatalog c;
+        auto bad = [&](const char* field, nlohmann::json v) {
+            nlohmann::json j = catalogJson(1, zipSha);
+            j["packs"][0]["files"][0]["url"] = "https://example.invalid/x.zip";
+            j["packs"][1]["files"][0]["url"] = "https://example.invalid/m.json";
+            if (std::string(field) == "url") j["packs"][0]["files"][0]["url"] = v;
+            else if (std::string(field) == "name") j["packs"][0]["files"][0]["name"] = v;
+            else j["packs"][0][field] = v;
+            std::string e;
+            return !engineParseCatalog(j.dump(), c, e);
+        };
+        CHECK(bad("installDir", "../escape"));
+        CHECK(bad("installDir", "C:/abs"));
+        CHECK(bad("postInstall", "cmd /c del"));
+        CHECK(bad("url", "ftp://host/x.zip"));
+        CHECK(bad("url", "http://example.com/x.zip"));      // plain http only on loopback
+        CHECK(bad("name", "..\\x.zip"));
+        CHECK(!bad("installDir", "models/ok-dir"));         // control: a valid catalog parses
+    }
+
+    // --- fetch + install (first connection for the zip is dropped half way -> resume)
+    EngineCatalog cat;
+    std::string err;
+    CHECK(!engineFetchCatalog(server.url("catalog.json"), root.u8string(), cat, err, "") || !engineHasSigningKey());
+    err.clear();
+    CHECK(engineFetchCatalog(server.url("catalog.json"), root.u8string(), cat, err, key.pubHex));
+    if (!err.empty()) std::fprintf(stderr, "  fetch: %s\n", err.c_str());
+    CHECK(cat.packs.size() == 2);
+    // A manual setup already sits where the model goes: it must be kept, not deleted.
+    writeText(root / "models" / "m1" / "mine.txt", "user data");
+    {
+        std::lock_guard<std::mutex> lk(server.mu);
+        server.dropOnce.insert("testpack.zip");
+    }
+    std::atomic<bool> cancel{false};
+    float lastPct = -1;
+    err.clear();
+    const bool ok = engineInstallPacks(cat, {"testpack", "model"}, root.u8string(), cancel,
+                                       [&](float p, const std::string&) { lastPct = p; }, err);
+    if (!ok) std::fprintf(stderr, "  install: %s\n", err.c_str());
+    CHECK(ok);
+    CHECK(lastPct >= 0.99f);
+    CHECK(server.rangeRequests >= 1);                                   // resumed with a byte range
+    CHECK(readText(root / "testpack" / "hello.txt") == "hello pack\n");
+    CHECK(fs::file_size(root / "testpack" / "data.bin", ec) == big.size());
+    CHECK(readText(root / "models" / "m1" / "model.json") == "{\"m\":1}\n");
+    CHECK(engineStatus(root.u8string(), cat.packs[0]).state == EnginePackStatus::State::Installed);
+    CHECK(engineStatus(root.u8string(), cat.packs[1]).state == EnginePackStatus::State::Installed);
+    bool backupKept = false;
+    for (const auto& e : fs::directory_iterator(root / "models"))
+        if (e.path().filename().u8string().rfind("m1.backup-", 0) == 0 && fs::exists(e.path() / "mine.txt"))
+            backupKept = true;
+    CHECK(backupKept);
+    CHECK(!fs::exists(root / ".downloads" / "testpack"));               // downloads cleaned up
+    CHECK(!fs::exists(root / ".staging" / "testpack"));
+
+    // --- update: a newer catalog with a new version replaces the managed install (no .old left)
+    {
+        nlohmann::json j = catalogJson(200, zipSha);
+        j["packs"][0]["version"] = "1.1";
+        publish(j);
+        EngineCatalog c2;
+        CHECK(engineFetchCatalog(server.url("catalog.json"), root.u8string(), c2, err, key.pubHex));
+        CHECK(engineStatus(root.u8string(), c2.packs[0]).state == EnginePackStatus::State::UpdateAvailable);
+        CHECK(engineInstallPacks(c2, {"testpack"}, root.u8string(), cancel, nullptr, err));
+        CHECK(engineStatus(root.u8string(), c2.packs[0]).state == EnginePackStatus::State::Installed);
+        CHECK(!fs::exists(root / "testpack.old"));
+    }
+
+    // --- rollback protection: an older (validly signed) catalog is refused
+    {
+        publish(catalogJson(150, zipSha));
+        EngineCatalog c3;
+        err.clear();
+        CHECK(!engineFetchCatalog(server.url("catalog.json"), root.u8string(), c3, err, key.pubHex));
+        CHECK(err.find("OLDER") != std::string::npos);
+    }
+
+    // --- hash mismatch: nothing is installed, the bad download is deleted, the old install stays
+    {
+        nlohmann::json j = catalogJson(300, std::string(64, 'a'));
+        j["packs"][0]["version"] = "2.0";
+        publish(j);
+        EngineCatalog c4;
+        CHECK(engineFetchCatalog(server.url("catalog.json"), root.u8string(), c4, err, key.pubHex));
+        err.clear();
+        CHECK(!engineInstallPacks(c4, {"testpack"}, root.u8string(), cancel, nullptr, err));
+        CHECK(err.find("SHA-256") != std::string::npos);
+        CHECK(!fs::exists(root / ".downloads" / "testpack" / "testpack.zip"));
+        CHECK(readText(root / "testpack" / "hello.txt") == "hello pack\n");
+        CHECK(engineStatus(root.u8string(), c4.packs[0]).installedVersion == "1.1");
+    }
+
+    // --- tampered catalog on the server (signature no longer matches)
+    {
+        nlohmann::json j = catalogJson(400, zipSha);
+        const std::string body = publish(j);
+        writeText(srv / "catalog.json", body + "\n");
+        EngineCatalog c5;
+        err.clear();
+        CHECK(!engineFetchCatalog(server.url("catalog.json"), root.u8string(), c5, err, key.pubHex));
+        CHECK(err.find("INVALID") != std::string::npos);
+    }
+}
+#endif
+
+// CLI helpers for manual / real-pack checks:
+//   pf360hosttest --verify <catalog.json> <pubhex>        (signature written by engine_packs.py)
+//   pf360hosttest --install <catalogUrl> <root> <pubhex> [ids...]
+static int cliMode(int argc, char** argv) {
+    const std::string mode = argv[1];
+    if (mode == "--verify" && argc == 4) {
+        std::string body = readText(fs::u8path(argv[2])), sig = readText(fs::u8path(std::string(argv[2]) + ".sig")), err;
+        const bool ok = engineVerifySignature(body, sig, argv[3], err);
+        EngineCatalog c;
+        const bool parsed = ok && engineParseCatalog(body, c, err);
+        std::printf("signature %s, parse %s %s\n", ok ? "OK" : "INVALID", parsed ? "OK" : "FAILED", err.c_str());
+        return ok && parsed ? 0 : 1;
+    }
+    if (mode == "--install" && argc >= 5) {
+        EngineCatalog cat;
+        std::string err;
+        if (!engineFetchCatalog(argv[2], argv[3], cat, err, argv[4])) { std::printf("fetch failed: %s\n", err.c_str()); return 1; }
+        std::vector<std::string> ids;
+        for (int i = 5; i < argc; ++i) ids.push_back(argv[i]);
+        if (ids.empty()) for (const auto& p : cat.packs) ids.push_back(p.id);
+        std::atomic<bool> cancel{false};
+        int lastTenth = -1;
+        const auto t0 = std::chrono::steady_clock::now();
+        const bool ok = engineInstallPacks(cat, ids, argv[3], cancel, [&](float p, const std::string& m) {
+            const int tenth = (int)(p * 20);
+            if (tenth != lastTenth) { lastTenth = tenth; std::printf("  %3.0f%%  %s\n", p * 100, m.c_str()); std::fflush(stdout); }
+        }, err);
+        std::printf("install %s in %.0f s %s\n", ok ? "OK" : "FAILED",
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), err.c_str());
+        return ok ? 0 : 1;
+    }
+    std::printf("usage: pf360hosttest [--verify catalog pubhex | --install url root pubhex [ids]]\n");
+    return 2;
+}
+
+int main(int argc, char** argv) {
+    if (argc > 1) return cliMode(argc, argv);
     std::error_code ec;
     const fs::path tmp = fs::temp_directory_path() / "pf360hosttest";
     fs::remove_all(tmp, ec);
@@ -267,6 +626,9 @@ int main() {
     testPresets();
     testManifest(tmp);
     testZUpDetection(tmp);
+#ifdef _WIN32
+    testEnginePacks(tmp);
+#endif
     if (haveFfmpeg() && !recon360FindPython({}).empty()) {
         const fs::path video = tmp / u8"clip ü.mp4";
         const fs::path longVideo = tmp / "long.mp4";

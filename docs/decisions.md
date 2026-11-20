@@ -19,6 +19,26 @@ This document records major design decisions.
 - **Decision**: The executable is built as a WIN32 subsystem application (on Windows) rather than a Console App.
 - **Reason**: This prevents a persistent and ugly DOS prompt terminal window from opening alongside the ViitorX Viewer application.
 
+## 360 engines ship as signed, downloadable engine packs (2026-11-21)
+- **Decision**: The ~11 GB 360 reconstruction stack (Python/PyTorch/Nerfstudio, COLMAP,
+  FFmpeg, masking model) is not bundled. The viewer downloads "engine packs" listed in a
+  signed `catalog.json` hosted on Hugging Face, installed by C++ (`EnginePacks.cpp`) with
+  the system `curl.exe` / `tar.exe` and Windows CNG (BCrypt) for SHA-256 + ECDSA P-256.
+- **Reason**: a 35 MB installer instead of 11 GB; only users who reconstruct pay the
+  download. Doing it in C++ means a fresh PC needs no Python to install the engines.
+  Hugging Face: free, large files, resumable range requests, CDN, already reachable on
+  networks that block GitHub release assets. Google Drive was rejected (virus-scan
+  interstitial, download quotas, unreliable resume).
+- **Security**: the catalog is the trust root, so it is signed with an offline key whose
+  public half is compiled in; a monotonic `sequence` blocks replay of old catalogs; files
+  are pinned by SHA-256 and URLs by commit; `installDir`/`postInstall` are validated so a
+  catalog can neither write outside the engines folder nor name a command to run.
+- **Runtime pack is relocatable by construction**: a venv cannot be moved (pyvenv.cfg
+  points at the packaging machine's Python, pip launchers embed absolute paths), so the
+  pack merges the base CPython install with the venv's site-packages and regenerates the
+  `ns-*.exe` launchers after unpacking (`pf360_relocate.py`). torchvision's AlexNet
+  weights (LPIPS) are bundled because Splatfacto otherwise downloads them at first use.
+
 ## Encryption not wired into the viewer/CLI (deferred, on purpose)
 - **Decision**: Did NOT add `pfconvert --encrypt` or a viewer password prompt, even though
   Phase 18 shipped an at-rest AES-256-GCM API in `PackageFormat`.

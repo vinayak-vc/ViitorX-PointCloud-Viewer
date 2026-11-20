@@ -1083,6 +1083,7 @@ int main(int argc, char** argv) {
         fprintf(f, "r360Ffmpeg=%s\n", recon360Settings.ffmpegExe.c_str());
         fprintf(f, "r360Ffprobe=%s\n", recon360Settings.ffprobeExe.c_str());
         fprintf(f, "r360MaskModel=%s\n", recon360Settings.maskModelDir.c_str());
+        fprintf(f, "r360EngineCatalog=%s\n", recon360Settings.engineCatalogUrl.c_str());
         for (const auto& r : recentDirs) {
             auto it = recentMeta.find(r);
             uint64_t p = it != recentMeta.end() ? it->second.points : 0;
@@ -1166,6 +1167,7 @@ int main(int argc, char** argv) {
                     else if (k == "r360Ffmpeg") recon360Settings.ffmpegExe = v;
                     else if (k == "r360Ffprobe") recon360Settings.ffprobeExe = v;
                     else if (k == "r360MaskModel") recon360Settings.maskModelDir = v;
+                    else if (k == "r360EngineCatalog") recon360Settings.engineCatalogUrl = v;
                 }
             }
             else if (strncmp(line, "recent=", 7) == 0) {
@@ -3934,6 +3936,18 @@ int main(int argc, char** argv) {
                         addToast("360 reconstruction FAILED: " + job->message(), "", true); break;
                     case ConvertJob::State::Canceled:
                         addToast("360 reconstruction canceled: " + job->name); break;
+                    default: break;
+                }
+                continue;
+            }
+            if (job->kind == ConvertJob::Kind::EnginePacks) {
+                switch (job->state.load()) {
+                    case ConvertJob::State::Succeeded:
+                        addToast("360 reconstruction engines installed"); break;
+                    case ConvertJob::State::Failed:
+                        addToast("Engine download failed: " + job->message(), "", true); break;
+                    case ConvertJob::State::Canceled:
+                        addToast("Engine download paused - start it again to resume"); break;
                     default: break;
                 }
                 continue;

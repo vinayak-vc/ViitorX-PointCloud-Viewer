@@ -33,6 +33,7 @@ struct Recon360Settings {
     std::string ffmpegExe;
     std::string ffprobeExe;
     std::string maskModelDir;   // optional masking add-on (scripts/pf360/setup_masking.ps1)
+    std::string engineCatalogUrl;   // signed engine-pack catalog; "" = build default (EnginePacks.h)
 };
 
 // Folder that contains the `pf360` package (worker root), or "" if missing.

@@ -316,6 +316,9 @@ Recommended order; update newdev.md status board as these move:
 ## Open - 360 Reconstruction Studio
 - `[x]` Nerfstudio env + COLMAP 3.11.1 installed; full chain verified on a synthetic clip (240/240 registered, PLY loads Z-up). `compat.json` verified.
 - `[x]` Automatic masking (people / vehicles / animals / sky): optional add-on, `masking` stage, COLMAP + Splatfacto masks, wizard controls + mask preview. Verified end to end on the synthetic clip.
+- `[x]` Engine packs: in-app download of signed packs from Hugging Face (`EnginePacks.cpp`, `scripts/pf360/engine_packs.py`); relocatable runtime pack; wizard Environment > Engines. See docs/360-reconstruction.md §8.1.
+- `[ ]` Engine packs release: generate the real signing key (`engine_packs.py keygen`), create the Hugging Face repo, `publish`, set `PF_ENGINE_CATALOG_URL`, rebuild. Licence review (FFmpeg GPL build -> consider an LGPL build; NVIDIA CUDA redistributables).
+- `[ ]` Engine packs: test on a clean PC with no Python/CUDA toolkit (only a relocated install on the dev PC was tested); "Remove engines" button.
 - `[ ]` Run real stitched 360 footage (with people / traffic) through Preview, then High Quality; judge masking on moving content.
 - `[ ]` Click through the wizard (Processing > Masking, preview overlay) on a real display.
 - `[ ]` Interactive masks (SAM 2.1, Apache-2.0: click / box / lasso + propagation) for objects the semantic classes miss.

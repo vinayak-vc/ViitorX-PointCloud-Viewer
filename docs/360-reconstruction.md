@@ -181,6 +181,75 @@ scales are logs — exactly what `SplatReader::loadPlyGaussians` expects.
 
 ## 8. Environment setup
 
+### 8.1 End users: engine packs (in-app download)
+
+The viewer ships without the engines (~35 MB instead of ~11 GB). The wizard's
+*Environment ▸ Engines (download)* section (opened automatically while the engines
+are missing) installs them as **engine packs** from a signed catalog on Hugging Face:
+
+| Pack id | Installs into `%LOCALAPPDATA%\ViitorX\PointForge\engines\` | Download | Required |
+|---|---|---|---|
+| `pf360-runtime` | `pf360-env\` — relocatable CPython 3.10 + PyTorch 2.1.2 cu118 + Nerfstudio 1.1.5 + prebuilt gsplat + transformers, LPIPS/AlexNet weights in `torch-home\` | ~3.2 GB | yes |
+| `colmap` | `colmap-conda\` — COLMAP 3.11.1 CUDA (conda-forge), build-time files stripped | ~1.9 GB | yes |
+| `ffmpeg` | `ffmpeg\bin\` — FFmpeg 9.0.2 shared build | ~0.1 GB | yes |
+| `mask-model` | `models\upernet-convnext-base-ade20k\` — fetched straight from `openmmlab/upernet-convnext-base` at the pinned revision | ~0.5 GB | optional |
+
+Needs: Windows 10 1803+ (uses the system `curl.exe` and `tar.exe`), an NVIDIA GPU
+with a current driver, ~17 GB free disk during install (~10.5 GB afterwards). No
+Python, Visual Studio or CUDA Toolkit is needed on the user's PC: nothing is compiled.
+
+**Trust chain** (`src/viewer/EnginePacks.{h,cpp}`):
+1. `catalog.json` + `catalog.json.sig` are fetched over HTTPS. The signature
+   (ECDSA P-256 / SHA-256, raw r‖s base64) must verify against the public key
+   compiled into the build (`src/viewer/EnginePackKey.h`). An empty key = the build
+   refuses every catalog.
+2. The catalog's `sequence` must not be lower than the newest one this PC accepted
+   (`engines\.engine-state.json`) — an old, validly signed catalog cannot be replayed.
+3. Every file is pinned by size + SHA-256; pack URLs are pinned to a Hugging Face
+   commit. Downloads resume (`curl --continue-at -`, up to 8 attempts) from
+   `engines\.downloads\<pack>\`; a hash mismatch deletes the file.
+4. Fields are validated even when signed: `installDir` must be a relative path of
+   `[A-Za-z0-9._-]` parts (no `..`), URLs must be `https://`, `postInstall` is one of a
+   fixed list (`python-relocate`) — the catalog cannot name a command to run.
+5. Zips are unpacked with `tar.exe` (refuses absolute / `..` entries) into
+   `engines\.staging\`, then swapped in. A folder the installer did not create (a
+   developer setup) is kept as `<dir>.backup-<time>`; a previous managed install is
+   restored if anything fails, else deleted. `<dir>\.pfpack.json` records id/version.
+6. `pf360-runtime`'s post-install step runs `python.exe -I pf360_relocate.py`, which
+   regenerates the `ns-*.exe` launchers for the folder it was unpacked into (pip bakes
+   absolute interpreter paths into them, so they are not shipped).
+
+**Live catalog** (published 2026-11-21): `https://huggingface.co/vinayaklakhani/pointforge-engines/resolve/main/catalog.json`,
+packs pinned to commit `fdb6a84…`; public key in `EnginePackKey.h` (private key kept by the
+publisher, outside the repo). Configure builds with
+`-DPF_ENGINE_CATALOG_URL=https://huggingface.co/vinayaklakhani/pointforge-engines/resolve/main/catalog.json`.
+
+The worker treats a pack runtime specially (`environment.pack_env`): child
+processes get `PYTHONNOUSERSITE=1` and `TORCH_HOME=<pack>\torch-home`, so neither a
+Python the user installed nor a missing download.pytorch.org can break training.
+The pack FFmpeg is preferred over `PATH`.
+
+Install runs as a job (`Kind::EnginePacks`) on the same queue as reconstructions,
+so packs are never swapped while a job uses them. *Pause download* cancels; starting
+again resumes. The catalog URL is the CMake cache variable `PF_ENGINE_CATALOG_URL`
+(baked in), overridable in *Engines ▸ Download source*.
+
+**Publishing (developers)** — `scripts/pf360/engine_packs.py`, run with the pf360 env's Python:
+1. Once: `engine_packs.py keygen --private-key %USERPROFILE%\.pointforge\engine-signing.pem`
+   (asks for a passphrase; writes the public key into `EnginePackKey.h`; keep the private
+   key out of the repo and backed up — losing it means shipping a new build with a new key).
+2. `engine_packs.py build --out <dir>` zips the working engines from this PC
+   (base CPython + venv site-packages merged; ~5.2 GB, ~15 min).
+3. `huggingface-cli login`, then `engine_packs.py publish --repo <org>/<name> --packs-dir <dir> --private-key <pem>`
+   uploads the zips, pins their URLs to the upload commit, signs and uploads the catalog,
+   and prints the catalog URL for `-DPF_ENGINE_CATALOG_URL=...`.
+4. Licences: the FFmpeg pack is a GPL-3.0 build — PointForge only runs it as a
+   separate program, but the GPL source-offer obligations apply to distributing those
+   binaries (or switch to an LGPL build). The CUDA DLLs in the PyTorch and COLMAP packs
+   are NVIDIA redistributables under the CUDA EULA. Review before public release.
+
+### 8.2 Developers: manual setup
+
 1. FFmpeg: `winget install Gyan.FFmpeg` (or set the path in Preferences).
 2. COLMAP **3.11.x**. Nerfstudio 1.1.5 passes `--SiftExtraction.use_gpu` /
    `--SiftMatching.use_gpu`, which newer COLMAP releases renamed; the doctor checks
@@ -235,6 +304,12 @@ in the UI; `environment.backend` is the extension point for them.
 | Masking controls greyed out | add-on not installed: run `setup_masking.ps1`, then *Full diagnostic* |
 | "Masking is enabled but the segmentation model is not installed" | same; or turn masking off |
 | Warning "N view(s) are more than 60% masked" | usually Sky on indoor scenes (textured ceilings can be classed as sky) or a crowd filling the view; drop that category or crop |
+| Engines section: "this build has no engine signing key" | developer build without `EnginePackKey.h` populated: run `engine_packs.py keygen`, rebuild |
+| "catalog signature is INVALID" | catalog edited after signing, or signed with a different key than this build embeds; re-run `publish` |
+| "OLDER engine catalog than this PC already accepted" | the server serves a stale catalog (cache/mirror) or an old one was re-uploaded; publish again (new sequence) |
+| "failed its SHA-256 check" | interrupted/corrupted download or the pack changed without a new catalog; it is deleted — install again |
+| "cannot replace … a program is using it" | a reconstruction or diagnostic still runs from that folder; wait or cancel it, then install again |
+| Download stops at the same point | network drops large transfers; *Install* again resumes from the partial file |
 | Ghosts / smeared people remain | add Vehicles, raise *Grow mask*; masks are per-view semantic segmentation, so tiny distant people can be missed |
 
 ## 10. Tests
@@ -269,6 +344,7 @@ in the UI; `environment.backend` is the extension point for them.
 | Wizard UI interaction | **not exercised** by an automated run (native SDL window) |
 | Nerfstudio projection → COLMAP → Splatfacto → export → load | **done 2026-11-21** on a *synthetic* 30 s 2880×1440 clip (`scripts/pf360/make_synthetic_360.py`), Preview preset, RTX 3060: 240/240 views registered, 30 distinct positions, 7000 its in 3.2 min, 259,599 Gaussians, validated PLY, loaded in PointForge (`--export-glb` smoke). Versions: `compat.json` |
 | Z-up orientation of a real export | **verified** on that run: camera centres vary only in X/Y, mean camera-up = +Z in export space |
+| Engine packs | **done 2026-11-21**: packs built (ffmpeg 0.10 GB, colmap 1.88 GB, pf360-runtime 3.49 GB; 523 s); installed by the C++ installer into a separate folder (193 s from a loopback server); relocated Python had no path outside its folder, CUDA + gsplat `_C` OK, launchers rewritten; doctor READY with `LOCALAPPDATA` pointed there and FFmpeg removed from PATH; masked Preview run (30 frames, 2000 its): 240/240 registered, 203,477 Gaussians, validated PLY. Mask pack downloaded from Hugging Face for real (466 MB, ~10.7 MB/s, SHA OK). `pf360hosttest` 100/100, Python 86. **Not done**: a clean second PC; the real signing key + Hugging Face upload (needs the owner's account) |
 | Real-world 360 footage | **not run yet** (masking not yet exercised on real moving people/traffic) |
 | Wizard masking controls + mask preview overlay | built; the preview call path is tested by pf360hosttest, the ImGui controls were **not clicked through** |
 

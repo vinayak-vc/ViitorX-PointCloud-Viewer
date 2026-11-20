@@ -168,6 +168,7 @@ class NerfstudioBackend(ReconstructionBackend):
         # cached yet (see environment.compiler_env). The vcvars PATH replaces the
         # base PATH, then the tool dirs are prepended as usual.
         extra = dict(environment.compiler_env())
+        extra.update(ctx.tools.ns_env())       # downloadable runtime pack: isolation + bundled weights
         env = procrun.child_env((), extra)
         dirs = [d for d in ctx.tools.path_prepend() if d]
         if dirs:

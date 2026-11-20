@@ -240,6 +240,34 @@ class Tools:
             dirs.append(str(Path(self.ffmpeg).parent))
         return dirs
 
+    def ns_env(self) -> Dict[str, str]:
+        """Extra environment for processes run with the Nerfstudio interpreter."""
+        return pack_env(self.ns_python)
+
+
+def pack_env(ns_python: Optional[str]) -> Dict[str, str]:
+    """When the Nerfstudio interpreter is PointForge's downloadable runtime pack
+    (PF360_PACK.json beside python.exe), isolate it from the machine: no user
+    site-packages from a Python the user installed themselves, and torchvision's
+    LPIPS backbone weights come from the pack (otherwise Splatfacto downloads them
+    from download.pytorch.org on first use). {} for a self-managed environment."""
+    if not ns_python:
+        return {}
+    root = Path(ns_python).parent
+    if root.name.lower() == "scripts":
+        root = root.parent
+    if not (root / "PF360_PACK.json").is_file():
+        return {}
+    add = {"PYTHONNOUSERSITE": "1"}
+    if (root / "torch-home").is_dir():
+        add["TORCH_HOME"] = str(root / "torch-home")
+    return add
+
+
+def pack_ffmpeg() -> Optional[str]:
+    """ffmpeg.exe from the downloadable FFmpeg engine pack (engines/ffmpeg/bin)."""
+    return _file(str(engines_root() / "ffmpeg" / "bin" / ("ffmpeg" + EXE)))
+
 
 def resolve_tools(cfg: Optional[Dict[str, Any]] = None) -> Tools:
     cfg = cfg or {}
@@ -257,7 +285,8 @@ def resolve_tools(cfg: Optional[Dict[str, Any]] = None) -> Tools:
     t.colmap = (_file(cfg.get("colmapExe")) or _file(os.environ.get("PF360_COLMAP"))
                 or _file(str(default_env_dir() / "colmap" / ("colmap" + EXE))) or shutil.which("colmap")
                 or find_colmap_in_engines())
-    t.ffmpeg = _file(cfg.get("ffmpegExe")) or _file(os.environ.get("PF360_FFMPEG")) or shutil.which("ffmpeg")
+    t.ffmpeg = (_file(cfg.get("ffmpegExe")) or _file(os.environ.get("PF360_FFMPEG")) or pack_ffmpeg()
+                or shutil.which("ffmpeg"))
     t.ffprobe = _file(cfg.get("ffprobeExe")) or _file(os.environ.get("PF360_FFPROBE")) or shutil.which("ffprobe")
     if not t.ffprobe and t.ffmpeg:
         t.ffprobe = _file(str(Path(t.ffmpeg).with_name("ffprobe" + EXE)))
@@ -378,7 +407,8 @@ def query_nvidia_smi() -> Dict[str, Any]:
 
 def query_torch(ns_python: str) -> Dict[str, Any]:
     try:
-        cp = procrun.capture([ns_python, "-c", TORCH_PROBE], timeout=180, env=procrun.child_env())
+        cp = procrun.capture([ns_python, "-c", TORCH_PROBE], timeout=180,
+                             env=procrun.child_env(extra=pack_env(ns_python)))
     except Exception as e:
         return {"probeError": repr(e)}
     text = cp.stdout.decode("utf-8", "replace")
@@ -397,7 +427,8 @@ def list_methods(tools: Tools) -> List[str]:
     if not ns_train:
         return []
     try:
-        cp = procrun.capture([ns_train, "--help"], timeout=180, env=procrun.child_env(tools.path_prepend()))
+        cp = procrun.capture([ns_train, "--help"], timeout=180,
+                             env=procrun.child_env(tools.path_prepend(), tools.ns_env()))
     except Exception:
         return []
     text = cp.stdout.decode("utf-8", "replace") + cp.stderr.decode("utf-8", "replace")
@@ -411,8 +442,8 @@ def list_methods(tools: Tools) -> List[str]:
     return found
 
 
-INSTALL_HINT = ("Run scripts\\pf360\\setup_environment.ps1 (creates an isolated env under "
-                "%LOCALAPPDATA%\\ViitorX\\PointForge\\engines\\pf360-env), or point PointForge at an existing "
+INSTALL_HINT = ("Use 'Install engines' in the 360 wizard (Environment > Engines) to download the engine packs, "
+                "or run scripts\\pf360\\setup_environment.ps1 (developer setup), or point PointForge at an existing "
                 "Nerfstudio Python in Edit > Preferences > 360 Reconstruction.")
 
 

@@ -293,8 +293,9 @@ std::thread lineReader(HANDLE h, std::function<void(const std::string&)> onLine)
 std::vector<std::wstring> pythonLauncher(const Recon360Settings& s) {
     if (isFile(widen(s.workerPython))) return {widen(s.workerPython)};
     // The worker is stdlib-only: any CPython >= 3.8 works, including the Nerfstudio env's.
-    const std::wstring envPy = (localAppData() / L"ViitorX" / L"PointForge" / L"engines" / L"pf360-env" /
-                                L"Scripts" / L"python.exe").wstring();
+    const fs::path envDir = localAppData() / L"ViitorX" / L"PointForge" / L"engines" / L"pf360-env";
+    const std::wstring envPy = (envDir / L"Scripts" / L"python.exe").wstring();   // developer venv
+    const std::wstring packPy = (envDir / L"python.exe").wstring();               // downloaded runtime pack
     std::wstring py = searchPath(L"py");
     if (!py.empty()) return {py, L"-3"};
     py = searchPath(L"python");
@@ -302,6 +303,7 @@ std::vector<std::wstring> pythonLauncher(const Recon360Settings& s) {
     if (!py.empty() && py.find(L"WindowsApps") == std::wstring::npos) return {py};
     if (isFile(widen(s.nsPython))) return {widen(s.nsPython)};
     if (isFile(envPy)) return {envPy};
+    if (isFile(packPy)) return {packPy};
     return {};
 }
 

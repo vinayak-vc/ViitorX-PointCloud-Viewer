@@ -6,6 +6,7 @@
 // for the same resources. The UI polls job state each frame (all cross-thread
 // fields are atomics or mutex-guarded).
 #include "indexer/OctreeIndexer.h"
+#include "viewer/EnginePacks.h"
 #include "viewer/Photogrammetry.h"
 #include "viewer/Recon360.h"
 
@@ -27,7 +28,8 @@ struct ConvertJob {
     // file mid-job). EngineSetup: one-time ODM+COLMAP auto-install.
     // Recon360: 360 video -> pf360 worker (FFmpeg/COLMAP/Nerfstudio) -> 3DGS .ply
     // (output = the produced .ply; loaded on the existing Gaussian-splat path).
-    enum class Kind { Convert, Photogrammetry, EngineSetup, Recon360 };
+    // EnginePacks: download + install signed 360 engine packs (EnginePacks.h).
+    enum class Kind { Convert, Photogrammetry, EngineSetup, Recon360, EnginePacks };
 
     Kind         kind = Kind::Convert;
     std::string  input;               // source scan file
@@ -44,6 +46,9 @@ struct ConvertJob {
     std::shared_ptr<Recon360JobSpec> recon;
     std::shared_ptr<Recon360Live>    reconLive;   // stage/log state shared with the UI
     Recon360Settings                 reconSettings;
+    // EnginePacks only:
+    std::shared_ptr<EngineCatalog>   engineCatalog;
+    std::vector<std::string>         enginePackIds;
 
     std::atomic<State> state{State::Queued};
     std::atomic<float> progress{0.0f};
@@ -129,6 +134,20 @@ public:
         size_t slash = spec.videoPath.find_last_of("/\\");
         job->name = ((slash == std::string::npos) ? spec.videoPath : spec.videoPath.substr(slash + 1)) +
                     " (360 -> splat)";
+        submit(job);
+        return job;
+    }
+
+    // Download + install engine packs (user confirmed size/licences in the wizard).
+    // Same worker thread as reconstructions, so packs are never swapped while a
+    // reconstruction is using them.
+    std::shared_ptr<ConvertJob> enqueueEnginePacks(const EngineCatalog& cat, const std::vector<std::string>& ids) {
+        auto job = std::make_shared<ConvertJob>();
+        job->kind = ConvertJob::Kind::EnginePacks;
+        job->engineCatalog = std::make_shared<EngineCatalog>(cat);
+        job->enginePackIds = ids;
+        job->name = "360 engines download";
+        job->loadWhenDone = false;
         submit(job);
         return job;
     }
@@ -221,6 +240,15 @@ private:
                         std::lock_guard<std::mutex> lk(job->reconLive->mu);
                         job->setMessage(job->reconLive->finalMessage.empty() ? "Done" : job->reconLive->finalMessage);
                     }
+                } else if (job->kind == ConvertJob::Kind::EnginePacks) {
+                    std::string err;
+                    ok = engineInstallPacks(*job->engineCatalog, job->enginePackIds, engineRoot(), job->cancelFlag,
+                                            [raw](float pct, const std::string& msg) {
+                                                raw->progress = pct;
+                                                raw->setMessage(msg);
+                                            },
+                                            err);
+                    if (!ok && !err.empty()) job->setMessage(err);
                 } else if (job->kind == ConvertJob::Kind::EngineSetup) {
                     std::string err;
                     ok = installEngines(/*wantColmap=*/true, /*wantOdm=*/true, job->cancelFlag,

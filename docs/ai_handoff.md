@@ -1,5 +1,11 @@
 # AI Handoff - PointForge (C++ repo)
 
+## Session (2026-11-21, later) - 360 engine packs: in-app download from Hugging Face (branch `splat-generator`)
+
+- **What**: the viewer ships without the ~11 GB engines; wizard *Environment > Engines (download)* installs signed packs (`pf360-runtime`, `colmap`, `ffmpeg`, optional `mask-model`). C++ `src/viewer/EnginePacks.{h,cpp}` (system curl.exe/tar.exe, BCrypt SHA-256 + ECDSA P-256, staging + swap + rollback, `.pfpack.json`, sequence anti-rollback), `EnginePackKey.h` (public key, EMPTY until `keygen`), `ConvertJob::Kind::EnginePacks`, Prefs `r360EngineCatalog`, CMake `PF_ENGINE_CATALOG_URL`. Tooling `scripts/pf360/engine_packs.py` (build/keygen/catalog/sign/verify/publish) + `pack_relocate.py`. Worker: `environment.pack_env` (PYTHONNOUSERSITE, TORCH_HOME), pack FFmpeg before PATH, pack python at env root. Docs: 360-reconstruction.md §8.1, decisions.md.
+- **Tests**: `pf360hosttest` 100 checks (43 new: signature/tamper/wrong key, parser rejects `..`/abs paths/unknown postInstall/non-https, loopback server with dropped connection -> resume, SHA mismatch keeps old install, backup of a manual folder, update replaces, older catalog refused); Python 86 (+6). Python-signed catalog verified by C++. Real Hugging Face download (mask model, 466 MB, CDN redirect + SHA) OK.
+- **Release TODO (user)**: run `keygen` (passphrase, key outside repo), create the HF repo, `huggingface-cli login`, `publish`, configure `-DPF_ENGINE_CATALOG_URL=...`, rebuild. Licence review (FFmpeg GPL build).
+
 ## Session (2026-11-21) - 360 Studio: real GPU run + automatic masking (branch `splat-generator`)
 
 - **Installed (this machine)**: pf360 env (Python 3.10, torch 2.1.2+cu118, nerfstudio 1.1.5, **prebuilt** gsplat 1.4.0+pt21cu118, setuptools 69.5.1), COLMAP 3.11.1 from conda-forge in `engines\colmap-conda`, masking add-on (transformers 4.46.3 + `upernet-convnext-base-ade20k`). CAVEAT: installed from inside the Claude desktop app, so Windows put them in `%LOCALAPPDATA%\Packages\Claude_pzs8sxrjxfjjc\LocalCache\Local\ViitorX\PointForge\engines` — copy that `ViitorX` folder to the real `%LOCALAPPDATA%` from a normal PowerShell before using PointForge started from Explorer.
