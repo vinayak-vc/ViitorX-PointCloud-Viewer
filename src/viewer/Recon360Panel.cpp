@@ -31,8 +31,6 @@ const int kDownscales[] = {1, 2, 4, 8};
 const ImVec4 kGood(0.45f, 0.85f, 0.45f, 1), kWarn(1.0f, 0.75f, 0.3f, 1), kBad(1.0f, 0.4f, 0.4f, 1),
              kDim(0.6f, 0.6f, 0.6f, 1);
 
-double nowSec() { return (double)SDL_GetTicks64() / 1000.0; }
-
 std::string fmtTime(double s) {
     if (s < 0) s = 0;
     int t = (int)s;
@@ -293,7 +291,7 @@ void Recon360Panel::enqueue(Recon360PanelHost& host) {
     const Recon360JobSpec sp = buildSpec(probedPath, probe, (fs::u8path(parentBuf) / fs::u8path(projectBuf)).u8string(),
                                          plyBuf, projectionConfirmed, false, 0);
     job = host.jobs->enqueueRecon360(sp, *host.settings, autoLoad);
-    jobStart = nowSec();
+    jobStart = jobClockSec();
     jobEnd = 0;
     {
         std::lock_guard<std::mutex> lk(job->reconLive->mu);
@@ -461,7 +459,7 @@ void Recon360Panel::enqueueBatch(Recon360PanelHost& host) {
         batchJobNames.push_back(b.rel);
         logInfo("[pf360] batch queued " + sp.jobId + ": " + b.rel + " -> " + sp.outputDir);
     }
-    batchStart = nowSec();
+    batchStart = jobClockSec();
     step = 4;
 }
 
@@ -471,7 +469,7 @@ void Recon360Panel::resumeJobs(Recon360PanelHost& host, const std::vector<Recon3
         // One job: the regular run page.
         batchMode = false;
         job = host.jobs->enqueueRecon360(specs[0], *host.settings, false);
-        jobStart = nowSec();
+        jobStart = jobClockSec();
         jobEnd = 0;
         { std::lock_guard<std::mutex> lk(job->reconLive->mu); job->reconLive->startedAt = jobStart; }
         step = 4;
@@ -483,7 +481,7 @@ void Recon360Panel::resumeJobs(Recon360PanelHost& host, const std::vector<Recon3
             batchJobs.push_back(host.jobs->enqueueRecon360(sp, *host.settings, false));
             batchJobNames.push_back(fs::u8path(sp.videoPath).filename().u8string());
         }
-        batchStart = nowSec();
+        batchStart = jobClockSec();
         step = 4;
     }
     for (const auto& sp : specs) logInfo("[pf360] resuming " + sp.jobId + " in " + sp.outputDir);
@@ -707,9 +705,10 @@ void Recon360Panel::drawBatchOutput(Recon360PanelHost& host) {
 void Recon360Panel::drawBatchRun(Recon360PanelHost& host) {
     int done = 0, ok = 0, failed = 0, canceled = 0;
     float sum = 0;
+    double lastEnd = 0;          // when the last video finished (the timer stops there)
     for (const auto& j : batchJobs) {
         const auto st = j->state.load();
-        if (j->finished()) ++done;
+        if (j->finished()) { ++done; lastEnd = std::max(lastEnd, j->endedAt.load()); }
         if (st == ConvertJob::State::Succeeded) ++ok;
         if (st == ConvertJob::State::Failed) ++failed;
         if (st == ConvertJob::State::Canceled) ++canceled;
@@ -720,8 +719,9 @@ void Recon360Panel::drawBatchRun(Recon360PanelHost& host) {
     char ov[96];
     snprintf(ov, sizeof(ov), "%d / %d videos finished", done, n);
     ImGui::ProgressBar(n ? sum / n : 1.0f, ImVec2(-1, 0), ov);
-    ImGui::Text("Succeeded %d   Failed %d   Paused %d   Elapsed %s", ok, failed, canceled,
-                fmtTime(nowSec() - batchStart).c_str());
+    const double end = (allDone && lastEnd > 0) ? lastEnd : jobClockSec();
+    ImGui::Text("Succeeded %d   Failed %d   Paused %d   %s %s", ok, failed, canceled,
+                allDone ? "Total time" : "Elapsed", fmtTime(end - batchStart).c_str());
     if (ImGui::BeginTable("##brun", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingStretchProp,
                           ImVec2(0, std::max(160.0f * host.uiScale, ImGui::GetContentRegionAvail().y - 40.0f * host.uiScale)))) {
         ImGui::TableSetupScrollFreeze(0, 1);
@@ -779,7 +779,7 @@ void Recon360Panel::drawBatchRun(Recon360PanelHost& host) {
                 if (st == ConvertJob::State::Failed || st == ConvertJob::State::Canceled)
                     batchJobs[i] = host.jobs->enqueueRecon360(*batchJobs[i]->recon, *host.settings, false);
             }
-            batchStart = nowSec();
+            batchStart = jobClockSec();
             return;
         }
         if (failed + canceled > 0) ImGui::SameLine();
@@ -1471,12 +1471,12 @@ void Recon360Panel::drawStepOutput(Recon360PanelHost& host) {
 void Recon360Panel::drawStepRun(Recon360PanelHost& host) {
     if (!job) { step = 0; return; }
     const bool finished = job->finished();
-    if (finished && jobEnd == 0) jobEnd = nowSec();
+    if (finished && jobEnd == 0) jobEnd = job->endedAt.load() > 0 ? job->endedAt.load() : jobClockSec();
     Recon360Live& L = *job->reconLive;
     std::lock_guard<std::mutex> lk(L.mu);
     const int cur = L.currentStage;
     ImGui::Text("Current stage: %s", cur >= 0 ? recon360StageLabel(cur) : "Queued / starting worker");
-    ImGui::Text("Elapsed: %s", fmtTime((finished ? jobEnd : nowSec()) - jobStart).c_str());
+    ImGui::Text("Elapsed: %s", fmtTime((finished ? jobEnd : jobClockSec()) - jobStart).c_str());
     const float w = ImGui::GetContentRegionAvail().x;
     if (!finished && L.stagePercent < 0)
         ImGui::ProgressBar(-1.0f * (float)ImGui::GetTime(), ImVec2(w, 0), "working (progress not reported)");
@@ -1571,7 +1571,7 @@ void Recon360Panel::drawStepDone(Recon360PanelHost& host) {
         ImGui::TextColored(kBad, "Reconstruction failed");
         ImGui::TextWrapped("%s", job->message().c_str());
     }
-    ImGui::Text("Total time: %s", fmtTime((jobEnd > 0 ? jobEnd : nowSec()) - jobStart).c_str());
+    ImGui::Text("Total time: %s", fmtTime((jobEnd > 0 ? jobEnd : jobClockSec()) - jobStart).c_str());
     if (!ws.empty()) ImGui::TextDisabled("Workspace: %s", ws.c_str());
     for (const auto& w : warnings) wrapped(kWarn, "Warning: " + w);
     ImGui::Spacing();
@@ -1596,7 +1596,7 @@ void Recon360Panel::drawStepDone(Recon360PanelHost& host) {
         if (ImGui::Button(st == ConvertJob::State::Canceled ? "Resume" : "Retry (resume)")) {
             // Same settings + workspace: finished stages are reused via their hashes.
             job = host.jobs->enqueueRecon360(*job->recon, *host.settings, job->loadWhenDone);
-            jobStart = nowSec();
+            jobStart = jobClockSec();
             jobEnd = 0;
             step = 4;
             return;

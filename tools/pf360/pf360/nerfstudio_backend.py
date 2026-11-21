@@ -460,7 +460,9 @@ class NerfstudioBackend(ReconstructionBackend):
                                   "texture/overlap or camera movement.",
                                   {"generatedImages": total, "registeredImages": 0})
             best = max(models, key=lambda kv: kv[1])
-            rig = self._rig_complete(ctx, env, log, sparse_dir, best[0], db, pr)
+            rig = self._rig_complete(ctx, env, log, sparse_dir, db, pr)
+            if rig:
+                rig["dir"] = self._triangulate(ctx, env, log, colmap, sparse_dir, rig["dir"], db)
             model_rel = "colmap/sparse/%s" % (rig["dir"] if rig else best[0])
             ctx.emitter.progress("camera_reconstruction", 92.0, "writing transforms.json")
             flags = self._help(ctx, "process", [tool, "images", "--help"])
@@ -480,20 +482,21 @@ class NerfstudioBackend(ReconstructionBackend):
                                  cancel=ctx.cancel, log=log, env=env)
                 if rc != 0:
                     raise StageFailed("Attaching masks to the training data failed (exit %d) - see logs/colmap.log" % rc)
-        data = self._validate_reconstruction(ctx, total, models, best[0], rig)
+        data = self._validate_reconstruction(ctx, total, models, rig["dir"] if rig else best[0], rig)
         data["trainingMasks"] = masks_on
         return data
 
-    def _rig_complete(self, ctx: StageContext, env: Dict[str, str], log, sparse_dir: Path, model: str, db: Path,
+    def _rig_complete(self, ctx: StageContext, env: Dict[str, str], log, sparse_dir: Path, db: Path,
                       pr: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Poses every view of each registered panorama from its registered views (ns_helpers/rig_complete.py).
-        Returns the helper's stats + "dir", or None (then the plain COLMAP model is used)."""
+        """Joins COLMAP's models through shared panoramas, then poses every view of each registered
+        panorama from its registered views (ns_helpers/rig_complete.py --sparse).
+        Returns the helper's stats + "dir", or None (then the largest plain COLMAP model is used)."""
         views = yaw_pitch_pairs(pr["imagesPerEquirect"], (pr["cropTop"], pr["cropBottom"], pr["cropLeft"],
                                                           pr["cropRight"]))
-        out_name = "%s_rig" % model
-        ctx.emitter.progress("camera_reconstruction", 91.0, "completing panoramas")
+        out_name = "joined_rig"
+        ctx.emitter.progress("camera_reconstruction", 90.5, "joining models + completing panoramas")
         lines: List[str] = []
-        rc = procrun.run([ctx.tools.ns_python, str(HELPERS / "rig_complete.py"), "--model", str(sparse_dir / model),
+        rc = procrun.run([ctx.tools.ns_python, str(HELPERS / "rig_complete.py"), "--sparse", str(sparse_dir),
                           "--db", str(db), "--views", json.dumps(views), "--out", str(sparse_dir / out_name)],
                          cancel=ctx.cancel, on_line=lines.append, log=log, env=env)
         stats = next((json.loads(l[len("PF360RIG"):]) for l in lines if l.startswith("PF360RIG")), None)
@@ -502,7 +505,32 @@ class NerfstudioBackend(ReconstructionBackend):
                                 stage="camera_reconstruction")
             return None
         stats["dir"] = out_name
+        if stats.get("modelsTotal", 0) > 1:
+            ctx.emitter.log("joined %d of %d COLMAP models through shared panoramas"
+                            % (stats.get("modelsMerged", 0), stats["modelsTotal"]), stage="camera_reconstruction")
         return stats
+
+    def _triangulate(self, ctx: StageContext, env: Dict[str, str], log, colmap: str, sparse_dir: Path,
+                     model: str, db: Path) -> str:
+        """COLMAP point_triangulator on the joined model: camera poses stay fixed, the sparse points are
+        rebuilt from ALL matches (so completed views and the seams between joined models get points).
+        Returns the model to use; on failure the joined model (its points have no tracks)."""
+        out_name = model + "_tri"
+        out = sparse_dir / out_name
+        shutil.rmtree(out, ignore_errors=True)
+        out.mkdir(parents=True)
+        ctx.emitter.progress("camera_reconstruction", 91.0, "triangulating points")
+        rc = procrun.run([colmap, "point_triangulator", "--database_path", str(db),
+                          "--image_path", str(ctx.workspace.planar_dir), "--input_path", str(sparse_dir / model),
+                          "--output_path", str(out), "--clear_points", "1", "--refine_intrinsics", "0",
+                          "--Mapper.ba_refine_focal_length", "0", "--Mapper.ba_refine_principal_point", "0",
+                          "--Mapper.ba_refine_extra_params", "0"],
+                         cancel=ctx.cancel, log=log, env=env, cwd=str(ctx.workspace.root))
+        if rc != 0 or not (out / "points3D.bin").is_file():
+            ctx.emitter.warning("Re-triangulating the joined model failed (see logs/colmap.log); using the "
+                                "points of COLMAP's models instead.", stage="camera_reconstruction")
+            return model
+        return out_name
 
     def _vocab_tree(self, ctx: StageContext, env: Dict[str, str]) -> str:
         """Nerfstudio's cached vocabulary tree (downloaded by Nerfstudio on first use)."""
@@ -557,6 +585,7 @@ class NerfstudioBackend(ReconstructionBackend):
             data["colmapRegisteredViews"] = rig.get("registeredViews")
             data["completedViews"] = rig.get("addedViews")
             data["panoramasRegistered"] = rig.get("panoramasCompleted")
+            data["colmapModelsJoined"] = rig.get("modelsMerged")
             if rig.get("panoramasInconsistent"):
                 ctx.emitter.warning("%d panorama(s) had inconsistent view poses and were not completed."
                                     % rig["panoramasInconsistent"], stage="camera_reconstruction")
@@ -573,9 +602,16 @@ class NerfstudioBackend(ReconstructionBackend):
         if used is not None:
             data["colmapModelUsed"] = used
         if len(models) > 1:
-            ctx.emitter.warning("COLMAP split the scene into %d disconnected models; only the largest (%d images) "
-                                "is used. Capture with more overlap or try exhaustive matching."
-                                % (len(models), max(n for _, n in models)), stage="camera_reconstruction")
+            if rig and rig.get("modelsMerged"):
+                left = len(models) - int(rig["modelsMerged"])
+                if left > 0:
+                    ctx.emitter.warning("COLMAP split the walk into %d pieces; %d were joined through shared "
+                                        "panoramas, %d could not be tied in and are left out."
+                                        % (len(models), rig["modelsMerged"], left), stage="camera_reconstruction")
+            else:
+                ctx.emitter.warning("COLMAP split the scene into %d disconnected models; only the largest (%d "
+                                    "images) is used. Capture with more overlap or try exhaustive matching."
+                                    % (len(models), max(n for _, n in models)), stage="camera_reconstruction")
         if data.get("cameraExtent", 0.0) <= 1e-9 or data.get("distinctCameraPositions", 0) < 3:
             raise StageFailed("The registered cameras barely move (camera rotated in place). Gaussian Splats need "
                               "the camera to travel through the scene to recover depth.", data)

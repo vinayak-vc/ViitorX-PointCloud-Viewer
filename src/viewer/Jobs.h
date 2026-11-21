@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <memory>
 #include <mutex>
@@ -20,6 +21,12 @@
 #include <vector>
 
 namespace pf {
+
+// Monotonic seconds for job timing (ConvertJob::endedAt and the UIs that compare against it).
+inline double jobClockSec() {
+    using namespace std::chrono;
+    return duration<double>(steady_clock::now().time_since_epoch()).count();
+}
 
 struct ConvertJob {
     enum class State { Queued, Running, Succeeded, Failed, Canceled };
@@ -53,6 +60,9 @@ struct ConvertJob {
     std::atomic<State> state{State::Queued};
     std::atomic<float> progress{0.0f};
     std::atomic<bool>  cancelFlag{false};
+    // jobClockSec() when the job reached a finished state (0 = not finished). Written BEFORE
+    // `state`, so a UI that sees finished() also sees the end time.
+    std::atomic<double> endedAt{0.0};
     bool               notified = false; // main thread has handled completion (main thread only)
 
     void setMessage(const std::string& m) { std::lock_guard<std::mutex> lk(mMutex); mMessage = m; }
@@ -181,7 +191,9 @@ public:
         // A queued job can be canceled immediately; a running one stops at the
         // converter's next cancellation checkpoint.
         ConvertJob::State expected = ConvertJob::State::Queued;
-        job->state.compare_exchange_strong(expected, ConvertJob::State::Canceled);
+        const double now = jobClockSec();
+        if (job->state.compare_exchange_strong(expected, ConvertJob::State::Canceled))
+            job->endedAt = now;      // (a running job gets its end time from the worker)
     }
 
     void clearFinished() {
@@ -294,6 +306,7 @@ private:
                 job->setMessage("Unknown exception during conversion");
                 ok = false;
             }
+            job->endedAt = jobClockSec();
             if (job->cancelFlag.load()) {
                 job->state = ConvertJob::State::Canceled;
             } else if (ok) {

@@ -145,7 +145,7 @@ struct Recon360Live {
     std::vector<std::string> warnings;
     std::string outputPly, reportJson, workspace, finalMessage;
     uint64_t gaussianCount = 0, plyBytes = 0;
-    double startedAt = 0;          // SDL ticks seconds at launch (UI clock)
+    double startedAt = 0;          // jobClockSec() at launch (UI clock)
 
     void addLog(const std::string& l) {
         log.push_back(l);

@@ -1,5 +1,12 @@
 # AI Handoff - PointForge (C++ repo)
 
+## Session (2026-11-21, night) - joining COLMAP's split models; batch timer
+
+- **User batch** (5 real clips): 2 failed at 26 % / 16 % placed. `colmap.log` showed many models covering the SAME time ranges (direction-wise split: forward vs backward views share no features); only the largest was used.
+- **Fix**: `rig_complete.py --sparse <sparse>` joins all mapper models through shared panoramas (`estimate_sim3`: R from rig rotations Q_ref = Q_mov R^T, scale = median pairwise-distance ratio then LS, rejects rmsRel > 0.15; greedy most-inliers-first into the model with most panoramas), then completes; backend `_triangulate` runs `colmap point_triangulator --clear_points 1` (verified: poses unchanged). Output dirs `sparse/joined_rig[_tri]`. Cache tag NOT bumped on purpose, so failed jobs resume with the COLMAP DB kept.
+- **Batch timer**: `ConvertJob::endedAt` (`jobClockSec()`, steady clock) set before the terminal state; batch + single-run pages stop at the last end time ("Total time").
+- Tests: `tests/test_rig_merge.py` (4); Python 95 OK; hosttest 126/126; synthetic full run OK. Not yet re-run on the user's 2 failed clips.
+
 ## Session (2026-11-21, evening) - real-footage COLMAP fix, pause/resume, batch, embedded worker
 
 - **Embedded worker**: `tools/embed_worker.cmake` -> `EmbeddedWorker.h`; a lone exe extracts the worker to `%LOCALAPPDATA%\ViitorX\PointForge\worker\<hash>`; pack Python preferred.
