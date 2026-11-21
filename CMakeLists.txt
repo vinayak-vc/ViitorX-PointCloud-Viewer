@@ -323,6 +323,15 @@ target_link_libraries(pfconvert PRIVATE pfcore)
 # parallel byte-identity + hierarchy invariants). Uses OctreeStore for the
 # read-back; OctreeStore is GL-free (same pattern as pfunity).
 # ---------------------------------------------------------------------------
+# The pf360 worker (tools/pf360/pf360) compiled into the exe as EmbeddedWorker.h,
+# extracted on first use, so a lone copied exe can run 360 reconstructions.
+# Always-run target; the script only rewrites the header when a file changed.
+add_custom_target(embed_worker_header ALL
+    COMMAND ${CMAKE_COMMAND} -DWORKER_DIR=${CMAKE_CURRENT_SOURCE_DIR}/tools/pf360/pf360
+            -DOUTPUT_HEADER=${CMAKE_BINARY_DIR}/generated/EmbeddedWorker.h
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_worker.cmake
+    COMMENT "Embedding the pf360 worker"
+    VERBATIM)
 set(PF_ENGINE_CATALOG_URL "" CACHE STRING
     "Signed 360 engine-pack catalog URL (https://huggingface.co/<repo>/resolve/main/catalog.json); empty = unset")
 option(PF_BUILD_TESTS "Build the pftest round-trip test executable" ON)
@@ -351,7 +360,10 @@ if(PF_BUILD_TESTS)
         src/viewer/EnginePacks.cpp
     )
     target_link_libraries(pf360hosttest PRIVATE pfcore Threads::Threads nlohmann_json::nlohmann_json)
-    target_compile_definitions(pf360hosttest PRIVATE PF_ENGINE_CATALOG_URL="${PF_ENGINE_CATALOG_URL}")
+    target_compile_definitions(pf360hosttest PRIVATE PF_ENGINE_CATALOG_URL="${PF_ENGINE_CATALOG_URL}"
+                               PF_EMBED_WORKER)
+    target_include_directories(pf360hosttest PRIVATE ${CMAKE_BINARY_DIR}/generated)
+    add_dependencies(pf360hosttest embed_worker_header)
     add_dependencies(pf360hosttest pfview)   # pfview's post-build copies the worker beside the exes
     add_test(NAME pf360_host COMMAND pf360hosttest)
 endif()
@@ -393,7 +405,9 @@ add_dependencies(pfview version_header)
 # Downloadable 360 engine packs (src/viewer/EnginePacks.h): the signed catalog's
 # location, e.g. https://huggingface.co/<org>/<repo>/resolve/main/catalog.json.
 # Users can override it in Preferences; the signature key is in EnginePackKey.h.
-target_compile_definitions(pfview PRIVATE PF_ENGINE_CATALOG_URL="${PF_ENGINE_CATALOG_URL}")
+target_compile_definitions(pfview PRIVATE PF_ENGINE_CATALOG_URL="${PF_ENGINE_CATALOG_URL}" PF_EMBED_WORKER)
+target_include_directories(pfview PRIVATE ${CMAKE_BINARY_DIR}/generated)
+add_dependencies(pfview embed_worker_header)
 # 360 Reconstruction Studio: ship the standalone pf360 Python worker beside the
 # exe (<exe dir>/pf360/pf360/...). Recon360.cpp also finds tools/pf360 in the
 # source tree for dev builds. The worker is stdlib-only Python; nothing is compiled.

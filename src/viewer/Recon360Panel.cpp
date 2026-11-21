@@ -17,6 +17,7 @@
 #include <ctime>
 #include <filesystem>
 #include <fstream>
+#include <set>
 
 namespace fs = std::filesystem;
 
@@ -87,9 +88,16 @@ bool Recon360Panel::isVideoFile(const std::string& path) {
 
 void Recon360Panel::show(const std::string& videoPath) {
     open = true;
+    unfinishedDirty = true;                               // jobs may have stopped since last time
     if (step >= 4 && job && !job->finished()) return;   // a run is in progress: just bring it up
+    if (step >= 4 && batchMode) {
+        bool running = false;
+        for (const auto& j : batchJobs) running = running || !j->finished();
+        if (running) return;                              // batch still running: just bring it up
+    }
     if (step >= 4) { step = 0; job.reset(); }
     if (!videoPath.empty()) {
+        batchMode = false;                                // a dropped / chosen video = single mode
         snprintf(videoBuf, sizeof(videoBuf), "%s", videoPath.c_str());
         probedPath.clear();     // force a new probe
         step = 0;
@@ -219,7 +227,9 @@ bool Recon360Panel::outputProblem(std::string& msg, bool& isResume) const {
     return false;
 }
 
-void Recon360Panel::enqueue(Recon360PanelHost& host) {
+Recon360JobSpec Recon360Panel::buildSpec(const std::string& video, const Recon360Probe& pr, const std::string& outputDir,
+                                         const std::string& plyName, bool confirmed, bool fullLength,
+                                         int index) const {
     Recon360JobSpec sp;
     char id[64];
     std::time_t t = std::time(nullptr);
@@ -229,18 +239,27 @@ void Recon360Panel::enqueue(Recon360PanelHost& host) {
 #else
     localtime_r(&t, &tm);
 #endif
-    snprintf(id, sizeof(id), "pf360_%04d%02d%02d_%02d%02d%02d", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
-             tm.tm_hour, tm.tm_min, tm.tm_sec);
+    // Batch jobs are queued within the same second: the index keeps ids (and manifest files) unique.
+    snprintf(id, sizeof(id), "pf360_%04d%02d%02d_%02d%02d%02d_%03d", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+             tm.tm_hour, tm.tm_min, tm.tm_sec, index);
     sp.jobId = id;
-    sp.videoPath = probedPath;
-    std::error_code ec;
-    fs::create_directories(fs::u8path(parentBuf), ec);
-    sp.outputDir = (fs::u8path(parentBuf) / fs::u8path(projectBuf)).u8string();
-    sp.plyFileName = plyBuf;
-    sp.projectionConfirmed = projectionConfirmed || !probe.requiresConfirmation;
-    sp.startSeconds = startSec;
-    sp.endSeconds = (endSec > 0 && endSec < probe.durationSeconds - 0.01) ? endSec : -1;
-    sp.targetFrames = targetFrames;
+    sp.videoPath = video;
+    sp.outputDir = outputDir;
+    sp.plyFileName = plyName;
+    sp.projectionConfirmed = confirmed || !pr.requiresConfirmation;
+    if (fullLength) {
+        // Batch: whole video; frame count from the preset's rate for THIS video's length.
+        sp.startSeconds = 0;
+        sp.endSeconds = -1;
+        const int pi = presetIdx < (int)presets.size() ? presetIdx : 1;
+        sp.targetFrames = (framesAuto && pi < (int)presets.size())
+                              ? recon360FramesForWindow(presets[(size_t)pi], pr.durationSeconds)
+                              : targetFrames;
+    } else {
+        sp.startSeconds = startSec;
+        sp.endSeconds = (endSec > 0 && endSec < pr.durationSeconds - 0.01) ? endSec : -1;
+        sp.targetFrames = targetFrames;
+    }
     sp.imagesPerEquirect = viewsIdx == 1 ? 14 : 8;
     sp.cropTop = crop[0]; sp.cropBottom = crop[1]; sp.cropLeft = crop[2]; sp.cropRight = crop[3];
     sp.matchingMethod = kMatching[matchingIdx];
@@ -264,6 +283,15 @@ void Recon360Panel::enqueue(Recon360PanelHost& host) {
     sp.maskAnimals = maskAnimals;
     sp.maskSky = maskSky;
     sp.maskDilatePx = maskDilate;
+    return sp;
+}
+
+void Recon360Panel::enqueue(Recon360PanelHost& host) {
+    if (batchMode) { enqueueBatch(host); return; }
+    std::error_code ec;
+    fs::create_directories(fs::u8path(parentBuf), ec);
+    const Recon360JobSpec sp = buildSpec(probedPath, probe, (fs::u8path(parentBuf) / fs::u8path(projectBuf)).u8string(),
+                                         plyBuf, projectionConfirmed, false, 0);
     job = host.jobs->enqueueRecon360(sp, *host.settings, autoLoad);
     jobStart = nowSec();
     jobEnd = 0;
@@ -273,6 +301,494 @@ void Recon360Panel::enqueue(Recon360PanelHost& host) {
     }
     step = 4;
     logInfo("[pf360] queued " + sp.jobId + " -> " + sp.outputDir);
+}
+
+// ---------------------------------------------------------------------------
+// batch: every video under a folder, same settings, queued one after another
+// ---------------------------------------------------------------------------
+namespace {
+constexpr size_t kBatchMaxVideos = 1000;
+} // namespace
+
+void Recon360Panel::startBatchScan(const Recon360Settings& s) {
+    if (bscan) bscan->cancel = true;        // a previous scan stops at its next video
+    bscan = std::make_shared<BatchScan>();
+    batch.clear();
+    batchSynced = false;
+    batchConfirm = false;
+    auto st = bscan;
+    const fs::path root = fs::u8path(batchRootBuf);
+    const bool recursive = batchRecursive;
+    bscanFut = std::async(std::launch::async, [st, root, recursive, s]() {
+        std::vector<BatchItem> found;
+        std::error_code ec;
+        if (!fs::is_directory(root, ec)) {
+            std::lock_guard<std::mutex> lk(st->mu);
+            st->error = "Folder not found.";
+            st->listed = st->done = true;
+            return;
+        }
+        bool truncated = false;
+        for (const auto& p : recon360FindVideos(root.u8string(), recursive, kBatchMaxVideos, truncated, &st->cancel)) {
+            BatchItem it;
+            it.path = p;
+            it.rel = fs::u8path(p).lexically_relative(root).u8string();
+            found.push_back(std::move(it));
+        }
+        {
+            std::lock_guard<std::mutex> lk(st->mu);
+            st->items = found;
+            st->listed = true;
+            if (truncated)
+                st->error = "Stopped listing at " + std::to_string(kBatchMaxVideos) + " videos; pick a narrower folder.";
+        }
+        // Probe one by one (each spawns ffprobe through the worker; parallel probes would fight for disk).
+        for (size_t i = 0; i < found.size() && !st->cancel; ++i) {
+            Recon360Probe p = recon360ProbeVideo(s, found[i].path, 0, -1);
+            std::lock_guard<std::mutex> lk(st->mu);
+            st->items[i].probe = std::move(p);
+            st->items[i].probed = true;
+        }
+        std::lock_guard<std::mutex> lk(st->mu);
+        st->done = true;
+    });
+}
+
+void Recon360Panel::syncBatch() {
+    if (!bscan) return;
+    std::lock_guard<std::mutex> lk(bscan->mu);
+    if (!bscan->listed) return;
+    if (!batchSynced) { batch = bscan->items; batchSynced = true; }
+    for (size_t i = 0; i < batch.size() && i < bscan->items.size(); ++i) {
+        if (batch[i].probed || !bscan->items[i].probed) continue;
+        batch[i].probe = bscan->items[i].probe;
+        batch[i].probed = true;
+        batch[i].selected = batch[i].probe.ok && batch[i].probe.supported;   // default: every usable 360 video
+    }
+}
+
+int Recon360Panel::batchSelectedCount() const {
+    int n = 0;
+    for (const auto& b : batch) n += (b.selected && b.probe.ok && b.probe.supported) ? 1 : 0;
+    return n;
+}
+
+bool Recon360Panel::batchNeedsConfirm() const {
+    for (const auto& b : batch)
+        if (b.selected && b.probe.ok && b.probe.requiresConfirmation) return true;
+    return false;
+}
+
+void Recon360Panel::planBatch() {
+    std::error_code ec;
+    const fs::path parent = fs::u8path(parentBuf);
+    std::set<std::string> used;
+    for (auto& b : batch) {
+        b.willRun = false;
+        b.plan.clear();
+        if (!(b.selected && b.probe.ok && b.probe.supported)) continue;
+        // Workspace name: file stem; on a clash (same name in two subfolders) prefix the folder, then number.
+        std::string name = stemSafe(b.path);
+        if (used.count(name)) {
+            const fs::path p = fs::u8path(b.path);
+            const std::string withFolder = stemSafe(p.parent_path().filename().u8string() + "_" + p.filename().u8string());
+            name = withFolder;
+            for (int k = 2; used.count(name); ++k) name = withFolder + "_" + std::to_string(k);
+        }
+        used.insert(name);
+        b.project = name;
+        switch (recon360WorkspaceState((parent / fs::u8path(name)).u8string(), name + "_splat.ply")) {
+            case Recon360WorkspaceState::Done:
+                b.plan = "skip - already reconstructed (delete its folder to redo)"; break;
+            case Recon360WorkspaceState::Resume:
+                b.plan = "resume - finished stages are reused"; b.willRun = true; break;
+            case Recon360WorkspaceState::Foreign:
+                b.plan = "skip - folder exists and is not a 360 workspace"; break;
+            default:
+                b.plan = "new"; b.willRun = true; break;
+        }
+    }
+}
+
+void Recon360Panel::batchToFirstVideo(Recon360PanelHost& host) {
+    // The Processing step's preview / crop / mask preview use the first selected video as the example.
+    for (const auto& b : batch) {
+        if (!(b.selected && b.probe.ok && b.probe.supported)) continue;
+        snprintf(videoBuf, sizeof(videoBuf), "%s", b.path.c_str());
+        probedPath = b.path;
+        probe = b.probe;
+        projectionConfirmed = batchConfirm;
+        startSec = 0;
+        endSec = (float)b.probe.durationSeconds;
+        frameRgb.clear();
+        frameErr.clear();
+        maskRgb.clear();
+        maskKey.clear();
+        showMaskOverlay = false;
+        shutdownGL();
+        if (!frameFut.valid()) {
+            const Recon360Settings s = *host.settings;
+            const std::string v = b.path;
+            const double t = b.probe.durationSeconds * 0.5;
+            frameFut = std::async(std::launch::async, [s, v, t]() {
+                FrameResult r;
+                r.ok = recon360ExtractFrame(s, v, t, 768, r.rgb, r.w, r.h, r.err);
+                return r;
+            });
+        }
+        if (!parentBuf[0]) {
+            const fs::path parent = fs::u8path(batchRootBuf) / "PointForge360";
+            snprintf(parentBuf, sizeof(parentBuf), "%s", parent.u8string().c_str());
+        }
+        applyPreset(presetIdx < 3 ? presetIdx : 1);
+        return;
+    }
+}
+
+void Recon360Panel::enqueueBatch(Recon360PanelHost& host) {
+    planBatch();
+    std::error_code ec;
+    fs::create_directories(fs::u8path(parentBuf), ec);
+    batchJobs.clear();
+    batchJobNames.clear();
+    int idx = 0;
+    for (const auto& b : batch) {
+        if (!b.willRun) continue;
+        const Recon360JobSpec sp = buildSpec(b.path, b.probe, (fs::u8path(parentBuf) / fs::u8path(b.project)).u8string(),
+                                             b.project + "_splat.ply", batchConfirm, true, ++idx);
+        // Results are not auto-opened (one toast each); open them from the batch table.
+        batchJobs.push_back(host.jobs->enqueueRecon360(sp, *host.settings, false));
+        batchJobNames.push_back(b.rel);
+        logInfo("[pf360] batch queued " + sp.jobId + ": " + b.rel + " -> " + sp.outputDir);
+    }
+    batchStart = nowSec();
+    step = 4;
+}
+
+void Recon360Panel::resumeJobs(Recon360PanelHost& host, const std::vector<Recon360JobSpec>& specs) {
+    if (specs.empty() || !host.jobs) return;
+    if (specs.size() == 1) {
+        // One job: the regular run page.
+        batchMode = false;
+        job = host.jobs->enqueueRecon360(specs[0], *host.settings, false);
+        jobStart = nowSec();
+        jobEnd = 0;
+        { std::lock_guard<std::mutex> lk(job->reconLive->mu); job->reconLive->startedAt = jobStart; }
+        step = 4;
+    } else {
+        batchMode = true;
+        batchJobs.clear();
+        batchJobNames.clear();
+        for (const auto& sp : specs) {
+            batchJobs.push_back(host.jobs->enqueueRecon360(sp, *host.settings, false));
+            batchJobNames.push_back(fs::u8path(sp.videoPath).filename().u8string());
+        }
+        batchStart = nowSec();
+        step = 4;
+    }
+    for (const auto& sp : specs) logInfo("[pf360] resuming " + sp.jobId + " in " + sp.outputDir);
+    unfinishedDirty = true;
+}
+
+void Recon360Panel::drawUnfinished(Recon360PanelHost& host) {
+    if (unfinishedDirty) { unfinished = recon360ListUnfinished(); unfinishedDirty = false; }
+    // Hide jobs that are queued or running right now.
+    std::vector<const Recon360Unfinished*> rows;
+    const auto active = host.jobs ? host.jobs->jobs() : std::vector<std::shared_ptr<ConvertJob>>{};
+    for (const auto& u : unfinished) {
+        bool busy = false;
+        for (const auto& j : active)
+            busy = busy || (j->recon && !j->finished() && j->recon->outputDir == u.spec.outputDir);
+        if (!busy) rows.push_back(&u);
+    }
+    if (rows.empty()) return;
+    char hdr[96];
+    snprintf(hdr, sizeof(hdr), "Unfinished reconstructions (%d) - resume where they stopped###unfin", (int)rows.size());
+    ImGui::SetNextItemOpen(true, ImGuiCond_Once);
+    if (!ImGui::CollapsingHeader(hdr)) return;
+    ImGui::TextDisabled("Every finished stage, COLMAP's features/matches and the latest training checkpoint are kept, "
+                        "so Resume continues instead of starting over.");
+    if (ImGui::BeginTable("##unfin", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_ScrollY,
+                          ImVec2(0, std::min(180.0f * host.uiScale, (rows.size() + 1) * ImGui::GetFrameHeightWithSpacing() + 4)))) {
+        ImGui::TableSetupColumn("Video", ImGuiTableColumnFlags_WidthStretch, 2.0f);
+        ImGui::TableSetupColumn("Stopped at", ImGuiTableColumnFlags_WidthStretch, 2.5f);
+        ImGui::TableSetupColumn("When", ImGuiTableColumnFlags_WidthFixed);
+        ImGui::TableSetupColumn("##a", ImGuiTableColumnFlags_WidthFixed);
+        for (size_t i = 0; i < rows.size(); ++i) {
+            const Recon360Unfinished& u = *rows[i];
+            ImGui::PushID((int)i);
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(fs::u8path(u.spec.videoPath).filename().u8string().c_str());
+            ImGui::SetItemTooltip("%s\nWorkspace: %s", u.spec.videoPath.c_str(), u.spec.outputDir.c_str());
+            ImGui::TableNextColumn();
+            int idx = -1;
+            for (int s = 0; s < Recon360Live::kStageCount; ++s) if (u.lastStage == Recon360Live::kStages[s]) idx = s;
+            const char* what = u.lastStatus == "cancelled" ? "paused in" : u.lastStatus == "failed" ? "failed in"
+                             : u.lastStatus == "running" ? "interrupted (app closed / crash) in" : "stopped after";
+            ImGui::TextColored(u.lastStatus == "failed" ? kBad : kWarn, "%s %s", what,
+                               idx >= 0 ? recon360StageLabel(idx) : "start");
+            ImGui::TableNextColumn();
+            if (u.updatedAt > 0) {
+                std::time_t t = (std::time_t)u.updatedAt;
+                std::tm tm{};
+#ifdef _WIN32
+                localtime_s(&tm, &t);
+#else
+                localtime_r(&t, &tm);
+#endif
+                char b[32];
+                std::strftime(b, sizeof(b), "%Y-%m-%d %H:%M", &tm);
+                ImGui::TextDisabled("%s", b);
+            }
+            ImGui::TableNextColumn();
+            if (ImGui::SmallButton("Resume")) resumeJobs(host, {u.spec});
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Folder")) recon360Reveal(u.spec.outputDir, false);
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+    }
+    if (rows.size() > 1 && ImGui::Button("Resume all")) {
+        std::vector<Recon360JobSpec> specs;
+        for (const auto* u : rows) specs.push_back(u->spec);
+        resumeJobs(host, specs);
+    }
+    ImGui::Separator();
+}
+
+void Recon360Panel::drawBatchVideo(Recon360PanelHost& host) {
+    syncBatch();
+    ImGui::TextWrapped("Pick a folder: every MP4 / MOV / MKV in it is checked, and the 360 videos are reconstructed "
+                       "one after another with the settings of the next pages.");
+    ImGui::SetNextItemWidth(-110.0f * host.uiScale);
+    ImGui::InputTextWithHint("##broot", "folder with 360 videos", batchRootBuf, sizeof(batchRootBuf));
+    ImGui::SameLine();
+    if (ImGui::Button("Browse Folder")) {
+        std::string d = openFolderDialog();
+        if (!d.empty()) {
+            snprintf(batchRootBuf, sizeof(batchRootBuf), "%s", d.c_str());
+            startBatchScan(*host.settings);
+        }
+    }
+    if (ImGui::Checkbox("Include subfolders", &batchRecursive) && batchRootBuf[0]) startBatchScan(*host.settings);
+    ImGui::SameLine();
+    ImGui::BeginDisabled(!batchRootBuf[0]);
+    if (ImGui::Button("Scan")) startBatchScan(*host.settings);
+    ImGui::EndDisabled();
+    if (!bscan) return;
+
+    bool listed, done;
+    std::string error;
+    {
+        std::lock_guard<std::mutex> lk(bscan->mu);
+        listed = bscan->listed;
+        done = bscan->done;
+        error = bscan->error;
+    }
+    if (!error.empty()) wrapped(done && batch.empty() ? kBad : kWarn, error);
+    if (!listed) { ImGui::TextDisabled("Looking for videos..."); return; }
+    if (batch.empty()) { wrapped(kWarn, "No MP4 / MOV / MKV files found here."); return; }
+
+    int probedN = 0;
+    double totalSec = 0;
+    for (const auto& b : batch) {
+        probedN += b.probed ? 1 : 0;
+        if (b.selected && b.probe.ok && b.probe.supported) totalSec += b.probe.durationSeconds;
+    }
+    if (!done) {
+        char ov[64];
+        snprintf(ov, sizeof(ov), "Checking videos %d / %d", probedN, (int)batch.size());
+        ImGui::ProgressBar((float)probedN / (float)batch.size(), ImVec2(-1, 0), ov);
+    }
+    if (ImGui::SmallButton("Select all usable")) for (auto& b : batch) b.selected = b.probe.ok && b.probe.supported;
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Select none")) for (auto& b : batch) b.selected = false;
+    ImGui::SameLine();
+    ImGui::TextDisabled("%d of %d selected, %s of video", batchSelectedCount(), (int)batch.size(),
+                        fmtTime(totalSec).c_str());
+
+    const float tableH = std::max(160.0f * host.uiScale, ImGui::GetContentRegionAvail().y - 70.0f * host.uiScale);
+    if (ImGui::BeginTable("##batch", 5, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingStretchProp |
+                                            ImGuiTableFlags_BordersInnerV, ImVec2(0, tableH))) {
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableSetupColumn("##s", ImGuiTableColumnFlags_WidthFixed);
+        ImGui::TableSetupColumn("Video", ImGuiTableColumnFlags_WidthStretch, 3.0f);
+        ImGui::TableSetupColumn("Length", ImGuiTableColumnFlags_WidthFixed);
+        ImGui::TableSetupColumn("Resolution", ImGuiTableColumnFlags_WidthFixed);
+        ImGui::TableSetupColumn("Check", ImGuiTableColumnFlags_WidthStretch, 2.0f);
+        ImGui::TableHeadersRow();
+        for (size_t i = 0; i < batch.size(); ++i) {
+            BatchItem& b = batch[i];
+            ImGui::PushID((int)i);
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            const bool usable = b.probed && b.probe.ok && b.probe.supported;
+            ImGui::BeginDisabled(!usable);
+            bool sel = b.selected && usable;
+            if (ImGui::Checkbox("##sel", &sel)) b.selected = sel;
+            ImGui::EndDisabled();
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(b.rel.c_str());
+            ImGui::TableNextColumn();
+            if (b.probe.ok) ImGui::TextUnformatted(fmtTime(b.probe.durationSeconds).c_str());
+            ImGui::TableNextColumn();
+            if (b.probe.ok) ImGui::Text("%dx%d", b.probe.width, b.probe.height);
+            ImGui::TableNextColumn();
+            if (!b.probed) ImGui::TextDisabled("checking...");
+            else if (!b.probe.ok) {
+                ImGui::TextColored(kBad, "unreadable");
+                ImGui::SetItemTooltip("%s", b.probe.error.c_str());
+            } else if (!b.probe.supported) {
+                ImGui::TextColored(kBad, "not a stitched 360 video");
+                std::string why;
+                for (const auto& r : b.probe.reasons) why += r + "\n";
+                if (!why.empty()) ImGui::SetItemTooltip("%s", why.c_str());
+            } else if (b.probe.requiresConfirmation) {
+                ImGui::TextColored(kWarn, "2:1, no 360 metadata");
+                ImGui::SetItemTooltip("Looks equirectangular but the file carries no spherical metadata. Confirm below.");
+            } else {
+                ImGui::TextColored(kGood, "360 equirectangular");
+            }
+            if (b.probed && !b.probe.warnings.empty()) {
+                std::string w;
+                for (const auto& x : b.probe.warnings) w += x + "\n";
+                ImGui::SameLine();
+                ImGui::TextColored(kWarn, "(!)");
+                ImGui::SetItemTooltip("%s", w.c_str());
+            }
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+    }
+    if (batchNeedsConfirm())
+        ImGui::Checkbox("I confirm the selected videos without 360 metadata are stitched equirectangular (2:1)",
+                        &batchConfirm);
+}
+
+void Recon360Panel::drawBatchOutput(Recon360PanelHost& host) {
+    ImGui::Text("Output folder (one workspace per video, named after the file):");
+    ImGui::SetNextItemWidth(-110.0f * host.uiScale);
+    ImGui::InputText("##bparent", parentBuf, sizeof(parentBuf));
+    ImGui::SameLine();
+    if (ImGui::Button("Browse Folder")) {
+        std::string d = openFolderDialog();
+        if (!d.empty()) snprintf(parentBuf, sizeof(parentBuf), "%s", d.c_str());
+    }
+    planBatch();
+    int run = 0, skip = 0, resume = 0;
+    for (const auto& b : batch) {
+        if (b.plan.empty()) continue;
+        if (b.willRun) ++run; else ++skip;
+        if (b.plan.rfind("resume", 0) == 0) ++resume;
+    }
+    ImGui::Text("%d to run (%d resuming), %d skipped", run, resume, skip);
+    ImGui::TextDisabled("Jobs run one at a time in the Jobs panel; a failed video does not stop the others. Results "
+                        "are not opened automatically - open them from the batch table.");
+    if (ImGui::BeginTable("##bplan", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingStretchProp,
+                          ImVec2(0, std::max(140.0f * host.uiScale, ImGui::GetContentRegionAvail().y)))) {
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableSetupColumn("Video", ImGuiTableColumnFlags_WidthStretch, 2.0f);
+        ImGui::TableSetupColumn("Workspace", ImGuiTableColumnFlags_WidthStretch, 1.5f);
+        ImGui::TableSetupColumn("Plan", ImGuiTableColumnFlags_WidthStretch, 2.0f);
+        ImGui::TableHeadersRow();
+        for (const auto& b : batch) {
+            if (b.plan.empty()) continue;
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn(); ImGui::TextUnformatted(b.rel.c_str());
+            ImGui::TableNextColumn(); ImGui::TextUnformatted(b.project.c_str());
+            ImGui::TableNextColumn();
+            ImGui::TextColored(b.willRun ? (b.plan == "new" ? kGood : kWarn) : kDim, "%s", b.plan.c_str());
+        }
+        ImGui::EndTable();
+    }
+}
+
+void Recon360Panel::drawBatchRun(Recon360PanelHost& host) {
+    int done = 0, ok = 0, failed = 0, canceled = 0;
+    float sum = 0;
+    for (const auto& j : batchJobs) {
+        const auto st = j->state.load();
+        if (j->finished()) ++done;
+        if (st == ConvertJob::State::Succeeded) ++ok;
+        if (st == ConvertJob::State::Failed) ++failed;
+        if (st == ConvertJob::State::Canceled) ++canceled;
+        sum += j->finished() ? 1.0f : std::max(0.0f, j->progress.load());
+    }
+    const int n = (int)batchJobs.size();
+    const bool allDone = done == n;
+    char ov[96];
+    snprintf(ov, sizeof(ov), "%d / %d videos finished", done, n);
+    ImGui::ProgressBar(n ? sum / n : 1.0f, ImVec2(-1, 0), ov);
+    ImGui::Text("Succeeded %d   Failed %d   Paused %d   Elapsed %s", ok, failed, canceled,
+                fmtTime(nowSec() - batchStart).c_str());
+    if (ImGui::BeginTable("##brun", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingStretchProp,
+                          ImVec2(0, std::max(160.0f * host.uiScale, ImGui::GetContentRegionAvail().y - 40.0f * host.uiScale)))) {
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableSetupColumn("Video", ImGuiTableColumnFlags_WidthStretch, 2.0f);
+        ImGui::TableSetupColumn("State", ImGuiTableColumnFlags_WidthFixed);
+        ImGui::TableSetupColumn("Progress / message", ImGuiTableColumnFlags_WidthStretch, 3.0f);
+        ImGui::TableSetupColumn("##act", ImGuiTableColumnFlags_WidthFixed);
+        ImGui::TableHeadersRow();
+        for (size_t i = 0; i < batchJobs.size(); ++i) {
+            const auto& j = batchJobs[i];
+            ImGui::PushID((int)i);
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(batchJobNames[i].c_str());
+            ImGui::TableNextColumn();
+            switch (j->state.load()) {
+                case ConvertJob::State::Queued:    ImGui::TextColored(kDim, "queued"); break;
+                case ConvertJob::State::Running:   ImGui::TextColored(ImVec4(0.4f, 0.8f, 1, 1), "running"); break;
+                case ConvertJob::State::Succeeded: ImGui::TextColored(kGood, "done"); break;
+                case ConvertJob::State::Failed:    ImGui::TextColored(kBad, "failed"); break;
+                case ConvertJob::State::Canceled:  ImGui::TextColored(kWarn, "paused"); break;
+            }
+            ImGui::TableNextColumn();
+            if (j->state.load() == ConvertJob::State::Running) {
+                ImGui::ProgressBar(std::max(0.0f, j->progress.load()), ImVec2(-1, 0), j->message().c_str());
+            } else {
+                ImGui::TextWrapped("%s", j->message().c_str());
+            }
+            ImGui::TableNextColumn();
+            const bool hasPly = j->state.load() == ConvertJob::State::Succeeded && j->output.size() > 4 &&
+                                j->output.substr(j->output.size() - 4) == ".ply";
+            if (hasPly && ImGui::SmallButton("Open") && host.openSplat) host.openSplat(j->output);
+            if (j->recon) {
+                if (hasPly) ImGui::SameLine();
+                if (ImGui::SmallButton("Folder")) recon360Reveal(j->recon->outputDir, false);
+            }
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+    }
+    if (!allDone) {
+        if (ImGui::Button("Pause all")) for (const auto& j : batchJobs) if (!j->finished()) JobQueue::cancel(j);
+        ImGui::SetItemTooltip("The running video saves a restore point and stops; queued ones do not start. Resume "
+                              "later here or from 'Unfinished reconstructions' - also after closing PointForge.");
+        ImGui::SameLine();
+        if (ImGui::Button("Run in background")) {
+            open = false;
+            if (host.showJobsPanel) host.showJobsPanel();
+        }
+    } else {
+        if (failed + canceled > 0 && ImGui::Button("Resume paused / failed")) {
+            // Same specs + workspaces: finished stages are reused via their hashes.
+            for (size_t i = 0; i < batchJobs.size(); ++i) {
+                const auto st = batchJobs[i]->state.load();
+                if (st == ConvertJob::State::Failed || st == ConvertJob::State::Canceled)
+                    batchJobs[i] = host.jobs->enqueueRecon360(*batchJobs[i]->recon, *host.settings, false);
+            }
+            batchStart = nowSec();
+            return;
+        }
+        if (failed + canceled > 0) ImGui::SameLine();
+        if (ImGui::Button("Open output folder")) recon360Reveal(parentBuf, false);
+        ImGui::SameLine();
+        if (ImGui::Button("New batch")) { step = 0; batchJobs.clear(); batchJobNames.clear(); }
+        ImGui::SameLine();
+        if (ImGui::Button("Close")) open = false;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -670,16 +1186,26 @@ void Recon360Panel::drawStepVideo(Recon360PanelHost& host) {
 
 void Recon360Panel::drawStepProcessing(Recon360PanelHost& host) {
     const float dur = (float)probe.durationSeconds;
-    ImGui::SeparatorText("Time range");
-    ImGui::SetNextItemWidth(260.0f * host.uiScale);
-    if (ImGui::DragFloatRange2("Start / end (s)", &startSec, &endSec, 0.1f, 0.0f, dur, "%.1f", "%.1f",
-                               ImGuiSliderFlags_AlwaysClamp)) {
-        if (endSec - startSec < 1.0f) endSec = std::min(dur, startSec + 1.0f);
-        if (framesAuto && presetIdx < (int)presets.size())
-            targetFrames = recon360FramesForWindow(presets[(size_t)presetIdx], endSec - startSec);
+    if (batchMode) {
+        ImGui::SeparatorText("Batch");
+        wrapped(kDim, "These settings apply to all " + std::to_string(batchSelectedCount()) +
+                          " selected videos. Each video is processed over its full length. The preview and the "
+                          "numbers below use the first one as an example: " + fs::u8path(probedPath).filename().u8string());
+    } else {
+        ImGui::SeparatorText("Time range");
+        ImGui::SetNextItemWidth(260.0f * host.uiScale);
+        if (ImGui::DragFloatRange2("Start / end (s)", &startSec, &endSec, 0.1f, 0.0f, dur, "%.1f", "%.1f",
+                                   ImGuiSliderFlags_AlwaysClamp)) {
+            if (endSec - startSec < 1.0f) endSec = std::min(dur, startSec + 1.0f);
+            if (framesAuto && presetIdx < (int)presets.size())
+                targetFrames = recon360FramesForWindow(presets[(size_t)presetIdx], endSec - startSec);
+        }
     }
     ImGui::SeparatorText("Frame sampling");
     ImGui::Checkbox("Follow quality preset", &framesAuto);
+    if (batchMode)
+        helpMarker(framesAuto ? "Batch: each video gets its own frame count from the preset's frames-per-second rule."
+                              : "Batch: every video uses this same frame count.");
     helpMarker("Presets pick ~N frames per second of the selected range (Preview 1, Balanced/High 3), clamped. "
                "More frames are not always better: redundant frames add processing time without adding new "
                "camera positions.");
@@ -988,8 +1514,15 @@ void Recon360Panel::drawStepRun(Recon360PanelHost& host) {
     }
     ImGui::EndChild();
     if (!finished) {
-        if (ImGui::Button("Cancel")) JobQueue::cancel(job);
-        ImGui::SetItemTooltip("Stops the worker and every COLMAP / training process it started. Intermediate data is kept.");
+        if (job->cancelFlag.load()) {
+            ImGui::BeginDisabled();
+            ImGui::Button("Pausing - saving restore point...");
+            ImGui::EndDisabled();
+        } else if (ImGui::Button("Pause")) {
+            JobQueue::cancel(job);
+        }
+        ImGui::SetItemTooltip("Stops after saving a restore point (training writes a checkpoint first, which can take up "
+                              "to a minute or two). Resume later from this wizard - also after closing PointForge.");
         ImGui::SameLine();
         if (ImGui::Button("Run in background")) {
             open = false;
@@ -1033,7 +1566,7 @@ void Recon360Panel::drawStepDone(Recon360PanelHost& host) {
     } else if (st == ConvertJob::State::Succeeded) {
         ImGui::TextColored(kGood, "Stopped after camera reconstruction, as requested.");
     } else if (st == ConvertJob::State::Canceled) {
-        ImGui::TextColored(kWarn, "Cancelled. Intermediate data and logs were kept.");
+        ImGui::TextColored(kWarn, "Paused. Everything done so far is kept; Resume continues from the restore point.");
     } else {
         ImGui::TextColored(kBad, "Reconstruction failed");
         ImGui::TextWrapped("%s", job->message().c_str());
@@ -1060,7 +1593,7 @@ void Recon360Panel::drawStepDone(Recon360PanelHost& host) {
         ImGui::SameLine();
     }
     if (st == ConvertJob::State::Failed || st == ConvertJob::State::Canceled) {
-        if (ImGui::Button("Retry")) {
+        if (ImGui::Button(st == ConvertJob::State::Canceled ? "Resume" : "Retry (resume)")) {
             // Same settings + workspace: finished stages are reused via their hashes.
             job = host.jobs->enqueueRecon360(*job->recon, *host.settings, job->loadWhenDone);
             jobStart = nowSec();
@@ -1093,15 +1626,24 @@ void Recon360Panel::draw(Recon360PanelHost& host) {
     ImGui::Separator();
     if (presets.empty() && presetErr.empty()) presets = recon360LoadPresets(presetErr);
 
+    if (step == 0) {
+        int mode = batchMode ? 1 : 0;
+        ImGui::RadioButton("Single video", &mode, 0);
+        ImGui::SameLine();
+        ImGui::RadioButton("Batch: all videos in a folder", &mode, 1);
+        batchMode = mode == 1;
+        ImGui::Separator();
+        drawUnfinished(host);
+    }
     const float footer = ImGui::GetFrameHeightWithSpacing() + 8 * S;
     if (ImGui::BeginChild("##r360body", ImVec2(0, -footer))) {
         switch (step) {
-            case 0: drawStepVideo(host); break;
+            case 0: batchMode ? drawBatchVideo(host) : drawStepVideo(host); break;
             case 1: drawStepProcessing(host); break;
             case 2: drawStepQuality(host); break;
-            case 3: drawStepOutput(host); break;
-            case 4: drawStepRun(host); break;
-            default: drawStepDone(host); break;
+            case 3: batchMode ? drawBatchOutput(host) : drawStepOutput(host); break;
+            case 4: batchMode ? drawBatchRun(host) : drawStepRun(host); break;
+            default: batchMode ? drawBatchRun(host) : drawStepDone(host); break;
         }
     }
     ImGui::EndChild();
@@ -1112,9 +1654,22 @@ void Recon360Panel::draw(Recon360PanelHost& host) {
         ImGui::SameLine();
         bool canNext = false;
         std::string why;
-        if (step == 0) {
+        if (step == 0 && batchMode) {
+            bool scanned = false;
+            if (bscan) { std::lock_guard<std::mutex> lk(bscan->mu); scanned = bscan->done; }
+            canNext = scanned && batchSelectedCount() > 0 && (!batchNeedsConfirm() || batchConfirm);
+            if (!scanned) why = "Wait until every video has been checked.";
+        } else if (step == 0) {
             canNext = probe.ok && probe.supported && (!probe.requiresConfirmation || projectionConfirmed) &&
                       probedPath == videoBuf && !probeFut.valid();
+        } else if (step == 3 && batchMode) {
+            int run = 0;
+            for (const auto& b : batch) run += b.willRun ? 1 : 0;
+            std::error_code ec;
+            const fs::path parent = fs::u8path(parentBuf);
+            const bool parentOk = parentBuf[0] && (fs::is_directory(parent, ec) || fs::is_directory(parent.parent_path(), ec));
+            canNext = run > 0 && parentOk;
+            why = !parentOk ? "Output folder does not exist." : run == 0 ? "Nothing to run." : "";
         } else if (step == 1) {
             const int vpf = recon360ViewsPerFrame(viewsIdx == 1 ? 14 : 8, crop[0], crop[1], crop[2], crop[3]);
             canNext = vpf > 0 && targetFrames >= 2 && endSec > startSec;
@@ -1128,12 +1683,20 @@ void Recon360Panel::draw(Recon360PanelHost& host) {
         ImGui::SetCursorPosX(ImGui::GetWindowContentRegionMax().x - 190 * S);
         ImGui::BeginDisabled(!canNext);
         if (step < 3) {
-            if (ImGui::Button("Next", ImVec2(90 * S, 0))) ++step;
+            if (ImGui::Button("Next", ImVec2(90 * S, 0))) {
+                if (step == 0 && batchMode) batchToFirstVideo(host);
+                ++step;
+            }
+        } else if (batchMode) {
+            int run = 0;
+            for (const auto& b : batch) run += b.willRun ? 1 : 0;
+            const std::string label = "Start " + std::to_string(run) + (run == 1 ? " reconstruction" : " reconstructions");
+            if (ImGui::Button(label.c_str(), ImVec2(180 * S, 0))) enqueue(host);
         } else {
             if (ImGui::Button("Start Reconstruction", ImVec2(180 * S, 0))) enqueue(host);
         }
         ImGui::EndDisabled();
-        if (!why.empty() && step == 2) ImGui::SetItemTooltip("%s", why.c_str());
+        if (!why.empty()) ImGui::SetItemTooltip("%s", why.c_str());
     }
     ImGui::End();
 }

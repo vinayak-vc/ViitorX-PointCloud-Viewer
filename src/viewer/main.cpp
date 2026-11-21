@@ -3935,7 +3935,7 @@ int main(int argc, char** argv) {
                     case ConvertJob::State::Failed:
                         addToast("360 reconstruction FAILED: " + job->message(), "", true); break;
                     case ConvertJob::State::Canceled:
-                        addToast("360 reconstruction canceled: " + job->name); break;
+                        addToast("360 reconstruction paused (restore point saved): " + job->name); break;
                     default: break;
                 }
                 continue;
@@ -6380,6 +6380,9 @@ int main(int argc, char** argv) {
 
     // ---- shutdown ---------------------------------------------------------
     cancelActiveSliceExports();
+    // 360 jobs stop at once (their last periodic checkpoint is the restore point); the
+    // next "Resume" continues from it.
+    recon360SetShuttingDown();
     jobs.shutdown();   // cancels the running conversion (if any) and joins the worker
     if (engineProbeThread.joinable()) engineProbeThread.join();
     recon360Panel.shutdownGL();

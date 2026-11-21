@@ -1,4 +1,4 @@
-"""Nerfstudio + COLMAP + Splatfacto backend.
+﻿"""Nerfstudio + COLMAP + Splatfacto backend.
 
 Stages (all tools run as child processes of the worker):
   panorama_projection    Nerfstudio equirect_utils (via ns_helpers/planar.py)
@@ -16,6 +16,7 @@ import json
 import math
 import os
 import re
+import shutil
 import sys
 import threading
 from pathlib import Path
@@ -23,7 +24,7 @@ from typing import Any, Dict, List, Optional, Sequence
 
 from . import environment, procrun
 from .backend import ReconstructionBackend, StageContext, StageFailed
-from .views import perspective_size, views_per_frame
+from .views import perspective_size, views_per_frame, yaw_pitch_pairs
 
 IMG_EXTS = (".jpg", ".jpeg", ".png", ".tif", ".tiff")
 TRAIN_STEP_RE = re.compile(r"^\s*(\d+)\s+\((\d+(?:\.\d+)?)%\)")
@@ -33,6 +34,40 @@ COLMAP_REG_RE = re.compile(r"Registering image #\d+ \((\d+)\)")
 HELPERS = Path(__file__).with_name("ns_helpers")
 # Horizontal FOV of Nerfstudio's planar views (equirect_utils, 1.1.5): 8 -> 120, 14 -> 110.
 PLANAR_FOV_DEG = {8: 120, 14: 110}
+# COLMAP mapper: minimum triangulation angle of the initial pair (default 16).
+INIT_MIN_TRI_ANGLE_DEG = 4
+# Training restore points: periodic checkpoint interval, and how long a pause may take to save one.
+TRAIN_STEPS_PER_SAVE = 1000
+TRAIN_PAUSE_GRACE_S = 150
+
+
+def _latest_valid_checkpoint(training_dir: Path) -> Optional[tuple]:
+    """(step, path) of the newest COMPLETE Nerfstudio checkpoint, or None.
+
+    torch.save writes a zip; a file cut short by a kill lacks the zip end-of-central-directory
+    record, so it is skipped (and deleted) and the previous checkpoint is used instead."""
+    if not training_dir.is_dir():
+        return None
+    found = []
+    for p in training_dir.rglob("step-*.ckpt"):
+        m = re.match(r"step-(\d+)\.ckpt$", p.name)
+        if m:
+            found.append((int(m.group(1)), p))
+    for step, p in sorted(found, reverse=True):
+        try:
+            size = p.stat().st_size
+            with open(p, "rb") as f:
+                f.seek(max(0, size - 65536 - 22))
+                tail = f.read()
+        except OSError:
+            continue
+        if size > 0 and b"PK\x05\x06" in tail:
+            return step, p
+        try:
+            p.unlink()                         # truncated: unusable, and would shadow older ones
+        except OSError:
+            pass
+    return None
 
 
 def planar_intrinsics(w: int, h: int, fov_deg: float) -> tuple:
@@ -189,7 +224,7 @@ class NerfstudioBackend(ReconstructionBackend):
                     "model": environment.MASK_MODEL_DIRNAME, "helper": "mask-v1"}
         if stage == "camera_reconstruction":
             return {"matching": pr["matchingMethod"], "colmap": ctx.tools.colmap, "numDownscales": 3,
-                    "sfm": "pf360-fixed-pinhole-v1", "masks": _masking_on(ctx.manifest)}
+                    "sfm": "pf360-fixed-pinhole-rig-v2", "masks": _masking_on(ctx.manifest)}
         if stage == "training":
             keys = ("method", "iterations", "downscaleFactor", "shDegree", "randomSeed", "useScaleRegularization",
                     "cullAlphaThresh", "densifyGradThresh", "cullScaleThresh")
@@ -225,7 +260,9 @@ class NerfstudioBackend(ReconstructionBackend):
             raise StageFailed("No extracted frames to project.")
         vpf = views_per_frame(pr["imagesPerEquirect"], crop)
         expected = n_frames * vpf
-        ws.reset_dir(ws.planar_dir)
+        if not ctx.results.get("_resume_panorama_projection"):
+            ws.reset_dir(ws.planar_dir)          # else: keep finished panoramas (restore point)
+        views = yaw_pitch_pairs(pr["imagesPerEquirect"], crop)
         stop = threading.Event()
 
         def poll() -> None:
@@ -239,12 +276,15 @@ class NerfstudioBackend(ReconstructionBackend):
         result: Dict[str, Any] = {}
 
         def on_line(l: str) -> None:
+            if l.startswith("PF360PLANARPROG"):        # per-panorama progress, not the result line
+                return
             if l.startswith("PF360PLANAR"):
                 result.update(json.loads(l[len("PF360PLANAR"):]))
         try:
             with ws.open_log("panorama.log") as log:
                 rc = procrun.run([ctx.tools.ns_python, str(HELPERS / "planar.py"), str(ws.frames_dir),
-                                  str(pr["imagesPerEquirect"])] + [repr(float(c)) for c in crop],
+                                  str(pr["imagesPerEquirect"])] + [repr(float(c)) for c in crop] +
+                                 [json.dumps(views)],
                                  cancel=ctx.cancel, on_line=on_line, log=log, env=self._env(ctx))
         finally:
             stop.set()
@@ -270,7 +310,8 @@ class NerfstudioBackend(ReconstructionBackend):
         total = _count_images(ws.planar_dir)
         if total == 0:
             raise StageFailed("No perspective images to mask.")
-        ws.reset_dir(ws.masks_dir)
+        if not ctx.results.get("_resume_masking"):
+            ws.reset_dir(ws.masks_dir)            # else: keep finished masks (restore point)
         stats: Dict[str, Any] = {}
 
         def on_line(l: str) -> None:
@@ -333,11 +374,26 @@ class NerfstudioBackend(ReconstructionBackend):
         vpf = views_per_frame(pr["imagesPerEquirect"],
                               (pr["cropTop"], pr["cropBottom"], pr["cropLeft"], pr["cropRight"]))
 
-        ws.reset_dir(ws.processed_dir)
         colmap_dir = ws.processed_dir / "colmap"
         sparse_dir = colmap_dir / "sparse"
-        sparse_dir.mkdir(parents=True, exist_ok=True)
         db = colmap_dir / "database.db"
+        # Restore point: COLMAP's database holds the extracted features and finished matches;
+        # feature_extractor / *_matcher skip images and pairs already in it, so an interrupted
+        # run continues. The SQLite journal files move with it (a hot journal = recovery data).
+        kept = []
+        if ctx.results.get("_resume_camera_reconstruction") and db.is_file():
+            hold = ws.root / ".colmap-db-hold"
+            ws.reset_dir(hold)
+            for f in colmap_dir.glob("database.db*"):
+                os.replace(f, hold / f.name)
+                kept.append(f.name)
+        ws.reset_dir(ws.processed_dir)
+        sparse_dir.mkdir(parents=True, exist_ok=True)
+        if kept:
+            for name in kept:
+                os.replace(ws.root / ".colmap-db-hold" / name, colmap_dir / name)
+            shutil.rmtree(ws.root / ".colmap-db-hold", ignore_errors=True)
+            ctx.emitter.log("keeping COLMAP features + matches from the interrupted run", stage="camera_reconstruction")
         cuda = bool((ctx.results.get("_env") or {}).get("cuda", True))
         gpu = "1" if cuda else "0"
         env = self._env(ctx)
@@ -362,8 +418,10 @@ class NerfstudioBackend(ReconstructionBackend):
         method = pr["matchingMethod"]
         matcher = [colmap, "%s_matcher" % method, "--database_path", str(db), "--SiftMatching.use_gpu", gpu]
         if method == "sequential":
-            # Images are ordered panorama-major (frame_N_0..V-1): cover ~3 panoramas.
-            matcher += ["--SequentialMatching.overlap", str(max(10, 3 * vpf))]
+            # Images are ordered panorama-major (frame_N_0..V-1): cover ~5 panoramas so a view
+            # direction is matched against itself a few steps along the walk (3 was too short on
+            # real footage: COLMAP kept starting tiny models that never joined).
+            matcher += ["--SequentialMatching.overlap", str(max(10, 5 * vpf))]
         elif method == "vocab_tree":
             matcher += ["--VocabTreeMatching.vocab_tree_path", self._vocab_tree(ctx, env)]
         masks_on = _masking_on(ctx.manifest)
@@ -383,7 +441,10 @@ class NerfstudioBackend(ReconstructionBackend):
              [colmap, "mapper", "--database_path", str(db), "--image_path", str(ws.planar_dir),
               "--output_path", str(sparse_dir),
               "--Mapper.ba_refine_focal_length", "0", "--Mapper.ba_refine_principal_point", "0",
-              "--Mapper.ba_refine_extra_params", "0", "--Mapper.ba_global_function_tolerance=1e-6"]),
+              "--Mapper.ba_refine_extra_params", "0", "--Mapper.ba_global_function_tolerance=1e-6",
+              # Walking video: consecutive panoramas are ~0.5 m apart, far below what COLMAP's
+              # default 16 deg initial triangulation angle wants ("No good initial image pair").
+              "--Mapper.init_min_tri_angle", str(INIT_MIN_TRI_ANGLE_DEG)]),
         ]
         with ws.open_log("colmap.log") as log:
             log.write("pf360: PINHOLE %dx%d fov=%d -> fx=fy=%.3f cx=%.3f cy=%.3f (fixed)\n"
@@ -399,11 +460,13 @@ class NerfstudioBackend(ReconstructionBackend):
                                   "texture/overlap or camera movement.",
                                   {"generatedImages": total, "registeredImages": 0})
             best = max(models, key=lambda kv: kv[1])
+            rig = self._rig_complete(ctx, env, log, sparse_dir, best[0], db, pr)
+            model_rel = "colmap/sparse/%s" % (rig["dir"] if rig else best[0])
             ctx.emitter.progress("camera_reconstruction", 92.0, "writing transforms.json")
             flags = self._help(ctx, "process", [tool, "images", "--help"])
             args = [tool, "images", "--data", str(ws.planar_dir), "--output-dir", str(ws.processed_dir),
                     "--camera-type", "perspective", "--num-downscales", "3",
-                    "--colmap-model-path", "colmap/sparse/%s" % best[0]]
+                    "--colmap-model-path", model_rel]
             args += flags.boolean("--skip-colmap", True)
             args += flags.boolean("--verbose", True)
             rc = procrun.run(args, cancel=ctx.cancel, log=log, env=env, cwd=str(ws.root))
@@ -417,9 +480,29 @@ class NerfstudioBackend(ReconstructionBackend):
                                  cancel=ctx.cancel, log=log, env=env)
                 if rc != 0:
                     raise StageFailed("Attaching masks to the training data failed (exit %d) - see logs/colmap.log" % rc)
-        data = self._validate_reconstruction(ctx, total, models, best[0])
+        data = self._validate_reconstruction(ctx, total, models, best[0], rig)
         data["trainingMasks"] = masks_on
         return data
+
+    def _rig_complete(self, ctx: StageContext, env: Dict[str, str], log, sparse_dir: Path, model: str, db: Path,
+                      pr: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Poses every view of each registered panorama from its registered views (ns_helpers/rig_complete.py).
+        Returns the helper's stats + "dir", or None (then the plain COLMAP model is used)."""
+        views = yaw_pitch_pairs(pr["imagesPerEquirect"], (pr["cropTop"], pr["cropBottom"], pr["cropLeft"],
+                                                          pr["cropRight"]))
+        out_name = "%s_rig" % model
+        ctx.emitter.progress("camera_reconstruction", 91.0, "completing panoramas")
+        lines: List[str] = []
+        rc = procrun.run([ctx.tools.ns_python, str(HELPERS / "rig_complete.py"), "--model", str(sparse_dir / model),
+                          "--db", str(db), "--views", json.dumps(views), "--out", str(sparse_dir / out_name)],
+                         cancel=ctx.cancel, on_line=lines.append, log=log, env=env)
+        stats = next((json.loads(l[len("PF360RIG"):]) for l in lines if l.startswith("PF360RIG")), None)
+        if rc != 0 or not stats:
+            ctx.emitter.warning("Panorama completion failed (see logs/colmap.log); using COLMAP's views only.",
+                                stage="camera_reconstruction")
+            return None
+        stats["dir"] = out_name
+        return stats
 
     def _vocab_tree(self, ctx: StageContext, env: Dict[str, str]) -> str:
         """Nerfstudio's cached vocabulary tree (downloaded by Nerfstudio on first use)."""
@@ -435,7 +518,8 @@ class NerfstudioBackend(ReconstructionBackend):
         return path
 
     def _validate_reconstruction(self, ctx: StageContext, total: int,
-                                 models: Optional[List] = None, used: Optional[str] = None) -> Dict[str, Any]:
+                                 models: Optional[List] = None, used: Optional[str] = None,
+                                 rig: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Camera registration checks. Exit code 0 alone is not success."""
         ws = ctx.workspace
         tf = ws.processed_dir / "transforms.json"
@@ -466,12 +550,25 @@ class NerfstudioBackend(ReconstructionBackend):
             data["cameraExtent"] = extent
             clusters = _cluster_count(centers, 0.02 * extent) if extent > 0 else 1
             data["distinctCameraPositions"] = clusters
+        panoramas = len({p.stem.rpartition("_")[0] for p in ws.planar_dir.iterdir() if p.suffix.lower() in IMG_EXTS})
+        data["panoramas"] = panoramas
+        if rig:
+            # COLMAP placed `registeredViews`; completion posed the rest of those panoramas.
+            data["colmapRegisteredViews"] = rig.get("registeredViews")
+            data["completedViews"] = rig.get("addedViews")
+            data["panoramasRegistered"] = rig.get("panoramasCompleted")
+            if rig.get("panoramasInconsistent"):
+                ctx.emitter.warning("%d panorama(s) had inconsistent view poses and were not completed."
+                                    % rig["panoramasInconsistent"], stage="camera_reconstruction")
         ratio = data["registrationRatio"]
         if reg < 8 or ratio < 0.3:
-            raise StageFailed("Only %d of %d perspective images were registered by COLMAP (%.0f%%). The "
-                              "reconstruction is not usable." % (reg, total, 100 * ratio), data)
+            raise StageFailed(
+                "Only %d of %d perspective images could be placed by COLMAP (%.0f%%, %s of %d panoramas). The "
+                "reconstruction is not usable. Try: crop the bottom (removes the person / stick that moves with the "
+                "camera), mask People, use 8 views per frame, fewer frames, or walk more slowly with less turning."
+                % (reg, total, 100 * ratio, data.get("panoramasRegistered", "?"), panoramas), data)
         if ratio < 0.7:
-            ctx.emitter.warning("Only %.0f%% of perspective images were registered; expect gaps." % (100 * ratio),
+            ctx.emitter.warning("Only %.0f%% of perspective images were placed; expect gaps." % (100 * ratio),
                                 stage="camera_reconstruction")
         if used is not None:
             data["colmapModelUsed"] = used
@@ -501,12 +598,29 @@ class NerfstudioBackend(ReconstructionBackend):
             else:
                 raise StageFailed("Training method %s is not available (installed: %s)." % (method, ", ".join(methods)))
         flags = self._help(ctx, "train-" + method, [tool, method, "--help"])
-        ws.reset_dir(ws.training_dir)
+        total_its = int(tr["iterations"])
+        # Restore point: continue from the newest COMPLETE checkpoint of the interrupted run.
+        ckpt = _latest_valid_checkpoint(ws.training_dir) if ctx.results.get("_resume_training") else None
+        start = 0
+        if ckpt:
+            start = ckpt[0] + 1
+            if start >= total_its:            # finished, but paused before the stage was recorded
+                cfg = self._find_config(ctx)
+                if cfg:
+                    return {"method": method, "iterations": total_its, "lastLoggedStep": ckpt[0],
+                            "config": str(cfg), "resumedFromStep": ckpt[0]}
+            ctx.emitter.log("resuming training from checkpoint step %d / %d" % (ckpt[0], total_its), stage="training")
+        else:
+            ws.reset_dir(ws.training_dir)
+        # Nerfstudio trains max_num_iterations MORE steps after a loaded checkpoint, so pass the remainder.
         args = [tool, method, "--data", str(ws.processed_dir), "--output-dir", str(ws.training_dir),
                 "--experiment-name", "pf360", "--timestamp", "run",
-                "--max-num-iterations", str(int(tr["iterations"])),
+                "--max-num-iterations", str(total_its - start),
+                "--steps-per-save", str(TRAIN_STEPS_PER_SAVE),
                 "--machine.seed", str(int(tr["randomSeed"])),
                 "--vis", "tensorboard"]
+        if ckpt:
+            args += ["--load-checkpoint", str(ckpt[1])]
         args += flags.boolean("--viewer.quit-on-train-completion", True)
         args += ["--pipeline.model.sh-degree", str(int(tr["shDegree"]))]
         args += flags.boolean("--pipeline.model.use-scale-regularization", bool(tr.get("useScaleRegularization")))
@@ -524,8 +638,9 @@ class NerfstudioBackend(ReconstructionBackend):
             del tail[:-40]
             m = TRAIN_STEP_RE.match(l)
             if m:
-                pct = float(m.group(2))
+                # Absolute step / total (Nerfstudio's own % covers only the remaining steps after a resume).
                 last["step"] = int(m.group(1))
+                pct = 100.0 * last["step"] / max(1, total_its)
                 if pct - last["pct"] >= 0.25:
                     last["pct"] = pct
                     ctx.emitter.progress("training", pct, "step %s / %d" % (m.group(1), int(tr["iterations"])))
@@ -533,14 +648,51 @@ class NerfstudioBackend(ReconstructionBackend):
                 ctx.emitter.warning("CUDA out of memory: lower the training resolution (downscale factor), use fewer "
                                     "frames, choose standard Splatfacto, or close other GPU applications.",
                                     stage="training")
-        with ws.open_log("training.log") as log:
-            rc = procrun.run(args, cancel=ctx.cancel, on_line=on_line, log=log, env=self._env(ctx), cwd=str(ws.root))
+        # Run through ns_helpers/train_resumable.py (= ns-train + graceful pause). On pause/cancel
+        # the trainer is asked to save a checkpoint and stop; it is killed only if that takes
+        # longer than TRAIN_PAUSE_GRACE_S.
+        pause_file = ws.root / ".pause-training"
+        args = [ctx.tools.ns_python, str(HELPERS / "train_resumable.py"), str(pause_file)] + args[1:]
+        own = procrun.CancelToken()
+        finished = threading.Event()
+
+        def watch_pause() -> None:
+            while not finished.is_set():
+                if ctx.cancel.wait(0.5):
+                    if finished.is_set():
+                        return
+                    try:
+                        pause_file.write_text("pause", encoding="utf-8")
+                    except OSError:
+                        own.cancel()
+                        return
+                    ctx.emitter.progress("training", None, "pausing - saving a checkpoint")
+                    if not finished.wait(TRAIN_PAUSE_GRACE_S):
+                        own.cancel()
+                    return
+
+        watcher = threading.Thread(target=watch_pause, daemon=True)
+        watcher.start()
+        try:
+            with ws.open_log("training.log") as log:
+                rc = procrun.run(args, cancel=own, on_line=on_line, log=log, env=self._env(ctx), cwd=str(ws.root))
+        finally:
+            finished.set()
+            watcher.join(timeout=2)
+            try:
+                pause_file.unlink()
+            except OSError:
+                pass
+        if ctx.cancel.cancelled:
+            raise procrun.Cancelled()          # paused: the checkpoint is the restore point
         cfg = self._find_config(ctx)
         if rc != 0 or cfg is None:
             hint = " | ".join(tail[-3:])
             raise StageFailed("ns-train failed (exit %d) - see logs/training.log. Last output: %s" % (rc, hint[-400:]))
-        return {"method": method, "iterations": int(tr["iterations"]), "lastLoggedStep": last["step"],
-                "config": str(cfg)}
+        out = {"method": method, "iterations": total_its, "lastLoggedStep": last["step"], "config": str(cfg)}
+        if ckpt:
+            out["resumedFromStep"] = ckpt[0]
+        return out
 
     def _find_config(self, ctx: StageContext) -> Optional[Path]:
         root = ctx.workspace.training_dir

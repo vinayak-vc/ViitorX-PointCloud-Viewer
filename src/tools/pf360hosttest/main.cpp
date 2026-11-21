@@ -183,6 +183,112 @@ static void testProbe(const fs::path& video) {
     CHECK(!bad.ok);
 }
 
+// Batch mode: folder scan rules, workspace planning, and several videos run back to back
+// with ids that differ only by their batch index (all queued within the same second).
+static void testBatch(const fs::path& tmp, const fs::path& video) {
+    std::error_code ec;
+    const fs::path root = tmp / u8"batch root ü";
+    fs::remove_all(root, ec);
+    auto put = [&](const fs::path& rel) {
+        fs::create_directories((root / rel).parent_path());
+        fs::copy_file(video, root / rel, fs::copy_options::overwrite_existing);
+    };
+    put("a.mp4");
+    put(fs::u8path("sub/B.MP4"));                       // upper-case extension
+    put(fs::u8path("sub/deeper/c.mkv"));
+    put(fs::u8path("PointForge360/old/old.mp4"));       // our own output tree: never scanned
+    put(fs::u8path("ws/clip.mp4"));                     // inside a 360 workspace: never scanned
+    std::ofstream(root / "ws" / "state.json") << "{}";
+    std::ofstream(root / "notes.txt") << "not a video";
+
+    bool truncated = false;
+    auto rel = [&](const std::vector<std::string>& v) {
+        std::vector<std::string> r;
+        for (const auto& p : v) r.push_back(fs::u8path(p).lexically_relative(root).generic_u8string());
+        return r;
+    };
+    const auto all = rel(recon360FindVideos(root.u8string(), true, 100, truncated));
+    CHECK((all == std::vector<std::string>{"a.mp4", "sub/B.MP4", "sub/deeper/c.mkv"}));
+    CHECK(!truncated);
+    CHECK((rel(recon360FindVideos(root.u8string(), false, 100, truncated)) == std::vector<std::string>{"a.mp4"}));
+    CHECK(recon360FindVideos(root.u8string(), true, 2, truncated).size() == 2 && truncated);
+    CHECK(recon360FindVideos((root / "missing").u8string(), true, 100, truncated).empty());
+
+    const fs::path out = tmp / "batch out";
+    fs::remove_all(out, ec);
+    CHECK(recon360WorkspaceState((out / "a").u8string(), "a_splat.ply") == Recon360WorkspaceState::New);
+    fs::create_directories(out / "foreign");
+    std::ofstream(out / "foreign" / "x.txt") << "x";
+    CHECK(recon360WorkspaceState((out / "foreign").u8string(), "foreign_splat.ply") == Recon360WorkspaceState::Foreign);
+
+    // Two videos back to back, like the batch queue (one job at a time).
+    Recon360Settings st;
+    std::atomic<bool> cancel{false};
+    std::string err;
+    const char* ids[2] = {"pf360_20261121_120000_001", "pf360_20261121_120000_002"};
+    const fs::path vids[2] = {root / "a.mp4", root / "sub" / "B.MP4"};
+    const char* names[2] = {"a", "B"};
+    for (int i = 0; i < 2; ++i) {
+        Recon360JobSpec sp = baseSpec(vids[i], out / names[i], ids[i]);
+        Recon360Live live;
+        const bool ok = recon360Run(sp, st, cancel, live, nullptr, err);
+        if (!ok) std::fprintf(stderr, "batch run %d: %s\n", i, err.c_str());
+        CHECK(ok);
+        CHECK(fs::exists(out / names[i] / "frames" / "frame_00008.jpg"));
+        // An interrupted / partial batch item resumes on the next batch.
+        CHECK(recon360WorkspaceState((out / names[i]).u8string(), std::string(names[i]) + "_splat.ply") ==
+              Recon360WorkspaceState::Resume);
+    }
+    fs::create_directories(out / "a" / "export");
+    std::ofstream(out / "a" / "export" / "a_splat.ply") << "ply";
+    CHECK(recon360WorkspaceState((out / "a").u8string(), "a_splat.ply") == Recon360WorkspaceState::Done);
+    // The worker wrote one manifest per job id (no overwrite between batch items).
+    const fs::path jobsDir = fs::path(_wgetenv(L"LOCALAPPDATA")) / "ViitorX" / "PointForge" / "pf360-jobs";
+    CHECK(fs::exists(jobsDir / (std::string(ids[0]) + ".json")) && fs::exists(jobsDir / (std::string(ids[1]) + ".json")));
+}
+
+// Restore points across app restarts: a job is rebuilt from its saved manifest and
+// unfinished workspaces are listed (finished / deleted ones are not).
+static void testUnfinished(const fs::path& tmp, const fs::path& video) {
+    std::error_code ec;
+    Recon360JobSpec sp = baseSpec(video, tmp / u8"resume ws ü", "hosttest_resume_001");
+    sp.stopAfter.clear();
+    sp.targetFrames = 77; sp.imagesPerEquirect = 14; sp.cropBottom = 0.2f; sp.matchingMethod = "exhaustive";
+    sp.maskEnabled = true; sp.maskPeople = true; sp.maskSky = true; sp.maskDilatePx = 12;
+    sp.iterations = 12345; sp.downscaleFactor = 4; sp.method = "splatfacto-big"; sp.plyFileName = "x_splat.ply";
+    std::string path, err;
+    CHECK(recon360WriteManifest(sp, {}, path, err));
+    std::ifstream f(fs::u8path(path), std::ios::binary);
+    const std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    Recon360JobSpec back;
+    CHECK(recon360SpecFromManifest(text, back, err));
+    CHECK(back.jobId == sp.jobId && back.videoPath == sp.videoPath && back.outputDir == sp.outputDir);
+    CHECK(back.targetFrames == 77 && back.imagesPerEquirect == 14 && std::fabs(back.cropBottom - 0.2f) < 1e-6f);
+    CHECK(back.matchingMethod == "exhaustive" && back.maskEnabled && back.maskPeople && back.maskSky && !back.maskVehicles);
+    CHECK(back.maskDilatePx == 12 && back.iterations == 12345 && back.downscaleFactor == 4);
+    CHECK(back.method == "splatfacto-big" && back.plyFileName == "x_splat.ply" && back.projectionConfirmed);
+
+    auto listed = [&]() {
+        for (const auto& u : recon360ListUnfinished()) if (u.spec.jobId == sp.jobId) return true;
+        return false;
+    };
+    fs::remove_all(fs::u8path(sp.outputDir), ec);
+    CHECK(!listed());                                         // never started: no workspace
+    fs::create_directories(fs::u8path(sp.outputDir));
+    std::ofstream(fs::u8path(sp.outputDir) / "state.json")
+        << R"({"marker":"pf360-workspace-v1","stages":{"frame_extraction":{"status":"completed","finishedAt":1},)"
+           R"("training":{"status":"cancelled","finishedAt":2}}})";
+    bool found = false;
+    for (const auto& u : recon360ListUnfinished())
+        if (u.spec.jobId == sp.jobId) { found = true; CHECK(u.lastStage == "training" && u.lastStatus == "cancelled"); }
+    CHECK(found);
+    std::ofstream(fs::u8path(sp.outputDir) / "state.json")
+        << R"({"marker":"pf360-workspace-v1","stages":{"validation":{"status":"completed","finishedAt":3}}})";
+    CHECK(!listed());                                         // finished
+    fs::remove_all(fs::u8path(sp.outputDir), ec);
+    fs::remove(fs::u8path(path), ec);
+}
+
 static void testRunFramesOnly(const fs::path& tmp, const fs::path& video) {
     Recon360Settings st;
     Recon360JobSpec sp = baseSpec(video, tmp / u8"out ü 1", "hosttest_run");
@@ -636,6 +742,8 @@ int main(int argc, char** argv) {
         CHECK(makeVideo(longVideo, 60, 2048, 1024));
         testProbe(video);
         testRunFramesOnly(tmp, video);
+        testBatch(tmp, video);
+        testUnfinished(tmp, video);
         testFailurePropagation(tmp, video);
         testCancel(tmp, longVideo);
         testMaskPreview();

@@ -18,6 +18,7 @@ Never downloads anything (local_files_only).
 """
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -109,12 +110,27 @@ def run(args):
         raise SystemExit("no ADE20K classes matched groups %s" % groups)
     src, out = Path(args.images), Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
+    for t in out.glob("*.tmp"):               # left by an interrupted run
+        t.unlink()
     files = sorted(p for p in src.iterdir() if p.suffix.lower() in IMG_EXTS and p.is_file())
     total = len(files)
     _emit("PF360MASK", {"done": 0, "total": total, "device": device, "classIds": ids})
     fractions, heavy = [], 0
+    # Restore point: masks finished by an interrupted run are kept (written atomically, so an
+    # existing file is complete); they still count in the statistics.
+    todo = []
+    for p in files:
+        m = out / (p.name + ".png")
+        if m.is_file() and m.stat().st_size > 0:
+            frac = 1.0 - float(np.asarray(Image.open(m).convert("L")).mean()) / 255.0
+            fractions.append(frac)
+            heavy += frac > 0.6
+        else:
+            todo.append(p)
+    done_before = total - len(todo)
+    files = todo
     i = 0
-    while i < total:
+    while i < len(files):
         batch = files[i:i + args.batch]
         imgs = [np.asarray(Image.open(p).convert("RGB")) for p in batch]
         # Group equal sizes (always equal for one pf360 job, but stay safe).
@@ -125,10 +141,12 @@ def run(args):
             frac = 1.0 - float(k.mean())
             fractions.append(frac)
             heavy += frac > 0.6
-            Image.fromarray((k * 255).astype(np.uint8), mode="L").save(out / (p.name + ".png"))
+            tmp = out / (p.name + ".png.tmp")
+            Image.fromarray((k * 255).astype(np.uint8), mode="L").save(tmp, format="PNG")
+            os.replace(tmp, out / (p.name + ".png"))
         i += len(batch)
-        _emit("PF360MASK", {"done": i, "total": total})
-    stats = {"images": total, "groups": groups, "classIds": ids, "dilatePx": args.dilate, "device": device,
+        _emit("PF360MASK", {"done": done_before + i, "total": total})
+    stats = {"images": total, "resumedFrom": done_before, "groups": groups, "classIds": ids, "dilatePx": args.dilate, "device": device,
              "meanMaskedFraction": round(float(np.mean(fractions)), 4) if fractions else 0.0,
              "maxMaskedFraction": round(float(np.max(fractions)), 4) if fractions else 0.0,
              "imagesMaskedOver60Percent": int(heavy)}

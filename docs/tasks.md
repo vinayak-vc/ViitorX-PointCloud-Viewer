@@ -319,6 +319,10 @@ Recommended order; update newdev.md status board as these move:
 - `[x]` Engine packs: in-app download of signed packs from Hugging Face (`EnginePacks.cpp`, `scripts/pf360/engine_packs.py`); relocatable runtime pack; wizard Environment > Engines. See docs/360-reconstruction.md §8.1.
 - `[ ]` Engine packs release: generate the real signing key (`engine_packs.py keygen`), create the Hugging Face repo, `publish`, set `PF_ENGINE_CATALOG_URL`, rebuild. Licence review (FFmpeg GPL build -> consider an LGPL build; NVIDIA CUDA redistributables).
 - `[ ]` Engine packs: test on a clean PC with no Python/CUDA toolkit (only a relocated install on the dev PC was tested); "Remove engines" button.
+- `[x]` Batch mode: scan a folder (subfolders optional) for 360 videos, same settings, one queued job per video, skip/resume per workspace, batch progress table. Helpers tested in `pf360hosttest`; the ImGui pages not clicked through yet.
+- `[x]` Real-footage failure (6% registered on a 3 min walk, 14 views): panorama rig completion (`rig_complete.py`), wider sequential overlap (5 panoramas), mapper init angle 4°.
+- `[x]` Pause / resume with restore points per stage (projection, masks, COLMAP DB, training checkpoint with graceful pause) + "Unfinished reconstructions" list (survives restart/crash).
+- `[ ]` Re-run the failing real clip (VID_20251114_083443_00_001-003, 5.7K, 192 s) with the fixes; if registration is still low, try bottom crop + People mask. COLMAP >= 3.12 rigs remain the proper long-term fix.
 - `[ ]` Run real stitched 360 footage (with people / traffic) through Preview, then High Quality; judge masking on moving content.
 - `[ ]` Click through the wizard (Processing > Masking, preview overlay) on a real display.
 - `[ ]` Interactive masks (SAM 2.1, Apache-2.0: click / box / lasso + propagation) for objects the semantic classes miss.

@@ -1,5 +1,12 @@
 # AI Handoff - PointForge (C++ repo)
 
+## Session (2026-11-21, evening) - real-footage COLMAP fix, pause/resume, batch, embedded worker
+
+- **Embedded worker**: `tools/embed_worker.cmake` -> `EmbeddedWorker.h`; a lone exe extracts the worker to `%LOCALAPPDATA%\ViitorX\PointForge\worker\<hash>`; pack Python preferred.
+- **Batch mode**: wizard "Batch: all videos in a folder" (`recon360FindVideos`, `recon360WorkspaceState`, one Recon360 job per video, skip/resume plan, batch table).
+- **Real clip failure** (user log, RTX 4090, 400 frames x 14 views): COLMAP registered 6 %, only some view directions. Fix: `ns_helpers/rig_complete.py` (poses all views of a registered panorama; note equirect2persp's local frame is LEFT-handed -> det -1 panorama matrices), sequential overlap 5 panoramas, `--Mapper.init_min_tri_angle 4`, cache tag `pf360-fixed-pinhole-rig-v2`. Not yet re-run on that clip.
+- **Pause/resume**: `Workspace.resumable` + "running" record; resumable projection (own loop in `planar.py`, atomic writes), masks, COLMAP DB kept, training via `train_resumable.py` (graceful pause -> checkpoint, exit 75; re-binds optimizers after load = Nerfstudio 1.1.5 bug), remaining-iterations on resume; host grace 180 s (0 at app exit via `recon360SetShuttingDown`); wizard "Unfinished reconstructions" (`recon360ListUnfinished`, `recon360SpecFromManifest`), Pause/Resume labels. Verified on GPU (see 360-reconstruction.md §11).
+
 ## Session (2026-11-21, later) - 360 engine packs: in-app download from Hugging Face (branch `splat-generator`)
 
 - **What**: the viewer ships without the ~11 GB engines; wizard *Environment > Engines (download)* installs signed packs (`pf360-runtime`, `colmap`, `ffmpeg`, optional `mask-model`). C++ `src/viewer/EnginePacks.{h,cpp}` (system curl.exe/tar.exe, BCrypt SHA-256 + ECDSA P-256, staging + swap + rollback, `.pfpack.json`, sequence anti-rollback), `EnginePackKey.h` (public key, EMPTY until `keygen`), `ConvertJob::Kind::EnginePacks`, Prefs `r360EngineCatalog`, CMake `PF_ENGINE_CATALOG_URL`. Tooling `scripts/pf360/engine_packs.py` (build/keygen/catalog/sign/verify/publish) + `pack_relocate.py`. Worker: `environment.pack_env` (PYTHONNOUSERSITE, TORCH_HOME), pack FFmpeg before PATH, pack python at env root. Docs: 360-reconstruction.md §8.1, decisions.md.

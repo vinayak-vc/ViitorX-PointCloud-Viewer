@@ -100,6 +100,12 @@ class Workspace:
             return s.get("data") or {}
         return None
 
+    def resumable(self, stage: str, fp: str) -> bool:
+        """True when this stage was interrupted (paused, cancelled, crashed while "running", or failed)
+        with the SAME settings, so its partial output can be continued instead of redone."""
+        s = self.state["stages"].get(stage)
+        return bool(s and s.get("fingerprint") == fp and s.get("status") in ("running", "cancelled", "failed"))
+
     def record(self, stage: str, fp: str, status: str, data: Dict[str, Any], seconds: float) -> None:
         self.state["stages"][stage] = {"fingerprint": fp, "status": status, "data": data,
                                        "seconds": round(seconds, 2), "finishedAt": time.time()}

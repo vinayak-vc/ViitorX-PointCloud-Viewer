@@ -3,7 +3,9 @@ import io
 import json
 import os
 import tempfile
+import time
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from pf360 import manifest, procrun
@@ -75,9 +77,15 @@ class BackendTests(unittest.TestCase):
         with mock.patch.object(procrun, "run", side_effect=fake_run):
             data = be.run_stage("training", self.ctx)
         a = captured["args"]
-        self.assertEqual(a[1], "splatfacto")                          # splatfacto-big not installed -> fallback
+        # ns-train runs through the graceful-pause wrapper: python train_resumable.py <pause file> <method> ...
+        self.assertEqual(a[0], self.tools.ns_python)
+        self.assertTrue(a[1].endswith("train_resumable.py"))
+        self.assertTrue(a[2].endswith(".pause-training"))
+        self.assertEqual(a[3], "splatfacto")                          # splatfacto-big not installed -> fallback
         self.assertIn("splatfacto-big is not available", self.buf.getvalue())
         self.assertEqual(a[a.index("--max-num-iterations") + 1], "40000")
+        self.assertEqual(a[a.index("--steps-per-save") + 1], "1000")
+        self.assertNotIn("--load-checkpoint", a)
         self.assertEqual(a[a.index("--machine.seed") + 1], "42")
         self.assertIn("--viewer.quit-on-train-completion", a)
         self.assertIn("--pipeline.model.use-scale-regularization", a)
@@ -85,6 +93,72 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(a[-3:], ["nerfstudio-data", "--downscale-factor", "1"])
         self.assertEqual(data["method"], "splatfacto")
         self.assertIn('"percent":2.5', self.buf.getvalue())
+
+    def _ckpt(self, step, complete=True):
+        d = self.ws.training_dir / "pf360" / "splatfacto" / "run" / "nerfstudio_models"
+        d.mkdir(parents=True, exist_ok=True)
+        p = d / ("step-%09d.ckpt" % step)
+        # torch.save writes a zip: a complete file ends with the end-of-central-directory record.
+        p.write_bytes(b"PK\x03\x04" + b"x" * 100 + (b"PK\x05\x06" + b"\0" * 18 if complete else b""))
+        (d.parent / "config.yml").write_text("x")
+        return p
+
+    def test_training_resumes_from_latest_complete_checkpoint(self):
+        be = NerfstudioBackend()
+        be._help_cache["train-splatfacto"] = NEW_TYRO
+        self._ckpt(9999)
+        truncated = self._ckpt(12999, complete=False)      # killed while saving
+        self.ctx.results["_resume_training"] = True
+        captured = {}
+
+        def fake_run(args, **kw):
+            captured["args"] = args
+            kw["on_line"]("20000 (80.00%)   12 ms")         # absolute step after the resume
+            return 0
+        with mock.patch.object(procrun, "run", side_effect=fake_run):
+            data = be.run_stage("training", self.ctx)
+        a = captured["args"]
+        self.assertTrue(a[a.index("--load-checkpoint") + 1].endswith("step-000009999.ckpt"))
+        self.assertEqual(a[a.index("--max-num-iterations") + 1], str(40000 - 10000))   # only the remainder
+        self.assertFalse(truncated.exists())                 # unusable partial checkpoint removed
+        self.assertEqual(data["resumedFromStep"], 9999)
+        self.assertIn('"percent":50.0', self.buf.getvalue())  # 20000 / 40000, not Nerfstudio's 80%
+
+    def test_training_not_resumed_without_restore_point(self):
+        be = NerfstudioBackend()
+        be._help_cache["train-splatfacto"] = NEW_TYRO
+        old = self._ckpt(9999)
+        captured = {}
+
+        def fake_run(args, **kw):
+            captured["args"] = args
+            self._ckpt(39999)
+            return 0
+        with mock.patch.object(procrun, "run", side_effect=fake_run):
+            be.run_stage("training", self.ctx)
+        self.assertNotIn("--load-checkpoint", captured["args"])
+        self.assertFalse(old.exists())                       # settings changed -> fresh training dir
+
+    def test_training_pause_saves_checkpoint_then_raises_cancelled(self):
+        be = NerfstudioBackend()
+        be._help_cache["train-splatfacto"] = NEW_TYRO
+        seen = {}
+
+        def fake_run(args, **kw):
+            pause_file = Path(args[2])
+            self.ctx.cancel.cancel()                         # user pressed Pause
+            for _ in range(50):                              # wrapper sees the pause request...
+                if pause_file.exists():
+                    break
+                time.sleep(0.05)
+            seen["pause"] = pause_file.exists()
+            self._ckpt(1500)                                 # ...saves a checkpoint and exits 75
+            return 75
+        with mock.patch.object(procrun, "run", side_effect=fake_run):
+            with self.assertRaises(procrun.Cancelled):
+                be.run_stage("training", self.ctx)
+        self.assertTrue(seen["pause"])
+        self.assertFalse((self.ws.root / ".pause-training").exists())
 
     def test_training_failure_raises(self):
         be = NerfstudioBackend()

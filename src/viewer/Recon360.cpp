@@ -4,7 +4,12 @@
 
 #include <nlohmann/json.hpp>
 
+#ifdef PF_EMBED_WORKER
+#include "EmbeddedWorker.h"   // generated: build/generated (tools/embed_worker.cmake)
+#endif
+
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -29,6 +34,9 @@ using json = nlohmann::json;
 
 namespace pf {
 
+static std::atomic<bool> g_recon360ShuttingDown{false};
+void recon360SetShuttingDown() { g_recon360ShuttingDown = true; }
+
 // ---------------------------------------------------------------------------
 // stage labels / weights
 // ---------------------------------------------------------------------------
@@ -38,6 +46,63 @@ const char* recon360StageLabel(int i) {
                                     "Masking (people / vehicles / sky)", "Camera reconstruction (COLMAP)",
                                     "Gaussian training", "Gaussian export", "PLY validation"};
     return (i >= 0 && i < n) ? labels[i] : "Preparing";
+}
+
+// ---------------------------------------------------------------------------
+// batch helpers (portable std::filesystem)
+// ---------------------------------------------------------------------------
+namespace {
+bool isVideoExt(const fs::path& p) {
+    std::string e = p.extension().u8string();
+    for (char& c : e) c = (char)std::tolower((unsigned char)c);
+    return e == ".mp4" || e == ".mov" || e == ".mkv";
+}
+bool isOwnOutputDir(const fs::path& d) {
+    std::error_code ec;
+    return d.filename() == "PointForge360" || fs::exists(d / "state.json", ec) ||
+           fs::exists(d / "reconstruction_report.json", ec);
+}
+} // namespace
+
+std::vector<std::string> recon360FindVideos(const std::string& rootUtf8, bool recursive, size_t maxCount,
+                                            bool& truncated, const std::atomic<bool>* cancel) {
+    truncated = false;
+    std::vector<std::string> out;
+    std::error_code ec;
+    const fs::path root = fs::u8path(rootUtf8);
+    if (!fs::is_directory(root, ec)) return out;
+    auto add = [&](const fs::path& p) {
+        if (out.size() >= maxCount) { truncated = true; return; }
+        out.push_back(p.u8string());
+    };
+    if (recursive) {
+        fs::recursive_directory_iterator it(root, fs::directory_options::skip_permission_denied, ec), end;
+        for (; !ec && it != end && !truncated && !(cancel && cancel->load()); it.increment(ec)) {
+            std::error_code e2;
+            if (it->is_directory(e2)) {
+                if (isOwnOutputDir(it->path())) it.disable_recursion_pending();
+            } else if (it->is_regular_file(e2) && isVideoExt(it->path())) {
+                add(it->path());
+            }
+        }
+    } else {
+        for (const auto& e : fs::directory_iterator(root, fs::directory_options::skip_permission_denied, ec)) {
+            std::error_code e2;
+            if (e.is_regular_file(e2) && isVideoExt(e.path())) add(e.path());
+            if (truncated) break;
+        }
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+Recon360WorkspaceState recon360WorkspaceState(const std::string& dirUtf8, const std::string& plyName) {
+    std::error_code ec;
+    const fs::path dir = fs::u8path(dirUtf8);
+    if (fs::exists(dir / "export" / fs::u8path(plyName), ec)) return Recon360WorkspaceState::Done;
+    if (fs::exists(dir / "state.json", ec)) return Recon360WorkspaceState::Resume;
+    if (fs::exists(dir, ec) && !fs::is_empty(dir, ec)) return Recon360WorkspaceState::Foreign;
+    return Recon360WorkspaceState::New;
 }
 
 float recon360Overall(int stage, float pct) {
@@ -296,14 +361,16 @@ std::vector<std::wstring> pythonLauncher(const Recon360Settings& s) {
     const fs::path envDir = localAppData() / L"ViitorX" / L"PointForge" / L"engines" / L"pf360-env";
     const std::wstring envPy = (envDir / L"Scripts" / L"python.exe").wstring();   // developer venv
     const std::wstring packPy = (envDir / L"python.exe").wstring();               // downloaded runtime pack
+    // Prefer PointForge's own interpreters (known version, no surprises from
+    // whatever Python the user installed), then the user's.
+    if (isFile(packPy)) return {packPy};
+    if (isFile(envPy)) return {envPy};
+    if (isFile(widen(s.nsPython))) return {widen(s.nsPython)};
     std::wstring py = searchPath(L"py");
     if (!py.empty()) return {py, L"-3"};
     py = searchPath(L"python");
     // Skip the Microsoft Store alias stub (it opens the Store instead of running).
     if (!py.empty() && py.find(L"WindowsApps") == std::wstring::npos) return {py};
-    if (isFile(widen(s.nsPython))) return {widen(s.nsPython)};
-    if (isFile(envPy)) return {envPy};
-    if (isFile(packPy)) return {packPy};
     return {};
 }
 
@@ -365,6 +432,40 @@ std::vector<std::string> strList(const json& j, const char* k) {
 
 } // namespace
 
+#ifdef PF_EMBED_WORKER
+// The worker compiled into the exe (tools/embed_worker.cmake). Extracted once per
+// worker version to %LOCALAPPDATA%\ViitorX\PointForge\worker\<hash>\pf360\...; a
+// ".complete" marker is written last, and extraction goes through a temp folder +
+// rename, so a crash mid-way never leaves a half-written worker in use.
+static std::string extractEmbeddedWorker() {
+    static std::mutex mu;
+    std::lock_guard<std::mutex> lk(mu);
+    std::error_code ec;
+    const fs::path base = localAppData() / L"ViitorX" / L"PointForge" / L"worker";
+    const fs::path dir = base / widen(pf_embedded_worker::kHash);
+    if (fs::exists(dir / L".complete", ec)) return narrow(dir.wstring());
+    const fs::path tmp = base / (widen(pf_embedded_worker::kHash) + L".tmp" + std::to_wstring(GetCurrentProcessId()));
+    fs::remove_all(tmp, ec);
+    for (size_t i = 0; i < pf_embedded_worker::kFileCount; ++i) {
+        const auto& f = pf_embedded_worker::kFiles[i];
+        const fs::path out = tmp / L"pf360" / fs::u8path(f.path);
+        fs::create_directories(out.parent_path(), ec);
+        std::ofstream o(out, std::ios::binary | std::ios::trunc);
+        o.write(reinterpret_cast<const char*>(f.data), (std::streamsize)f.size);
+        if (!o) { logError("[pf360] cannot extract the built-in worker to " + narrow(tmp.wstring())); fs::remove_all(tmp, ec); return {}; }
+    }
+    std::ofstream(tmp / L".complete") << "ok\n";
+    fs::remove_all(dir, ec);              // an incomplete earlier attempt
+    fs::rename(tmp, dir, ec);
+    if (ec) {                             // another PointForge instance won the race
+        fs::remove_all(tmp, ec);
+        return fs::exists(dir / L".complete", ec) ? narrow(dir.wstring()) : std::string();
+    }
+    logInfo("[pf360] built-in worker extracted to " + narrow(dir.wstring()));
+    return narrow(dir.wstring());
+}
+#endif
+
 std::string recon360WorkerRoot() {
     std::error_code ec;
     const fs::path exe = exeDir();
@@ -374,7 +475,15 @@ std::string recon360WorkerRoot() {
     for (int i = 0; i < 5 && !p.empty(); ++i, p = p.parent_path())
         if (fs::exists(p / L"tools" / L"pf360" / L"pf360" / L"__main__.py", ec))
             return narrow((p / L"tools" / L"pf360").wstring());
+#ifdef PF_EMBED_WORKER
+    // A lone exe (copied to another PC / folder): use the copy built into it.
+    static std::string embedded;          // extracted once per process
+    if (embedded.empty() || !fs::exists(fs::u8path(embedded) / "pf360" / "__main__.py", ec))
+        embedded = extractEmbeddedWorker();
+    return embedded;
+#else
     return {};
+#endif
 }
 
 std::string recon360FindPython(const Recon360Settings& s) {
@@ -612,6 +721,104 @@ bool recon360WriteManifest(const Recon360JobSpec& sp, const Recon360Settings& s,
     return (bool)f;
 }
 
+bool recon360SpecFromManifest(const std::string& text, Recon360JobSpec& sp, std::string& err) {
+    try {
+        const json m = json::parse(text);
+        sp = Recon360JobSpec{};
+        sp.jobId = m.at("jobId").get<std::string>();
+        const json& in = m.at("input");
+        sp.videoPath = in.at("videoPath").get<std::string>();
+        sp.projectionConfirmed = in.value("projectionConfirmed", false);
+        sp.startSeconds = in.value("startTimeSeconds", 0.0);
+        sp.endSeconds = in.contains("endTimeSeconds") && in["endTimeSeconds"].is_number() ? in["endTimeSeconds"].get<double>() : -1;
+        const json& pr = m.at("processing");
+        sp.targetFrames = pr.value("targetFrames", 90);
+        sp.imagesPerEquirect = pr.value("imagesPerEquirect", 8);
+        sp.cropTop = pr.value("cropTop", 0.0f); sp.cropBottom = pr.value("cropBottom", 0.0f);
+        sp.cropLeft = pr.value("cropLeft", 0.0f); sp.cropRight = pr.value("cropRight", 0.0f);
+        sp.matchingMethod = pr.value("matchingMethod", "sequential");
+        if (pr.contains("masking") && pr["masking"].is_object()) {
+            const json& mk = pr["masking"];
+            sp.maskEnabled = mk.value("enabled", false);
+            sp.maskDilatePx = mk.value("dilatePx", 8);
+            sp.maskPeople = sp.maskVehicles = sp.maskAnimals = sp.maskSky = false;
+            for (const auto& g : mk.value("groups", json::array())) {
+                const std::string s = g.get<std::string>();
+                sp.maskPeople |= s == "people"; sp.maskVehicles |= s == "vehicles";
+                sp.maskAnimals |= s == "animals"; sp.maskSky |= s == "sky";
+            }
+        }
+        const json& tr = m.at("training");
+        sp.qualityPreset = tr.value("qualityPreset", "balanced");
+        sp.method = tr.value("method", "splatfacto");
+        sp.fallbackMethod = tr.value("fallbackMethod", "");
+        sp.iterations = tr.value("iterations", 30000);
+        sp.downscaleFactor = tr.value("downscaleFactor", 2);
+        sp.shDegree = tr.value("shDegree", 3);
+        sp.randomSeed = tr.value("randomSeed", 42);
+        sp.useScaleRegularization = tr.value("useScaleRegularization", false);
+        sp.cullAlphaThresh = tr.value("cullAlphaThresh", -1.0f);
+        sp.densifyGradThresh = tr.value("densifyGradThresh", -1.0f);
+        sp.cullScaleThresh = tr.value("cullScaleThresh", -1.0f);
+        const json& out = m.at("output");
+        sp.outputDir = out.at("directory").get<std::string>();
+        sp.plyFileName = out.value("plyFileName", "");
+        const json opts = m.value("options", json::object());
+        sp.allowCache = opts.value("allowCache", true);
+        sp.stopAfter = opts.value("stopAfter", "");
+    } catch (const std::exception& e) {
+        err = std::string("manifest: ") + e.what();
+        return false;
+    }
+    return true;
+}
+
+std::vector<Recon360Unfinished> recon360ListUnfinished() {
+    std::vector<Recon360Unfinished> out;
+    std::error_code ec;
+    const fs::path dir = localAppData() / L"ViitorX" / L"PointForge" / L"pf360-jobs";
+    if (!fs::is_directory(dir, ec)) return out;
+    struct Cand { fs::path manifest; fs::file_time_type t; };
+    std::vector<Cand> cands;
+    for (const auto& e : fs::directory_iterator(dir, ec))
+        if (e.is_regular_file(ec) && e.path().extension() == L".json") cands.push_back({e.path(), e.last_write_time(ec)});
+    std::sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b) { return a.t > b.t; });
+    std::vector<std::string> seen;   // one entry per workspace (retries reuse it)
+    for (const auto& c : cands) {
+        std::ifstream f(c.manifest, std::ios::binary);
+        const std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        Recon360Unfinished u;
+        std::string err;
+        if (!recon360SpecFromManifest(text, u.spec, err)) continue;
+        const fs::path ws = fs::u8path(u.spec.outputDir);
+        std::string key = ws.lexically_normal().u8string();
+        for (char& ch : key) ch = (char)std::tolower((unsigned char)ch);
+        if (std::find(seen.begin(), seen.end(), key) != seen.end()) continue;
+        seen.push_back(key);
+        json st;
+        try {
+            std::ifstream sf(ws / "state.json", std::ios::binary);
+            if (!sf) continue;                                     // never started or deleted
+            sf >> st;
+        } catch (...) { continue; }
+        const json stages = st.value("stages", json::object());
+        // Finished: validation done (or the requested stopAfter stage done).
+        const std::string endStage = u.spec.stopAfter.empty() ? "validation" : u.spec.stopAfter;
+        if (stages.contains(endStage) && stages[endStage].value("status", "") == "completed") continue;
+        for (int i = 0; i < Recon360Live::kStageCount; ++i) {
+            const char* id = Recon360Live::kStages[i];
+            if (!stages.contains(id)) continue;
+            const std::string s = stages[id].value("status", "");
+            u.updatedAt = std::max(u.updatedAt, stages[id].value("finishedAt", 0.0));
+            if (s != "completed") { u.lastStage = id; u.lastStatus = s; }
+        }
+        u.manifestPath = narrow(c.manifest.wstring());
+        out.push_back(std::move(u));
+        if (out.size() >= 100) break;
+    }
+    return out;
+}
+
 bool recon360Run(const Recon360JobSpec& spec, const Recon360Settings& s, std::atomic<bool>& cancel,
                  Recon360Live& live, const std::function<void(float, const std::string&)>& progress,
                  std::string& err) {
@@ -720,9 +927,12 @@ bool recon360Run(const Recon360JobSpec& spec, const Recon360Settings& s, std::at
             WriteFile(c.inWr, msg, sizeof(msg) - 1, &wr, nullptr);
             logInfo("[pf360] cancel sent to worker");
         }
-        // Grace period for the worker to stop its children and write its report.
-        if (cancelSent && std::chrono::steady_clock::now() - cancelAt > std::chrono::seconds(20)) {
-            logWarn("[pf360] worker did not stop in 20 s; terminating its process tree");
+        // Grace period for the worker to save a restore point (training writes a checkpoint, up to
+        // ~150 s for very large models), stop its children and write its report. On app exit
+        // there is no waiting: the last periodic checkpoint is the restore point.
+        const auto grace = g_recon360ShuttingDown.load() ? std::chrono::seconds(0) : std::chrono::seconds(180);
+        if (cancelSent && std::chrono::steady_clock::now() - cancelAt > grace) {
+            logWarn("[pf360] worker did not stop in time; terminating its process tree");
             c.terminateTree();
             WaitForSingleObject(c.process, 5000);
             break;
@@ -799,6 +1009,8 @@ bool recon360Run(const Recon360JobSpec&, const Recon360Settings&, std::atomic<bo
 }
 bool recon360IsZUpOutput(const std::string&) { return false; }
 void recon360Reveal(const std::string&, bool) {}
+std::vector<Recon360Unfinished> recon360ListUnfinished() { return {}; }
+bool recon360SpecFromManifest(const std::string&, Recon360JobSpec&, std::string& err) { err = "Windows only"; return false; }
 #endif
 
 } // namespace pf

@@ -19,6 +19,44 @@ palette, or drop an `.mp4/.mov/.mkv` on the window) opens a 6-step wizard:
 | 5 Run | real per-stage progress (indeterminate when a tool reports none), log, Cancel, Run in background |
 | 6 Done | Gaussian count, PLY size, method, iterations, time; Open in PointForge / folder / report / logs / sparse cloud; Retry |
 
+**Batch mode** (step 1: *Batch: all videos in a folder*): pick a root folder; every
+`.mp4/.mov/.mkv` under it (optionally including subfolders, up to 1000, never inside
+`PointForge360` or an existing workspace — `recon360FindVideos`) is probed in the
+background and listed with length, resolution and a 360 check. Unusable files are
+unticked; files without spherical metadata need one confirmation for all. Steps 2–3
+apply to every selected video, which is processed over its **full length** (with
+*Follow quality preset* each video gets its own frame count from the preset rate;
+otherwise one fixed count); the preview uses the first video as the example. Step 4
+picks one output folder (default `<root>\PointForge360`) and shows the plan per video:
+workspace = file name (folder prefix / number on clashes), `new`, `resume` (existing
+workspace, finished stages reused) or `skip` (already has its PLY, or a foreign folder) —
+`recon360WorkspaceState`. *Start N reconstructions* queues one `Recon360` job each
+(ids `pf360_<time>_<index>`, not auto-opened); they run one after another, a failure
+does not stop the rest, and the batch table shows per-video state with Open / Folder,
+*Cancel remaining*, *Retry failed / cancelled*, *Run in background*. Re-running the
+same folder later skips finished videos, so an interrupted batch simply continues.
+
+**Pause / resume (restore points).** *Pause* (run page, batch *Pause all*) asks the
+worker to stop after saving a restore point; the job then shows as paused, and
+*Resume* continues it. The wizard's first page lists **Unfinished reconstructions**
+(`recon360ListUnfinished`: saved manifests whose workspace has no completed final
+stage — paused, failed, or interrupted by closing PointForge / a crash / power loss)
+with *Resume* / *Resume all*, so nothing depends on the app staying open. What is kept:
+
+| Stage | Restore point |
+|---|---|
+| finished stages | reused via the fingerprint cache (as before) |
+| panorama projection | panoramas whose views all exist are skipped; views are written to a temp name + renamed, so no truncated JPEG survives |
+| masking | finished masks kept (atomic writes), still counted in the statistics |
+| camera reconstruction | `database.db` (+ SQLite journal) kept: COLMAP skips extracted images and matched pairs; only the mapper (minutes) re-runs |
+| training | checkpoint every 1000 steps; **Pause** makes the trainer save one at the current step first (`ns_helpers/train_resumable.py` sets Nerfstudio's `stop_training`, exit 75; killed only after 150 s). Resume: newest complete checkpoint (`--load-checkpoint`, truncated zips skipped) with `--max-num-iterations` = the remaining steps (Nerfstudio would otherwise train that many *more*) |
+| frame extraction, export | short; re-run |
+
+A stage counts as interrupted when `state.json` shows it `running` (crash), `cancelled`
+(paused) or `failed` **with the same fingerprint**; changed settings start it fresh.
+On app exit PointForge does not wait for a new checkpoint — the last periodic one
+(≤ 1000 steps) is the restore point. Host grace for a pause: 180 s.
+
 The job is a `ConvertJob::Kind::Recon360` in the existing `JobQueue`, so it
 shows in the Jobs panel and status-bar pill, and runs one-at-a-time with other
 heavy jobs. On success the PLY is loaded on the **existing Gaussian-splat path**
@@ -194,6 +232,12 @@ are missing) installs them as **engine packs** from a signed catalog on Hugging 
 | `ffmpeg` | `ffmpeg\bin\` — FFmpeg 9.0.2 shared build | ~0.1 GB | yes |
 | `mask-model` | `models\upernet-convnext-base-ade20k\` — fetched straight from `openmmlab/upernet-convnext-base` at the pinned revision | ~0.5 GB | optional |
 
+The pf360 worker itself is compiled into the exe (`tools/embed_worker.cmake` →
+`EmbeddedWorker.h`) and extracted on first use to
+`%LOCALAPPDATA%\ViitorX\PointForge\worker\<content-hash>\` when no `pf360\` folder sits
+beside the exe (a `pf360\` folder or the source tree still wins, for development). So the
+exe alone is enough. The worker runs on the pack's Python first, then the user's.
+
 Needs: Windows 10 1803+ (uses the system `curl.exe` and `tar.exe`), an NVIDIA GPU
 with a current driver, ~17 GB free disk during install (~10.5 GB afterwards). No
 Python, Visual Studio or CUDA Toolkit is needed on the user's PC: nothing is compiled.
@@ -297,6 +341,7 @@ in the UI; `environment.backend` is the extension point for them.
 | pip fails building `fpsample` (`nmake` / `CMAKE_CXX_COMPILER not set`) | no C++ compiler visible; re-run the setup script (it imports vcvars) |
 | COLMAP FAIL "no --SiftExtraction.use_gpu option" | COLMAP too new for Nerfstudio 1.1.5; install 3.11.x (see §8) |
 | COLMAP release download resets | some networks block `release-assets.githubusercontent.com`; use the conda-forge route in §8 |
+| "Only N of M perspective images could be placed" on real walking footage | COLMAP 3.11 has no rig model, so it tends to register only some view directions. pf360 now (a) poses every view of a panorama from any registered one (`ns_helpers/rig_complete.py`, exact rotations of Nerfstudio's projection, verified to 0.06° against a full COLMAP model), (b) matches across 5 panoramas, (c) starts the mapper at 4° instead of 16°. If it still fails: bottom crop (the person / stick moving with the camera creates bogus matches), mask People, 8 views, fewer frames |
 | "registered cameras barely move" | the camera rotated in place; recapture walking through the scene |
 | Low registration % | too little overlap/texture; try 14 views, more frames, or `exhaustive` matching |
 | CUDA out of memory | raise downscale factor, fewer frames, standard Splatfacto, close GPU apps |
@@ -345,7 +390,10 @@ in the UI; `environment.backend` is the extension point for them.
 | Nerfstudio projection → COLMAP → Splatfacto → export → load | **done 2026-11-21** on a *synthetic* 30 s 2880×1440 clip (`scripts/pf360/make_synthetic_360.py`), Preview preset, RTX 3060: 240/240 views registered, 30 distinct positions, 7000 its in 3.2 min, 259,599 Gaussians, validated PLY, loaded in PointForge (`--export-glb` smoke). Versions: `compat.json` |
 | Z-up orientation of a real export | **verified** on that run: camera centres vary only in X/Y, mean camera-up = +Z in export space |
 | Engine packs | **done 2026-11-21**: packs built (ffmpeg 0.10 GB, colmap 1.88 GB, pf360-runtime 3.49 GB; 523 s); installed by the C++ installer into a separate folder (193 s from a loopback server); relocated Python had no path outside its folder, CUDA + gsplat `_C` OK, launchers rewritten; doctor READY with `LOCALAPPDATA` pointed there and FFmpeg removed from PATH; masked Preview run (30 frames, 2000 its): 240/240 registered, 203,477 Gaussians, validated PLY. Mask pack downloaded from Hugging Face for real (466 MB, ~10.7 MB/s, SHA OK). `pf360hosttest` 100/100, Python 86. **Live**: real key + Hugging Face repo published; the installer fetched the signed catalog and installed all 4 packs from Hugging Face (~5.9 GB) in 609 s into a separate folder; doctor READY from it. **Not done**: a clean second PC; clicking through the Engines section in the wizard |
-| Real-world 360 footage | **not run yet** (masking not yet exercised on real moving people/traffic) |
+| Pause / resume | **done 2026-11-21** on the GPU (synthetic clip, masking on, 3000 its): paused in projection (112 views kept), masking (72 masks kept), COLMAP matching (database kept, extraction skipped on resume), training twice (stopped 1–2 s after Pause with checkpoints at steps 1356 and 2115); resumed each time, training continued 1356 → 2115 → 3000 (no extra steps), final 360,952 Gaussians, validated PLY. Found + fixed on the way: Nerfstudio 1.1.5 Splatfacto resume crash (optimizers bound to pre-load tensors) — `train_resumable.py` re-binds them. `pf360hosttest` 126/126 (manifest → job round trip, unfinished list), Python 91 |
+| Panorama rig completion | math verified against a full COLMAP model (0.03° spread); knock-out test: from 1 of 8 views per panorama all 240 views restored within 0.06° / 0.16 % of the scene extent. **Not yet run on the failing real clip** |
+| Real-world 360 footage | first real run (5.7K, 192 s, 14 views, High) **failed at camera reconstruction: 347/5600 views (6 %)** — fixes above, re-run pending |
+| Real-world 360 footage (older note) | **not run yet** (masking not yet exercised on real moving people/traffic) |
 | Wizard masking controls + mask preview overlay | built; the preview call path is tested by pf360hosttest, the ImGui controls were **not clicked through** |
 
 ### Findings from the first real run (fixed)

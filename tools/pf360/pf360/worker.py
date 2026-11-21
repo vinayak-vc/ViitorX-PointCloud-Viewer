@@ -110,7 +110,18 @@ class Job:
                 self.em.emit("stage_skipped", stage=stage, message="reusing cached result (settings unchanged)", data=hit)
                 self.results[stage] = hit
                 return hit
-        self.em.emit("stage_started", stage=stage)
+        # Restore point: an interrupted run of this stage with the same settings is continued
+        # (stages keep their partial output); "running" is recorded first so a crash or power
+        # loss also counts as interrupted.
+        resume = bool(fp and self.ws is not None and allow and self.ws.resumable(stage, fp))
+        self.results["_resume_" + stage] = resume
+        if fp and self.ws is not None:
+            self.ws.record(stage, fp, "running", {}, 0.0)
+        if resume:
+            self.em.emit("stage_started", stage=stage, data={"resume": True})
+            self.em.log("continuing %s from its restore point" % stage, stage=stage)
+        else:
+            self.em.emit("stage_started", stage=stage)
         t0 = time.time()
         try:
             data = fn()

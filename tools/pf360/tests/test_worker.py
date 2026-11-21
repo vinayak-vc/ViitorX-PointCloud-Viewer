@@ -154,6 +154,59 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(ev[-1]["type"], "job_cancelled")
         self.assertTrue(os.path.isdir(os.path.join(self.tmp, "ws", "frames")))   # intermediates kept
 
+    def test_pause_then_resume_continues_the_interrupted_stage(self):
+        token = CancelToken()
+        code, ev = self.run_job(FakeBackend(cancel_at="training", token=token), token=token)
+        self.assertEqual(code, worker.EXIT_CANCELLED)
+        with open(os.path.join(self.tmp, "ws", "state.json"), encoding="utf-8") as f:
+            st = json.load(f)["stages"]
+        self.assertEqual(st["training"]["status"], "cancelled")
+        self.assertEqual(st["camera_reconstruction"]["status"], "completed")
+
+        class Spy(FakeBackend):
+            def run_stage(self, stage, ctx):
+                self.flags = getattr(self, "flags", {})
+                self.flags[stage] = ctx.results.get("_resume_" + stage)
+                return FakeBackend.run_stage(self, stage, ctx)
+        be = Spy()
+        code, ev = self.run_job(be)
+        self.assertEqual(code, 0)
+        self.assertEqual(be.ran, ["training", "export"])     # finished stages reused
+        self.assertTrue(be.flags["training"])                 # training continues from its restore point
+        self.assertFalse(be.flags["export"])
+        started = [e for e in ev if e["type"] == "stage_started" and e.get("stage") == "training"]
+        self.assertEqual(started[0].get("data"), {"resume": True})
+
+    def test_crash_counts_as_interrupted_and_settings_change_restarts(self):
+        code, _ = self.run_job(FakeBackend())
+        self.assertEqual(code, 0)
+        path = os.path.join(self.tmp, "ws", "state.json")
+        with open(path, encoding="utf-8") as f:
+            st = json.load(f)
+        st["stages"]["training"]["status"] = "running"       # app / PC died mid-training
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(st, f)
+
+        class Spy(FakeBackend):
+            def run_stage(self, stage, ctx):
+                self.flags = getattr(self, "flags", {})
+                self.flags[stage] = ctx.results.get("_resume_" + stage)
+                return FakeBackend.run_stage(self, stage, ctx)
+        be = Spy()
+        self.assertEqual(self.run_job(be)[0], 0)
+        self.assertTrue(be.flags["training"])
+        # Different training settings: the old partial training must not be continued.
+        with open(path, encoding="utf-8") as f:
+            st = json.load(f)
+        st["stages"]["training"]["status"] = "cancelled"
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(st, f)
+        raw = json.loads(json.dumps(self.raw))
+        raw["training"]["iterations"] = 777
+        be2 = Spy()
+        self.assertEqual(self.run_job(be2, raw=raw)[0], 0)
+        self.assertFalse(be2.flags["training"])
+
     def test_unconfirmed_projection_fails(self):
         raw = json.loads(json.dumps(self.raw))
         raw["input"]["projectionConfirmed"] = False

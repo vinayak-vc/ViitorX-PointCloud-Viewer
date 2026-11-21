@@ -6,8 +6,10 @@
 #include "viewer/Jobs.h"
 #include "viewer/Recon360.h"
 
+#include <atomic>
 #include <functional>
 #include <future>
+#include <mutex>
 #include <memory>
 #include <string>
 #include <vector>
@@ -55,6 +57,52 @@ private:
     void drawStepDone(Recon360PanelHost& host);
     void drawPreview(float width);
     void uploadPreview();
+    // Builds a job from the current wizard settings for one video (single + batch).
+    Recon360JobSpec buildSpec(const std::string& video, const Recon360Probe& pr, const std::string& outputDir,
+                              const std::string& plyName, bool confirmed, bool fullLength, int index) const;
+
+    // ---- restore points: unfinished jobs (paused / app closed / crashed / failed)
+    std::vector<Recon360Unfinished> unfinished;
+    bool unfinishedDirty = true;
+    void drawUnfinished(Recon360PanelHost& host);
+    void resumeJobs(Recon360PanelHost& host, const std::vector<Recon360JobSpec>& specs);
+
+    // ---- batch: every 360 video under a folder, same settings, queued in order
+    bool batchMode = false;
+    struct BatchItem {
+        std::string path, rel;              // absolute / relative to the root (UTF-8)
+        Recon360Probe probe;
+        bool probed = false, selected = false;
+        std::string project, plan;          // workspace name + what Start will do ("new", "resume", "skip: ...")
+        bool willRun = false;
+    };
+    struct BatchScan {                      // shared with the scan/probe thread
+        std::mutex mu;
+        std::vector<BatchItem> items;
+        bool listed = false, done = false;
+        std::string error;
+        std::atomic<bool> cancel{false};
+    };
+    std::shared_ptr<BatchScan> bscan;
+    std::future<void> bscanFut;
+    std::vector<BatchItem> batch;           // UI copy (selection edits live here)
+    bool batchSynced = false;
+    char batchRootBuf[1024] = {};
+    bool batchRecursive = true;
+    bool batchConfirm = false;              // "all selected videos are stitched equirectangular"
+    std::vector<std::shared_ptr<ConvertJob>> batchJobs;
+    std::vector<std::string> batchJobNames;   // parallel to batchJobs (relative video path)
+    double batchStart = 0;
+    void startBatchScan(const Recon360Settings& s);
+    void batchToFirstVideo(Recon360PanelHost& host);
+    void syncBatch();
+    void planBatch();
+    void enqueueBatch(Recon360PanelHost& host);
+    void drawBatchVideo(Recon360PanelHost& host);
+    void drawBatchOutput(Recon360PanelHost& host);
+    void drawBatchRun(Recon360PanelHost& host);
+    int batchSelectedCount() const;
+    bool batchNeedsConfirm() const;
 
     int step = 0;   // 0 video, 1 processing, 2 quality, 3 output, 4 processing(run), 5 done
 

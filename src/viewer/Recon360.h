@@ -171,10 +171,37 @@ bool recon360Run(const Recon360JobSpec& spec, const Recon360Settings& s, std::at
                  Recon360Live& live, const std::function<void(float, const std::string&)>& progress,
                  std::string& err);
 
+// ---- restore points: unfinished jobs, resumable after pause / crash / restart --------
+struct Recon360Unfinished {
+    Recon360JobSpec spec;            // rebuilt from the saved manifest
+    std::string manifestPath;
+    std::string lastStage;           // protocol id of the stage that was interrupted ("" = none started)
+    std::string lastStatus;          // running (= crashed / app closed), cancelled (= paused), failed
+    double updatedAt = 0;            // unix time of the last state change
+};
+// Jobs whose workspace exists and did not finish, newest first, one per workspace.
+std::vector<Recon360Unfinished> recon360ListUnfinished();
+// Rebuilds a job from a manifest written by recon360WriteManifest.
+bool recon360SpecFromManifest(const std::string& manifestJson, Recon360JobSpec& spec, std::string& err);
+
+// Call before the job queue shuts down at app exit: running jobs are then stopped
+// immediately instead of waiting for a restore point to be saved (pausing waits).
+void recon360SetShuttingDown();
+
 // True when `plyPath` is the output of a pf360 job (its workspace report says
 // so) — such files are Z-up (Nerfstudio orientation_method="up"), unlike the
 // Y-down convention of most downloaded 3DGS files.
 bool recon360IsZUpOutput(const std::string& plyPath);
+
+// ---- batch helpers (GUI-free, tested by pf360hosttest) -------------------------
+// MP4 / MOV / MKV files under `root` (UTF-8), sorted by path. Never descends into
+// PointForge's own output (folders named PointForge360, or holding a 360 workspace).
+// `truncated` is set when `maxCount` was hit.
+std::vector<std::string> recon360FindVideos(const std::string& root, bool recursive, size_t maxCount, bool& truncated,
+                                            const std::atomic<bool>* cancel = nullptr);
+// What starting a job in `workspaceDir` producing `plyName` would do.
+enum class Recon360WorkspaceState { New, Resume, Done, Foreign };
+Recon360WorkspaceState recon360WorkspaceState(const std::string& workspaceDir, const std::string& plyName);
 
 // Opens a folder / file in Explorer (no-op elsewhere).
 void recon360Reveal(const std::string& path, bool selectFile);
