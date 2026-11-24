@@ -29,7 +29,7 @@ points3D are the transformed points of all joined models without tracks; run
 `colmap point_triangulator` (poses fixed) on it for proper tracks.
 
 usage:
-  python rig_complete.py --sparse <sparse> --db <database.db> --views '[[yaw,pitch],...]' --out <dir>
+  python rig_complete.py --sparse <sparse> [--base <model>] --db <database.db> --views '[[yaw,pitch],...]' --out <dir>
   python rig_complete.py --model <sparse/K> --db <database.db> --views '[[yaw,pitch],...]' --out <dir>
   python rig_complete.py --model <sparse/K> --views '[[...]]' --verify
 prints: PF360RIG{json stats}
@@ -233,6 +233,42 @@ def complete(images, views, name_to_id, max_deg):
 
 # --------------------------------------------------------------------------- model merging
 MIN_SHARED = 3          # panoramas two models must share to be joined
+# Camera-path check. A walking 360 video moves the camera smoothly, so consecutive panorama
+# centres lie on a smooth curve. On real footage COLMAP also builds large models from only the
+# two downward views of each panorama (ground left/right or front/back, pitch -45): with fixed
+# intrinsics the flat ground lets it converge to wrong poses, and the path zig-zags (jerk 0.75-1.9
+# on the 2026-11-23 run, vs <= 0.3 for every model with 4+ view directions). Such a model was the
+# largest and became the join reference, so every correct piece was rejected against it.
+MAX_PATH_JERK = 0.5
+MIN_PATH_TRIPLES = 8    # fewer equally spaced triples: too short to judge, kept
+
+
+def pano_index(name):
+    """frame_00012 -> 12 (None if the name has no trailing number)."""
+    tail = name.rsplit("_", 1)[-1]
+    return int(tail) if tail.isdigit() else None
+
+
+def path_jerk(panos):
+    """Median roughness of a model's camera path: |c+ - 2c + c-| / (|c+ - c-| / 2) over triples of
+    panoramas with equal frame gaps (<= 3). ~0 for a smooth walk, ~1+ for a broken model.
+    Returns (jerk or None, triples used)."""
+    pts = sorted((pano_index(p), np.asarray(qc[1], dtype=np.float64)) for p, qc in panos.items()
+                 if pano_index(p) is not None)
+    tri = []
+    for (i0, c0), (i1, c1), (i2, c2) in zip(pts, pts[1:], pts[2:]):
+        g = i1 - i0
+        if g != i2 - i1 or g > 3:
+            continue
+        tri.append((np.linalg.norm(c2 - c0) / (2.0 * g), np.linalg.norm(c2 - 2.0 * c1 + c0) / g))
+    if not tri:
+        return None, 0
+    # Where the walker stands still the step is ~0 and the ratio is noise / noise: skip those.
+    moving = float(np.median([t[0] for t in tri]))
+    r = [acc / half for half, acc in tri if half > 0.2 * moving and half > 0]
+    if len(r) < MIN_PATH_TRIPLES:
+        return None, len(r)
+    return float(np.median(r)), len(r)
 
 
 def model_panoramas(images, views, max_deg):
@@ -246,21 +282,26 @@ def model_panoramas(images, views, max_deg):
     return out
 
 
-def estimate_sim3(ref, mov, shared, max_deg):
+def estimate_sim3(ref, mov, shared, max_deg, why=None):
     """Similarity x_ref = s * R @ x_mov + t from panoramas present in both models.
 
     R comes from the panorama rotations (Q_ref = Q_mov R^T, so every shared panorama
     gives a full estimate even when the walk is a straight line); s and t from the
-    centres. Returns (R, s, t, info) or None when the models do not agree."""
+    centres. Returns (R, s, t, info) or None when the models do not agree; `why` (a dict)
+    then says which check failed, for the log."""
+    why = {} if why is None else why
     rs = [ref[p][0].T @ mov[p][0] for p in shared]
     keep = list(range(len(rs)))
     r = None
     for _ in range(3):
         if len(keep) < MIN_SHARED:
+            why.update(reason="rotation", rotInliers=len(keep))
             return None
         r = project_orthogonal(sum(rs[i] for i in keep), 1.0)
         keep = [i for i in range(len(rs)) if angle_deg(r.T @ rs[i]) <= max_deg]
+    why["rotErrMedDeg"] = round(float(np.median([angle_deg(r.T @ x) for x in rs])), 2)
     if len(keep) < max(MIN_SHARED, len(rs) // 2):
+        why.update(reason="rotation", rotInliers=len(keep))
         return None
     a = np.array([r @ mov[shared[i]][1] for i in keep])
     b = np.array([ref[shared[i]][1] for i in keep])
@@ -268,19 +309,20 @@ def estimate_sim3(ref, mov, shared, max_deg):
     ia, ib = np.triu_indices(len(sel), 1)
     da = np.linalg.norm(a[sel][ia] - a[sel][ib], axis=1)
     db = np.linalg.norm(b[sel][ia] - b[sel][ib], axis=1)
-    if not len(da) or da.max() <= 0:
+    if not len(da) or da.max() <= 0 or (da > 0.25 * da.max()).sum() < 2:
+        why.update(reason="no-baseline")
         return None
     far = da > 0.25 * da.max()
-    if far.sum() < 2:
-        return None
     s = float(np.median(db[far] / da[far]))
     t = np.median(b - s * a, axis=0)
     res = np.linalg.norm(b - (s * a + t), axis=1)
     spread = float(np.sqrt(np.mean(np.sum((b - b.mean(axis=0)) ** 2, axis=1))))
     if spread <= 0 or s <= 0:
+        why.update(reason="no-baseline")
         return None
     inl = res <= max(3.0 * float(np.median(res)), 1e-3 * spread)
     if inl.sum() < MIN_SHARED:
+        why.update(reason="centres", centreInliers=int(inl.sum()))
         return None
     ai, bi = a[inl], b[inl]
     am, bm = ai.mean(axis=0), bi.mean(axis=0)
@@ -288,10 +330,13 @@ def estimate_sim3(ref, mov, shared, max_deg):
     if den > 0:
         s = float(np.sum((ai - am) * (bi - bm)) / den)
     if s <= 0:
+        why.update(reason="centres")
         return None
     t = bm - s * am
     rms = float(np.sqrt(np.mean(np.sum((bi - (s * ai + t)) ** 2, axis=1))))
+    why.update(rmsRel=round(rms / spread, 3), scale=round(s, 4))
     if rms > 0.15 * spread:            # centres disagree: not the same stretch of the walk
+        why.update(reason="centres")
         return None
     return r, s, t, {"shared": len(shared), "inliers": int(inl.sum()), "scale": s, "rmsRel": rms / spread}
 
@@ -305,11 +350,21 @@ def transform_image(im, r, s, t, cam):
             "npts": 0, "pts": b""}
 
 
-def merge(models, views, max_deg):
-    """models: [(name, images, points)]. Joins every model that can be tied to the largest
-    through shared panoramas. Returns (images, points, stats)."""
+def merge(models, views, max_deg, base_first=False):
+    """models: [(name, images, points)]. Joins every model that can be tied to the reference
+    (the one with most panoramas, or models[0] with base_first) through shared panoramas.
+    Returns (images, points, stats)."""
     ests = [model_panoramas(m[1], views, max_deg) for m in models]
-    order = sorted(range(len(models)), key=lambda i: (len(ests[i]), len(models[i][1])), reverse=True)
+    jerk = [path_jerk(e)[0] for e in ests]
+    broken = {i for i, j in enumerate(jerk) if j is not None and j > MAX_PATH_JERK}
+    if base_first:
+        broken.discard(0)              # the extended model was grown from a checked reference
+    if len(broken) == len(models):     # nothing passes: keep the old behaviour rather than nothing
+        broken = set()
+    order = sorted((i for i in range(len(models)) if i not in broken),
+                   key=lambda i: (len(ests[i]), len(models[i][1])), reverse=True)
+    if base_first and models:
+        order = [0] + [i for i in order if i != 0]
     if not order:
         return {}, [], {"modelsTotal": 0, "modelsMerged": 0, "joins": []}
     ref = order[0]
@@ -346,9 +401,24 @@ def merge(models, views, max_deg):
         pts.extend((s * (r @ xyz) + t, rgb, err) for xyz, rgb, err in models[i][2].values())
         info.update(model=models[i][0], newPanoramas=new_panos)
         joins.append(info)
+    # Why the rest stayed out (largest first), for the log.
+    left = []
+    for i in sorted(pending | broken, key=lambda i: len(models[i][1]), reverse=True)[:25]:
+        shared = sorted(p for p in ests[i] if p in panos)
+        why = {"model": models[i][0], "views": len(models[i][1]), "panoramas": len(ests[i]),
+               "newPanoramas": len([p for p in ests[i] if p not in panos]), "shared": len(shared)}
+        if i in broken:
+            why.update(reason="broken-path", pathJerk=round(jerk[i], 2))
+        elif len(shared) < MIN_SHARED:
+            why["reason"] = "too-few-shared"
+        else:
+            estimate_sim3(panos, ests[i], shared, max_deg, why)
+        left.append(why)
     return imgs, pts, {"modelsTotal": len(models), "modelsMerged": 1 + len(joins),
                        "referenceModel": models[ref][0], "joins": joins,
-                       "unmergedModels": sorted(models[i][0] for i in pending)}
+                       "unmergedModels": sorted(models[i][0] for i in pending | broken), "unmergedWhy": left,
+                       "brokenModels": sorted(models[i][0] for i in broken),
+                       "panoramasJoined": len(panos)}
 
 
 def colmap_model_dirs(sparse):
@@ -359,11 +429,13 @@ def colmap_model_dirs(sparse):
 
 def merge_main(a, views):
     dirs = colmap_model_dirs(a.sparse)
+    if a.base:
+        dirs = [Path(a.base)] + dirs
     if not dirs:
         print("pf360: no COLMAP models in %s" % a.sparse, file=sys.stderr)
         return 2
     models = [(d.name, read_images_bin(d / "images.bin"), read_points3d_bin(d / "points3D.bin")) for d in dirs]
-    imgs, pts, mstats = merge(models, views, a.max_deg)
+    imgs, pts, mstats = merge(models, views, a.max_deg, base_first=bool(a.base))
     con = sqlite3.connect("file:%s?mode=ro" % Path(a.db).as_posix(), uri=True)
     name_to_id = {n: i for i, n in con.execute("SELECT image_id, name FROM images")}
     con.close()
@@ -373,7 +445,7 @@ def merge_main(a, views):
     stats.update(mstats)
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
-    ref = next(d for d in dirs if d.name == mstats["referenceModel"])
+    ref = dirs[0] if a.base else next(d for d in dirs if d.name == mstats["referenceModel"])
     shutil.copyfile(ref / "cameras.bin", out / "cameras.bin")
     write_points3d_bin(out / "points3D.bin", pts)
     write_images_bin(out / "images.bin", done)
@@ -385,6 +457,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--model")
     ap.add_argument("--sparse", help="directory of COLMAP models to merge (mapper --output_path)")
+    ap.add_argument("--base", help="with --sparse: a model that is always the reference (an extended model)")
     ap.add_argument("--views", required=True, help="JSON [[yaw, pitch], ...] in view-index order")
     ap.add_argument("--db")
     ap.add_argument("--out")

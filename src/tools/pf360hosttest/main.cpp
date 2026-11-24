@@ -256,6 +256,8 @@ static void testUnfinished(const fs::path& tmp, const fs::path& video) {
     sp.targetFrames = 77; sp.imagesPerEquirect = 14; sp.cropBottom = 0.2f; sp.matchingMethod = "exhaustive";
     sp.maskEnabled = true; sp.maskPeople = true; sp.maskSky = true; sp.maskDilatePx = 12;
     sp.iterations = 12345; sp.downscaleFactor = 4; sp.method = "splatfacto-big"; sp.plyFileName = "x_splat.ply";
+    sp.cameraSolver = "glomap"; sp.globalRefinement = "fast"; sp.gpuBundleAdjustment = true;
+    sp.loopDetection = true;    // dropped: loop detection only exists for sequential matching
     std::string path, err;
     CHECK(recon360WriteManifest(sp, {}, path, err));
     std::ifstream f(fs::u8path(path), std::ios::binary);
@@ -267,6 +269,8 @@ static void testUnfinished(const fs::path& tmp, const fs::path& video) {
     CHECK(back.matchingMethod == "exhaustive" && back.maskEnabled && back.maskPeople && back.maskSky && !back.maskVehicles);
     CHECK(back.maskDilatePx == 12 && back.iterations == 12345 && back.downscaleFactor == 4);
     CHECK(back.method == "splatfacto-big" && back.plyFileName == "x_splat.ply" && back.projectionConfirmed);
+    CHECK(back.cameraSolver == "glomap" && back.globalRefinement == "fast" && back.gpuBundleAdjustment);
+    CHECK(!back.loopDetection);
 
     auto listed = [&]() {
         for (const auto& u : recon360ListUnfinished()) if (u.spec.jobId == sp.jobId) return true;

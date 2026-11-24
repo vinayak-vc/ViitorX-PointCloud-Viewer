@@ -19,6 +19,58 @@ from pathlib import Path
 EXIT_PAUSED = 75
 
 
+def cap_refine_pause(strategy) -> bool:
+    """Nerfstudio 1.1.5 Splatfacto bug on large datasets: it builds gsplat's DefaultStrategy with
+    pause_refine_after_reset = <training images> + refine_every, and gsplat only grows/prunes when
+    `step % reset_every >= pause_refine_after_reset`. reset_every is 30 x 100 = 3000 steps, so with
+    more than ~2,900 training images that test is never true: no Gaussian is ever split, cloned or
+    pruned, while the opacity resets still fade everything every 3000 steps. Seen on a 10,849-image
+    job: 108,004 seed Gaussians unchanged for 40k steps, 85% left near-transparent, PSNR 16.9.
+
+    Cap the pause at half the reset cycle (1500 steps by default), so refinement runs in the second
+    half of every cycle - closer to the original 3DGS schedule, which has no pause at all. Small
+    datasets (pause already below the cap) are untouched. Returns True when the value was changed."""
+    reset = getattr(strategy, "reset_every", 0) or 0
+    pause = getattr(strategy, "pause_refine_after_reset", 0) or 0
+    cap = reset // 2
+    if reset <= 0 or pause <= cap:
+        return False
+    strategy.pause_refine_after_reset = cap
+    print("pf360: Splatfacto refinement pause capped %d -> %d steps (reset every %d) - otherwise "
+          "Gaussians are never densified or pruned with this many images" % (pause, cap, reset), flush=True)
+    return True
+
+
+def _patch_splatfacto() -> None:
+    try:
+        from nerfstudio.models.splatfacto import SplatfactoModel
+    except Exception:                       # other Nerfstudio versions / methods: nothing to patch
+        return
+    original = SplatfactoModel.populate_modules
+
+    def populate_modules(self, *a, **kw):
+        original(self, *a, **kw)
+        strategy = getattr(self, "strategy", None)
+        if strategy is not None:
+            cap_refine_pause(strategy)
+
+    SplatfactoModel.populate_modules = populate_modules
+
+
+def _patch_timer() -> None:
+    """Nerfstudio's TimeWriter times with time.time(), which on Windows can step in ~16 ms ticks.
+    The trainer then divides by that duration (rays/sec after the one-image eval every 100
+    steps), so a fast eval measures 0.0 s and training dies with ZeroDivisionError - seen at
+    step ~900 of a splatfacto-big run. perf_counter is high-resolution; nerfstudio.utils.writer
+    uses `time` only for TimeWriter's start/stop, so swapping that module's clock is safe."""
+    try:
+        from nerfstudio.utils import writer
+    except Exception:
+        return
+    if hasattr(writer, "time"):
+        writer.time = time.perf_counter
+
+
 def main() -> int:
     pause = Path(sys.argv[1])
     try:
@@ -82,6 +134,8 @@ def main() -> int:
                   % (rebound, params["means"].shape[0]), flush=True)
 
     trainer_mod.Trainer._load_checkpoint = load_checkpoint
+    _patch_splatfacto()
+    _patch_timer()
     sys.argv = ["ns-train"] + sys.argv[2:]
     entrypoint()
     if state["paused"]:

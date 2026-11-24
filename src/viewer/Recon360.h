@@ -69,6 +69,8 @@ struct Recon360Doctor {
     bool ready = false;        // every check PASS/WARN/SKIP
     bool cuda = false;
     bool masking = false;      // optional masking add-on installed + importable
+    bool glomap = false;       // optional GLOMAP engine pack usable (fast global camera solver)
+    bool vocabTree = false;    // optional vocabulary-tree engine pack present (loop detection)
     std::string maskModelDir, nsPython;   // resolved by the worker (for the mask preview)
     std::string error;         // why the doctor itself could not run
     std::vector<Recon360Check> checks;
@@ -107,6 +109,11 @@ struct Recon360JobSpec {
     int targetFrames = 90, imagesPerEquirect = 8;
     float cropTop = 0, cropBottom = 0, cropLeft = 0, cropRight = 0;
     std::string matchingMethod = "sequential";
+    // Camera solve. cameraSolver: "colmap" (incremental) | "glomap" (global; optional pack).
+    // globalRefinement: "thorough" | "balanced" | "fast" (COLMAP global bundle-adjustment spacing).
+    std::string cameraSolver = "colmap", globalRefinement = "balanced";
+    bool loopDetection = false;        // sequential matching + vocabulary tree (optional pack)
+    bool gpuBundleAdjustment = false;  // COLMAP mapper --Mapper.ba_use_gpu
     std::string qualityPreset = "balanced", method = "splatfacto", fallbackMethod;
     int iterations = 30000, downscaleFactor = 2, shDegree = 3, randomSeed = 42;
     bool useScaleRegularization = false;

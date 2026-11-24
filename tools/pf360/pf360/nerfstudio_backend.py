@@ -19,6 +19,7 @@ import re
 import shutil
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -36,9 +37,196 @@ HELPERS = Path(__file__).with_name("ns_helpers")
 PLANAR_FOV_DEG = {8: 120, 14: 110}
 # COLMAP mapper: minimum triangulation angle of the initial pair (default 16).
 INIT_MIN_TRI_ANGLE_DEG = 4
+# COLMAP mapper: when to re-run a GLOBAL bundle adjustment. COLMAP does one once the model grows by 10%
+# (ratio 1.1) OR by 500 images / 250k points (freq) - whichever comes first. Past ~5000 views the fixed
+# 500 wins, and on a 2000-panorama clip (28000 views) each global BA took 7-20 min while registering
+# those 500 views took ~20 s, so ~95% of the mapper's time was global BA.
+#   thorough = COLMAP's defaults; balanced = the 10% ratio decides on big models (~3-4x fewer global
+#   BAs, small models unchanged); fast = 20% growth between global BAs (most drift between them).
+GLOBAL_REFINEMENT = {
+    "thorough": [],
+    "balanced": ["--Mapper.ba_global_images_freq", "2000", "--Mapper.ba_global_points_freq", "1000000"],
+    "fast": ["--Mapper.ba_global_images_ratio", "1.2", "--Mapper.ba_global_points_ratio", "1.2",
+             "--Mapper.ba_global_images_freq", "5000", "--Mapper.ba_global_points_freq", "5000000"],
+}
+
+
+def mapper_ba_args(pr: Dict[str, Any], cuda: bool = True) -> List[str]:
+    """COLMAP `mapper` bundle-adjustment options chosen in the job (refinement interval, GPU)."""
+    args = list(GLOBAL_REFINEMENT.get(pr.get("globalRefinement", "balanced"), GLOBAL_REFINEMENT["balanced"]))
+    if pr.get("gpuBundleAdjustment") and cuda:
+        args += ["--Mapper.ba_use_gpu", "1", "--Mapper.ba_gpu_index", "0"]
+    return args
+# Max `mapper --input_path` rounds that grow the joined, rig-completed model (camera stage).
+EXTEND_ROUNDS = 3
 # Training restore points: periodic checkpoint interval, and how long a pause may take to save one.
 TRAIN_STEPS_PER_SAVE = 1000
 TRAIN_PAUSE_GRACE_S = 150
+# Written into colmap/sparse after `mapper` exits 0; a resumed camera stage then keeps the models.
+MAPPER_DONE = "mapper_done.json"
+COLMAP_INIT_RE = re.compile(r"Initializing with image pair")
+# GLOMAP 1.2 mapper phases (glog lines with --log_to_stderr 1) -> camera-stage percent.
+GLOMAP_PHASES = [
+    ("preprocessing", 56.0, "GLOMAP: preparing the view graph"),
+    ("view graph calibration", 58.0, "GLOMAP: checking the view graph"),
+    ("relative pose estimation", 62.0, "GLOMAP: relative poses between matched views"),
+    ("rotation averaging", 68.0, "GLOMAP: camera rotations (all at once)"),
+    ("track establishment", 72.0, "GLOMAP: building point tracks"),
+    ("global positioning", 76.0, "GLOMAP: camera positions (all at once)"),
+    ("bundle adjustment", 82.0, "GLOMAP: refining cameras and points"),
+    ("retriangulation", 86.0, "GLOMAP: re-triangulating points"),
+    ("postprocessing", 89.0, "GLOMAP: writing the model"),
+]
+COLMAP_FIND_INIT_RE = re.compile(r"Finding good initial image pair")
+
+
+def _fmt_dur(seconds: float) -> str:
+    s = int(max(0.0, seconds))
+    if s >= 3600:
+        return "%dh %02dm" % (s // 3600, (s % 3600) // 60)
+    return "%dm %02ds" % (s // 60, s % 60) if s >= 60 else "%ds" % s
+
+
+class _Ticker:
+    """Keeps a long, quiet child step visibly alive in the UI.
+
+    COLMAP's mapper prints nothing while it bundle-adjusts a large model (10+ minutes on real
+    footage), so the host saw a frozen message. `set` records the latest progress (and emits it);
+    `seen` marks that the tool printed something. While the tool is quiet for `quiet_after`
+    seconds the last progress is re-emitted every `interval` seconds with the silent time, and a
+    log line is written every `log_every` seconds of silence. `tick` is the testable core."""
+
+    def __init__(self, emitter, stage: str, *, interval: float = 5.0, quiet_after: float = 30.0,
+                 log_every: float = 300.0, clock=None) -> None:
+        import time as _time
+        self.emitter, self.stage = emitter, stage
+        self.interval, self.quiet_after, self.log_every = interval, quiet_after, log_every
+        self.clock = clock or _time.monotonic
+        self._lock = threading.Lock()
+        self.pct: Optional[float] = None
+        self.msg = ""
+        self.last = self.clock()
+        self._logged = 0
+        self._stop = threading.Event()
+        self._th: Optional[threading.Thread] = None
+
+    def set(self, pct: Optional[float], msg: str) -> None:
+        with self._lock:
+            self.pct, self.msg, self.last, self._logged = pct, msg, self.clock(), 0
+        self.emitter.progress(self.stage, pct, msg)
+
+    def seen(self, _line: str = "") -> None:
+        with self._lock:
+            self.last, self._logged = self.clock(), 0
+
+    def tick(self, now: Optional[float] = None) -> None:
+        now = self.clock() if now is None else now
+        with self._lock:
+            quiet, pct, msg = now - self.last, self.pct, self.msg
+            n = int(quiet // self.log_every) if self.log_every > 0 else 0
+            log_now = n > self._logged
+            if log_now:
+                self._logged = n
+        if quiet < self.quiet_after:
+            return
+        self.emitter.progress(self.stage, pct, "%s - still working, no output for %s" % (msg, _fmt_dur(quiet)))
+        if log_now:
+            self.emitter.log("%s: still working (no output from the tool for %s)" % (msg, _fmt_dur(quiet)),
+                             stage=self.stage)
+
+    def _loop(self) -> None:
+        while not self._stop.wait(self.interval):
+            self.tick()
+
+    def __enter__(self) -> "_Ticker":
+        self._th = threading.Thread(target=self._loop, daemon=True)
+        self._th.start()
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self._stop.set()
+        if self._th is not None:
+            self._th.join()
+
+
+def _say(ctx: StageContext, ticker: Optional[_Ticker], pct: Optional[float], msg: str) -> None:
+    """Progress through the stage ticker when there is one (keeps the heartbeat message current)."""
+    if ticker is not None:
+        ticker.set(pct, msg)
+    else:
+        ctx.emitter.progress("camera_reconstruction", pct, msg)
+
+
+class _MapperProgress:
+    """COLMAP `mapper` output -> a percent that only grows + a readable message, over ALL models.
+
+    "Registering image #id (n)" counts the CURRENT model only and restarts at every new model
+    ("Initializing with image pair"), so the bar used to jump back each time COLMAP split the walk.
+    Here views of finished models are added up (a view may sit in two models, so this is "views
+    registered so far", capped at the image count). feed() returns (percent, message, log lines)
+    for lines that change the state, else None.
+
+    COLMAP throws away attempts with fewer than Mapper.min_model_size (10) images - on real footage
+    most of its ~90 starts register 0-6 images - so only attempts reaching MIN_MODEL count as models
+    (and get a log line); the rest are "attempts"."""
+
+    MIN_MODEL = 10               # COLMAP Mapper.min_model_size default
+
+    def __init__(self, total: int, lo: float, hi: float) -> None:
+        self.total, self.lo, self.hi = max(1, total), lo, hi
+        self.kept = 0            # finished models COLMAP keeps (>= MIN_MODEL views)
+        self.attempts = 0        # initial pairs tried
+        self.cur = 0             # views in the model being built
+        self.done = 0            # views in finished, kept models
+        self.best = lo
+
+    @property
+    def models(self) -> int:
+        """Models kept so far, including the one being built once it is big enough."""
+        return self.kept + (1 if self.cur >= self.MIN_MODEL else 0)
+
+    def _pct(self) -> float:
+        p = self.lo + (self.hi - self.lo) * min(1.0, (self.done + self.cur) / self.total)
+        self.best = max(self.best, p)
+        return self.best
+
+    def _placed(self) -> str:
+        return "%d of %d views registered so far" % (min(self.total, self.done + self.cur), self.total)
+
+    def feed(self, line: str) -> Optional[tuple]:
+        logs: List[str] = []
+        if COLMAP_FIND_INIT_RE.search(line):
+            self._close(logs)
+            return (self._pct(), "looking for a starting image pair - %d model(s) so far, %d attempt(s) (%s)"
+                    % (self.kept, self.attempts, self._placed()), logs)
+        if COLMAP_INIT_RE.search(line):
+            self._close(logs)
+            self.attempts += 1
+            if self.attempts == 1:
+                logs.append("COLMAP mapper started (it may build several models if the walk splits)")
+            return (self._pct(), "trying a starting image pair (attempt %d, %s)" % (self.attempts, self._placed()),
+                    logs)
+        m = COLMAP_REG_RE.search(line)
+        if m:
+            self.cur = int(m.group(1))
+            return (self._pct(), "registering images - model %d: %d views (%s)"
+                    % (self.kept + 1, self.cur, self._placed()), logs)
+        if "bundle adjustment" in line.lower():
+            return (self._pct(), "bundle adjustment - model %d, %d views (%s)"
+                    % (self.kept + 1, self.cur, self._placed()), logs)
+        return None
+
+    def _close(self, logs: List[str]) -> None:
+        """The model being built is finished (COLMAP looks for a new initial pair)."""
+        n, self.cur = self.cur, 0
+        if n >= self.MIN_MODEL:
+            self.kept += 1
+            self.done += n
+            logs.append("COLMAP model %d finished with %d views (%s)" % (self.kept, n, self._placed()))
+
+    def summary(self) -> str:
+        return "COLMAP mapper finished: %d model(s) from %d attempt(s), %s" % (self.models, self.attempts,
+                                                                              self._placed())
 
 
 def _latest_valid_checkpoint(training_dir: Path) -> Optional[tuple]:
@@ -223,8 +411,15 @@ class NerfstudioBackend(ReconstructionBackend):
             return {"enabled": True, "groups": sorted(mk.get("groups", [])), "dilatePx": mk.get("dilatePx", 8),
                     "model": environment.MASK_MODEL_DIRNAME, "helper": "mask-v1"}
         if stage == "camera_reconstruction":
-            return {"matching": pr["matchingMethod"], "colmap": ctx.tools.colmap, "numDownscales": 3,
-                    "sfm": "pf360-fixed-pinhole-rig-v2", "masks": _masking_on(ctx.manifest)}
+            inputs = {"matching": pr["matchingMethod"], "colmap": ctx.tools.colmap, "numDownscales": 3,
+                      "sfm": "pf360-fixed-pinhole-rig-v2", "masks": _masking_on(ctx.manifest)}
+            # Only non-default solver choices enter the fingerprint, so jobs from before these
+            # options still resume. (Refinement interval + GPU BA change speed, not the inputs.)
+            if pr.get("cameraSolver", "colmap") != "colmap":
+                inputs["solver"] = pr["cameraSolver"]
+            if pr.get("loopDetection"):
+                inputs["loopDetection"] = True
+            return inputs
         if stage == "training":
             keys = ("method", "iterations", "downscaleFactor", "shDegree", "randomSeed", "useScaleRegularization",
                     "cullAlphaThresh", "densifyGradThresh", "cullScaleThresh")
@@ -380,40 +575,59 @@ class NerfstudioBackend(ReconstructionBackend):
         # Restore point: COLMAP's database holds the extracted features and finished matches;
         # feature_extractor / *_matcher skip images and pairs already in it, so an interrupted
         # run continues. The SQLite journal files move with it (a hot journal = recovery data).
-        kept = []
+        # A FINISHED mapper (marker written after it exits 0) is kept as well: on real footage it takes
+        # hours, while everything after it (joining, completion, extension) is quick to redo.
+        kept, kept_models = [], []
         if ctx.results.get("_resume_camera_reconstruction") and db.is_file():
             hold = ws.root / ".colmap-db-hold"
             ws.reset_dir(hold)
             for f in colmap_dir.glob("database.db*"):
                 os.replace(f, hold / f.name)
                 kept.append(f.name)
+            if (sparse_dir / MAPPER_DONE).is_file() and _colmap_models(sparse_dir):
+                (hold / "sparse").mkdir()
+                for d in [sparse_dir / name for name, _ in _colmap_models(sparse_dir)] + [sparse_dir / MAPPER_DONE]:
+                    os.replace(d, hold / "sparse" / d.name)
+                    kept_models.append(d.name)
         ws.reset_dir(ws.processed_dir)
         sparse_dir.mkdir(parents=True, exist_ok=True)
         if kept:
             for name in kept:
                 os.replace(ws.root / ".colmap-db-hold" / name, colmap_dir / name)
+            for name in kept_models:
+                os.replace(ws.root / ".colmap-db-hold" / "sparse" / name, sparse_dir / name)
             shutil.rmtree(ws.root / ".colmap-db-hold", ignore_errors=True)
             ctx.emitter.log("keeping COLMAP features + matches from the interrupted run", stage="camera_reconstruction")
+        reuse_mapper = bool(kept_models)
+        if reuse_mapper:
+            ctx.emitter.log("reusing COLMAP's finished mapper output (%d models) from the interrupted run"
+                            % (len(kept_models) - 1), stage="camera_reconstruction")
         cuda = bool((ctx.results.get("_env") or {}).get("cuda", True))
         gpu = "1" if cuda else "0"
         env = self._env(ctx)
         phase = {"name": "feature extraction", "pct": 0.0}
+        ticker = _Ticker(ctx.emitter, "camera_reconstruction")
+        mapper = _MapperProgress(total, 55.0, 90.0)
 
         def on_line(l: str) -> None:
+            ticker.seen()
             m = COLMAP_FILE_RE.search(l)
             if m:
                 phase.update(name="feature extraction", pct=25.0 * int(m.group(1)) / max(1, int(m.group(2))))
+                ticker.set(phase["pct"], "feature extraction - %s / %s images" % (m.group(1), m.group(2)))
+                return
             m2 = COLMAP_MATCH_RE.search(l)
             if m2:
                 phase.update(name="feature matching", pct=25.0 + 30.0 * int(m2.group(1)) / max(1, int(m2.group(2))))
-            m3 = COLMAP_REG_RE.search(l)
-            if m3:
-                phase.update(name="registering images",
-                             pct=55.0 + 35.0 * min(1.0, int(m3.group(1)) / max(1, total)))
-            if m or m2 or m3:
-                ctx.emitter.progress("camera_reconstruction", phase["pct"], phase["name"])
-            elif "bundle adjustment" in l.lower():
-                ctx.emitter.progress("camera_reconstruction", None, "bundle adjustment")
+                ticker.set(phase["pct"], "feature matching - %s / %s images" % (m2.group(1), m2.group(2)))
+                return
+            got = mapper.feed(l)
+            if got:
+                pct, msg, logs = got
+                for x in logs:
+                    ctx.emitter.log(x, stage="camera_reconstruction")
+                phase.update(name="registering images", pct=pct)
+                ticker.set(pct, msg)
 
         method = pr["matchingMethod"]
         matcher = [colmap, "%s_matcher" % method, "--database_path", str(db), "--SiftMatching.use_gpu", gpu]
@@ -422,6 +636,20 @@ class NerfstudioBackend(ReconstructionBackend):
             # direction is matched against itself a few steps along the walk (3 was too short on
             # real footage: COLMAP kept starting tiny models that never joined).
             matcher += ["--SequentialMatching.overlap", str(max(10, 5 * vpf))]
+            if pr.get("loopDetection"):
+                # Every 10th image is also matched against its 50 most similar images anywhere in the
+                # video (vocabulary-tree retrieval): revisited places and pieces the sequential chain
+                # broke between get matches, so COLMAP builds fewer, larger models.
+                if ctx.tools.vocab_tree:
+                    # 512 features per image for the retrieval index: uncapped, indexing took 2.6 s
+                    # per image (~20 h for 28,000 views); capped 0.05 s. Matching itself still uses
+                    # all features.
+                    matcher += ["--SequentialMatching.loop_detection", "1",
+                                "--SequentialMatching.loop_detection_max_num_features", "512",
+                                "--SequentialMatching.vocab_tree_path", ctx.tools.vocab_tree]
+                else:
+                    ctx.emitter.warning("Loop detection was requested but the vocabulary tree engine pack is not "
+                                        "installed - matching without it.", stage="camera_reconstruction")
         elif method == "vocab_tree":
             matcher += ["--VocabTreeMatching.vocab_tree_path", self._vocab_tree(ctx, env)]
         masks_on = _masking_on(ctx.manifest)
@@ -434,84 +662,233 @@ class NerfstudioBackend(ReconstructionBackend):
         if masks_on:
             # COLMAP: mask file "<image name>.png", features in 0-valued pixels are dropped.
             extract += ["--ImageReader.mask_path", str(ws.masks_dir)]
-        steps = [
-            ("feature extraction", extract),
-            ("feature matching", matcher),
-            ("registering images",
+        colmap_mapper = (
+            "registering images",
              [colmap, "mapper", "--database_path", str(db), "--image_path", str(ws.planar_dir),
               "--output_path", str(sparse_dir),
               "--Mapper.ba_refine_focal_length", "0", "--Mapper.ba_refine_principal_point", "0",
               "--Mapper.ba_refine_extra_params", "0", "--Mapper.ba_global_function_tolerance=1e-6",
               # Walking video: consecutive panoramas are ~0.5 m apart, far below what COLMAP's
               # default 16 deg initial triangulation angle wants ("No good initial image pair").
-              "--Mapper.init_min_tri_angle", str(INIT_MIN_TRI_ANGLE_DEG)]),
-        ]
-        with ws.open_log("colmap.log") as log:
+              "--Mapper.init_min_tri_angle", str(INIT_MIN_TRI_ANGLE_DEG)] + mapper_ba_args(pr, cuda))
+        use_glomap = pr.get("cameraSolver") == "glomap"
+        if use_glomap and not ctx.tools.glomap:
+            ctx.emitter.warning("GLOMAP was chosen but its engine pack is not installed - using COLMAP's "
+                                "incremental mapper.", stage="camera_reconstruction")
+            use_glomap = False
+        steps = [("feature extraction", extract), ("feature matching", matcher)]
+        if not use_glomap:
+            steps.append(colmap_mapper)
+        with ws.open_log("colmap.log") as log, ticker:
             log.write("pf360: PINHOLE %dx%d fov=%d -> fx=fy=%.3f cx=%.3f cy=%.3f (fixed)\n"
                       % (w, h, fov, intr[0], intr[2], intr[3]))
-            for name, args in steps:
-                ctx.emitter.progress("camera_reconstruction", phase["pct"], name)
+            for name, args in ([] if reuse_mapper else steps):
+                ticker.set(phase["pct"], name)
                 rc = procrun.run(args, cancel=ctx.cancel, on_line=on_line, log=log, env=env, cwd=str(ws.root))
                 if rc != 0:
                     raise StageFailed("COLMAP %s failed (exit %d) - see logs/colmap.log" % (name, rc))
+            if use_glomap and not reuse_mapper:
+                if not self._glomap(ctx, log, sparse_dir, db, cuda, ticker):
+                    ctx.emitter.warning("GLOMAP did not produce a camera model - falling back to COLMAP's "
+                                        "incremental mapper (see logs/colmap.log).", stage="camera_reconstruction")
+                    for d in sparse_dir.iterdir():
+                        if d.is_dir():
+                            shutil.rmtree(d, ignore_errors=True)
+                    ticker.set(55.0, colmap_mapper[0])
+                    rc = procrun.run(colmap_mapper[1], cancel=ctx.cancel, on_line=on_line, log=log, env=env,
+                                     cwd=str(ws.root))
+                    if rc != 0:
+                        raise StageFailed("COLMAP mapper failed (exit %d) - see logs/colmap.log" % rc)
             models = _colmap_models(sparse_dir)
+            if reuse_mapper:
+                log.write("pf360: reusing the finished mapper output (%d models)\n" % len(models))
+            else:
+                ctx.emitter.log(mapper.summary(), stage="camera_reconstruction")
+                if models:
+                    with open(sparse_dir / MAPPER_DONE, "w", encoding="utf-8") as f:
+                        json.dump({"models": len(models), "views": sum(n for _, n in models)}, f)
             if not models:
                 raise StageFailed("COLMAP could not reconstruct any cameras - the footage probably lacks "
                                   "texture/overlap or camera movement.",
                                   {"generatedImages": total, "registeredImages": 0})
             best = max(models, key=lambda kv: kv[1])
-            rig = self._rig_complete(ctx, env, log, sparse_dir, db, pr)
+            rig = self._rig_complete(ctx, env, log, sparse_dir, db, pr, ticker=ticker)
             if rig:
-                rig["dir"] = self._triangulate(ctx, env, log, colmap, sparse_dir, rig["dir"], db)
+                rig["dir"] = self._triangulate(ctx, env, log, colmap, sparse_dir, rig["dir"], db, ticker=ticker)
+                rig = self._extend(ctx, env, log, colmap, sparse_dir, db, pr, rig, ticker=ticker)
             model_rel = "colmap/sparse/%s" % (rig["dir"] if rig else best[0])
-            ctx.emitter.progress("camera_reconstruction", 92.0, "writing transforms.json")
+            ticker.set(92.0, "writing transforms.json (ns-process-data)")
             flags = self._help(ctx, "process", [tool, "images", "--help"])
             args = [tool, "images", "--data", str(ws.planar_dir), "--output-dir", str(ws.processed_dir),
                     "--camera-type", "perspective", "--num-downscales", "3",
                     "--colmap-model-path", model_rel]
             args += flags.boolean("--skip-colmap", True)
             args += flags.boolean("--verbose", True)
-            rc = procrun.run(args, cancel=ctx.cancel, log=log, env=env, cwd=str(ws.root))
+            rc = procrun.run(args, cancel=ctx.cancel, on_line=ticker.seen, log=log, env=env, cwd=str(ws.root))
             if rc != 0:
                 raise StageFailed("ns-process-data failed (exit %d) - see logs/colmap.log" % rc)
             if masks_on:
                 # Splatfacto: per-frame mask_path + masks_N matching images_N sizes.
-                ctx.emitter.progress("camera_reconstruction", 96.0, "attaching masks for training")
+                ticker.set(96.0, "attaching masks for training")
                 rc = procrun.run([ctx.tools.ns_python, str(HELPERS / "mask.py"), "--attach", str(ws.processed_dir),
                                   "--masks", str(ws.masks_dir), "--planar", str(ws.planar_dir)],
-                                 cancel=ctx.cancel, log=log, env=env)
+                                 cancel=ctx.cancel, on_line=ticker.seen, log=log, env=env)
                 if rc != 0:
                     raise StageFailed("Attaching masks to the training data failed (exit %d) - see logs/colmap.log" % rc)
         data = self._validate_reconstruction(ctx, total, models, rig["dir"] if rig else best[0], rig)
         data["trainingMasks"] = masks_on
         return data
 
+    def _glomap(self, ctx: StageContext, log, sparse_dir: Path, db: Path, cuda: bool,
+                ticker: Optional["_Ticker"] = None) -> bool:
+        """GLOMAP global mapper on COLMAP's database (features + matches). Writes sparse/0 like COLMAP.
+        It adds (empty) rigs/frames tables to the database; COLMAP 3.11 ignores them (verified:
+        point_triangulator on that database + GLOMAP's model). Measured on 60 panoramas / 840 views
+        of a real walk: GLOMAP 160 s, one model with 810 views, all 60 panoramas rig-consistent,
+        path jerk 0.16; COLMAP mapper 340 s, 13 models, largest 323 views.
+        Intrinsics stay fixed (our PINHOLE). Returns False when it failed or produced nothing (the
+        caller then falls back to COLMAP's incremental mapper). Cancellation propagates."""
+        glomap = ctx.tools.glomap
+        gpu = "1" if cuda else "0"
+        msg = {"text": "GLOMAP: starting"}
+        _say(ctx, ticker, 55.0, msg["text"])
+        ctx.emitter.log("solving all cameras at once with GLOMAP", stage="camera_reconstruction")
+
+        def on_line(l: str) -> None:
+            if ticker is not None:
+                ticker.seen()
+            low = l.lower()
+            for key, pct, text in GLOMAP_PHASES:
+                if key in low and ("running" in low or "-----" in l or low.strip().startswith(key)):
+                    if text != msg["text"]:
+                        msg["text"] = text
+                        _say(ctx, ticker, pct, text)
+                    return
+
+        env = procrun.child_env(environment.glomap_path_dirs(glomap))
+        t0 = time.monotonic()
+        rc = procrun.run([glomap, "mapper", "--database_path", str(db), "--image_path", str(ctx.workspace.planar_dir),
+                          "--output_path", str(sparse_dir), "--log_to_stderr", "1",
+                          "--BundleAdjustment.optimize_intrinsics", "0",
+                          "--BundleAdjustment.optimize_principal_point", "0",
+                          # GLOMAP 1.2's own retriangulation aborts on a COLMAP 3.11 database ("Check
+                          # failed: existing_frame.DataIds() == frame.DataIds()"); COLMAP's
+                          # point_triangulator re-triangulates the joined model afterwards anyway.
+                          "--skip_retriangulation", "1",
+                          "--GlobalPositioning.use_gpu", gpu, "--BundleAdjustment.use_gpu", gpu],
+                         cancel=ctx.cancel, on_line=on_line, log=log, env=env, cwd=str(ctx.workspace.root))
+        models = _colmap_models(sparse_dir)
+        log.write("pf360: GLOMAP exit %d after %s, %d model(s)\n" % (rc, _fmt_dur(time.monotonic() - t0), len(models)))
+        if rc == 0 and models:
+            ctx.emitter.log("GLOMAP finished in %s: %s" % (
+                _fmt_dur(time.monotonic() - t0), ", ".join("model %s with %d views" % m for m in models)),
+                stage="camera_reconstruction")
+            return True
+        return False
+
+    def _extend(self, ctx: StageContext, env: Dict[str, str], log, colmap: str, sparse_dir: Path, db: Path,
+                pr: Dict[str, Any], rig: Dict[str, Any], ticker: Optional[_Ticker] = None) -> Dict[str, Any]:
+        """Grows the joined model where COLMAP's own chains broke.
+
+        After completion the joined model has ALL view directions posed and triangulated, so views of
+        the next panoramas - whatever direction they face - find 3D points to register against (COLMAP
+        alone only extended the directions it happened to start with). `mapper --input_path` continues
+        the model with the existing (rig-consistent) cameras fixed; the result is completed + joined
+        with COLMAP's remaining models again. Repeats while it grows."""
+        total = len({p.stem.rpartition("_")[0] for p in ctx.workspace.planar_dir.iterdir()
+                     if p.suffix.lower() in IMG_EXTS})
+        colmap_views = rig.get("registeredViews")
+        rounds = 0
+        for k in range(1, EXTEND_ROUNDS + 1):
+            have = int(rig.get("panoramasCompleted") or 0)
+            if have >= total:
+                break
+            ext = sparse_dir / ("extend%d" % k)
+            shutil.rmtree(ext, ignore_errors=True)
+            ext.mkdir(parents=True)
+            msg = "extending the model (%d / %d panoramas, round %d of up to %d)" % (have, total, k, EXTEND_ROUNDS)
+            _say(ctx, ticker, 91.0, msg)
+            ctx.emitter.log(msg, stage="camera_reconstruction")
+
+            def on_line(l: str, msg=msg) -> None:
+                if ticker is not None:
+                    ticker.seen()
+                m = COLMAP_REG_RE.search(l)
+                if m:
+                    _say(ctx, ticker, 91.0, "%s - %s views in the model" % (msg, m.group(1)))
+                elif "bundle adjustment" in l.lower():
+                    _say(ctx, ticker, 91.0, "%s - bundle adjustment" % msg)
+
+            rc = procrun.run([colmap, "mapper", "--database_path", str(db), "--image_path", str(ctx.workspace.planar_dir),
+                              "--input_path", str(sparse_dir / rig["dir"]), "--output_path", str(ext),
+                              "--Mapper.fix_existing_images", "1", "--Mapper.multiple_models", "0",
+                              "--Mapper.init_min_tri_angle", str(INIT_MIN_TRI_ANGLE_DEG),
+                              "--Mapper.ba_refine_focal_length", "0", "--Mapper.ba_refine_principal_point", "0",
+                              "--Mapper.ba_refine_extra_params", "0"]
+                             + mapper_ba_args(pr, bool((ctx.results.get("_env") or {}).get("cuda", True))),
+                             cancel=ctx.cancel, on_line=on_line, log=log, env=env, cwd=str(ctx.workspace.root))
+            model = ext if (ext / "images.bin").is_file() else ext / "0"
+            if rc != 0 or not (model / "images.bin").is_file():
+                ctx.emitter.warning("Extending the joined model failed (round %d, see logs/colmap.log); keeping "
+                                    "what was joined so far." % k, stage="camera_reconstruction")
+                break
+            new = self._rig_complete(ctx, env, log, sparse_dir, db, pr, out_name="extend%d_rig" % k, base=model,
+                                     ticker=ticker)
+            if not new:
+                break
+            new["dir"] = self._triangulate(ctx, env, log, colmap, sparse_dir, new["dir"], db, ticker=ticker)
+            got = int(new.get("panoramasCompleted") or 0)
+            ctx.emitter.log("extension round %d: %d -> %d of %d panoramas" % (k, have, got, total),
+                            stage="camera_reconstruction")
+            if got <= have:
+                break
+            rig, rounds = new, k
+            if got - have < max(2, total // 100):          # barely growing: not worth another mapper run
+                break
+        rig["registeredViews"] = colmap_views          # COLMAP's own placements (before completion)
+        rig["extensionRounds"] = rounds
+        return rig
+
     def _rig_complete(self, ctx: StageContext, env: Dict[str, str], log, sparse_dir: Path, db: Path,
-                      pr: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+                      pr: Dict[str, Any], out_name: str = "joined_rig",
+                      base: Optional[Path] = None, ticker: Optional[_Ticker] = None) -> Optional[Dict[str, Any]]:
         """Joins COLMAP's models through shared panoramas, then poses every view of each registered
-        panorama from its registered views (ns_helpers/rig_complete.py --sparse).
-        Returns the helper's stats + "dir", or None (then the largest plain COLMAP model is used)."""
+        panorama from its registered views (ns_helpers/rig_complete.py --sparse; `base` = a model that
+        is always the reference). Returns the helper's stats + "dir", or None (then the largest plain
+        COLMAP model is used)."""
         views = yaw_pitch_pairs(pr["imagesPerEquirect"], (pr["cropTop"], pr["cropBottom"], pr["cropLeft"],
                                                           pr["cropRight"]))
-        out_name = "joined_rig"
-        ctx.emitter.progress("camera_reconstruction", 90.5, "joining models + completing panoramas")
+        _say(ctx, ticker, 90.5, "joining models + completing panoramas")
         lines: List[str] = []
-        rc = procrun.run([ctx.tools.ns_python, str(HELPERS / "rig_complete.py"), "--sparse", str(sparse_dir),
-                          "--db", str(db), "--views", json.dumps(views), "--out", str(sparse_dir / out_name)],
-                         cancel=ctx.cancel, on_line=lines.append, log=log, env=env)
+
+        def on_line(l: str) -> None:
+            lines.append(l)
+            if ticker is not None:
+                ticker.seen()
+
+        args = [ctx.tools.ns_python, str(HELPERS / "rig_complete.py"), "--sparse", str(sparse_dir),
+                "--db", str(db), "--views", json.dumps(views), "--out", str(sparse_dir / out_name)]
+        if base is not None:
+            args += ["--base", str(base)]
+        rc = procrun.run(args, cancel=ctx.cancel, on_line=on_line, log=log, env=env)
         stats = next((json.loads(l[len("PF360RIG"):]) for l in lines if l.startswith("PF360RIG")), None)
         if rc != 0 or not stats:
             ctx.emitter.warning("Panorama completion failed (see logs/colmap.log); using COLMAP's views only.",
                                 stage="camera_reconstruction")
             return None
         stats["dir"] = out_name
+        if stats.get("brokenModels"):
+            ctx.emitter.log("left out %d COLMAP model(s) whose camera path zig-zags (built from the downward "
+                            "views only, poses not trustworthy): %s" % (len(stats["brokenModels"]),
+                                                                       ", ".join(stats["brokenModels"])),
+                            stage="camera_reconstruction")
         if stats.get("modelsTotal", 0) > 1:
             ctx.emitter.log("joined %d of %d COLMAP models through shared panoramas"
                             % (stats.get("modelsMerged", 0), stats["modelsTotal"]), stage="camera_reconstruction")
         return stats
 
     def _triangulate(self, ctx: StageContext, env: Dict[str, str], log, colmap: str, sparse_dir: Path,
-                     model: str, db: Path) -> str:
+                     model: str, db: Path, ticker: Optional[_Ticker] = None) -> str:
         """COLMAP point_triangulator on the joined model: camera poses stay fixed, the sparse points are
         rebuilt from ALL matches (so completed views and the seams between joined models get points).
         Returns the model to use; on failure the joined model (its points have no tracks)."""
@@ -519,13 +896,14 @@ class NerfstudioBackend(ReconstructionBackend):
         out = sparse_dir / out_name
         shutil.rmtree(out, ignore_errors=True)
         out.mkdir(parents=True)
-        ctx.emitter.progress("camera_reconstruction", 91.0, "triangulating points")
+        _say(ctx, ticker, 91.0, "triangulating points (poses fixed)")
         rc = procrun.run([colmap, "point_triangulator", "--database_path", str(db),
                           "--image_path", str(ctx.workspace.planar_dir), "--input_path", str(sparse_dir / model),
                           "--output_path", str(out), "--clear_points", "1", "--refine_intrinsics", "0",
                           "--Mapper.ba_refine_focal_length", "0", "--Mapper.ba_refine_principal_point", "0",
                           "--Mapper.ba_refine_extra_params", "0"],
-                         cancel=ctx.cancel, log=log, env=env, cwd=str(ctx.workspace.root))
+                         cancel=ctx.cancel, on_line=ticker.seen if ticker is not None else None, log=log, env=env,
+                         cwd=str(ctx.workspace.root))
         if rc != 0 or not (out / "points3D.bin").is_file():
             ctx.emitter.warning("Re-triangulating the joined model failed (see logs/colmap.log); using the "
                                 "points of COLMAP's models instead.", stage="camera_reconstruction")
@@ -533,7 +911,9 @@ class NerfstudioBackend(ReconstructionBackend):
         return out_name
 
     def _vocab_tree(self, ctx: StageContext, env: Dict[str, str]) -> str:
-        """Nerfstudio's cached vocabulary tree (downloaded by Nerfstudio on first use)."""
+        """The vocabulary-tree engine pack; else Nerfstudio's cached tree (downloaded on first use)."""
+        if ctx.tools.vocab_tree:
+            return ctx.tools.vocab_tree
         out: List[str] = []
         rc = procrun.run([ctx.tools.ns_python, "-c",
                           "from nerfstudio.process_data.colmap_utils import get_vocab_tree; "
@@ -603,11 +983,14 @@ class NerfstudioBackend(ReconstructionBackend):
             data["colmapModelUsed"] = used
         if len(models) > 1:
             if rig and rig.get("modelsMerged"):
-                left = len(models) - int(rig["modelsMerged"])
-                if left > 0:
-                    ctx.emitter.warning("COLMAP split the walk into %d pieces; %d were joined through shared "
-                                        "panoramas, %d could not be tied in and are left out."
-                                        % (len(models), rig["modelsMerged"], left), stage="camera_reconstruction")
+                placed = int(rig.get("panoramasCompleted") or 0)
+                if placed < panoramas:
+                    ctx.emitter.warning("COLMAP split the walk into %d pieces; after joining and extending, %d of "
+                                        "%d panoramas have cameras - the rest of the walk is missing from the splat."
+                                        % (len(models), placed, panoramas), stage="camera_reconstruction")
+                for why in (rig.get("unmergedWhy") or [])[:8]:      # diagnostics for logs/worker.log
+                    ctx.emitter.log("piece %s not joined: %s" % (why.get("model"), json.dumps(why)),
+                                    stage="camera_reconstruction")
             else:
                 ctx.emitter.warning("COLMAP split the scene into %d disconnected models; only the largest (%d "
                                     "images) is used. Capture with more overlap or try exhaustive matching."
@@ -657,6 +1040,12 @@ class NerfstudioBackend(ReconstructionBackend):
                 "--vis", "tensorboard"]
         if ckpt:
             args += ["--load-checkpoint", str(ckpt[1])]
+        # Splatfacto's config scores EVERY held-out image every 1000 steps. Nothing in pf360 reads
+        # those scores, and with many images it dominates the stage: 1,205 eval images took ~415 s
+        # per pass, 39 passes = ~4.5 h of a 4.8 h run whose 40k steps took ~10 min. An interval
+        # past the last step disables it (Nerfstudio's step_check never fires at step 0).
+        if flags.has("--steps-per-eval-all-images"):
+            args += ["--steps-per-eval-all-images", str(total_its + 1)]
         args += flags.boolean("--viewer.quit-on-train-completion", True)
         args += ["--pipeline.model.sh-degree", str(int(tr["shDegree"]))]
         args += flags.boolean("--pipeline.model.use-scale-regularization", bool(tr.get("useScaleRegularization")))

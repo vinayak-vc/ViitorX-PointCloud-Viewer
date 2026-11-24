@@ -16,7 +16,7 @@ from pf360.protocol import Emitter
 from pf360.workspace import Workspace
 
 NEW_TYRO = "--viewer.quit-on-train-completion, --viewer.no-quit-on-train-completion  --gpu, --no-gpu --verbose, --no-verbose " \
-           "--pipeline.model.use-scale-regularization, --pipeline.model.no-use-scale-regularization"
+           "--pipeline.model.use-scale-regularization, --pipeline.model.no-use-scale-regularization "            "--steps-per-eval-all-images INT"
 OLD_TYRO = "--viewer.quit-on-train-completion {True,False} --gpu {True,False} --verbose {True,False}"
 
 
@@ -85,6 +85,8 @@ class BackendTests(unittest.TestCase):
         self.assertIn("splatfacto-big is not available", self.buf.getvalue())
         self.assertEqual(a[a.index("--max-num-iterations") + 1], "40000")
         self.assertEqual(a[a.index("--steps-per-save") + 1], "1000")
+        # full held-out evaluation pushed past the last step (it cost ~4.5 h on a 10k-image job)
+        self.assertEqual(a[a.index("--steps-per-eval-all-images") + 1], "40001")
         self.assertNotIn("--load-checkpoint", a)
         self.assertEqual(a[a.index("--machine.seed") + 1], "42")
         self.assertIn("--viewer.quit-on-train-completion", a)

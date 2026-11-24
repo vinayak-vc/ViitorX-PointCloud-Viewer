@@ -223,6 +223,8 @@ class Tools:
     ffmpeg: Optional[str] = None
     ffprobe: Optional[str] = None
     mask_model: Optional[str] = None   # local segmentation model dir (optional masking add-on)
+    glomap: Optional[str] = None       # optional GLOMAP global mapper (engine pack "glomap")
+    vocab_tree: Optional[str] = None   # optional COLMAP vocabulary tree (engine pack "vocab-tree")
 
     def ns(self, tool: str) -> Optional[str]:
         if not self.ns_bin:
@@ -292,7 +294,25 @@ def resolve_tools(cfg: Optional[Dict[str, Any]] = None) -> Tools:
         t.ffprobe = _file(str(Path(t.ffmpeg).with_name("ffprobe" + EXE)))
     t.mask_model = (_model_dir(cfg.get("maskModelDir")) or _model_dir(os.environ.get("PF360_MASK_MODEL"))
                     or _model_dir(str(engines_root() / "models" / MASK_MODEL_DIRNAME)))
+    t.glomap = (_file(cfg.get("glomapExe")) or _file(os.environ.get("PF360_GLOMAP"))
+                or _file(str(engines_root() / GLOMAP_DIRNAME / "Library" / "bin" / ("glomap" + EXE)))
+                or shutil.which("glomap"))
+    t.vocab_tree = (_file(cfg.get("vocabTreePath")) or _file(os.environ.get("PF360_VOCAB_TREE"))
+                    or _file(str(engines_root() / "models" / VOCAB_TREE_DIRNAME / VOCAB_TREE_FILE)))
     return t
+
+
+# Optional engine packs (scripts/pf360/engine_packs.py): GLOMAP 1.2 (conda-forge, CUDA) and
+# COLMAP's 256K-word vocabulary tree (the size COLMAP recommends for 10k-100k images; the FLANN
+# format COLMAP 3.11 reads - 3.12+ switched to a different format).
+GLOMAP_DIRNAME = "glomap-conda"
+VOCAB_TREE_DIRNAME = "colmap-vocab-tree"
+VOCAB_TREE_FILE = "vocab_tree_flickr100K_words256K.bin"
+
+
+def glomap_path_dirs(glomap_exe: str) -> List[str]:
+    """DLL directories of a conda GLOMAP (its own CUDA / Ceres libraries)."""
+    return colmap_path_dirs(glomap_exe)
 
 
 # Installed by scripts/pf360/setup_masking.ps1 (see compat.json "masking").
@@ -330,6 +350,8 @@ class Report:
     tools: Dict[str, Optional[str]] = field(default_factory=dict)
     nerfstudio_version: Optional[str] = None
     masking: bool = False   # optional masking add-on usable
+    glomap: bool = False    # optional GLOMAP global mapper usable
+    vocab_tree: bool = False  # optional vocabulary tree present (loop detection, vocab_tree matching)
 
     @property
     def ready(self) -> bool:
@@ -450,7 +472,8 @@ INSTALL_HINT = ("Use 'Install engines' in the 360 wizard (Environment > Engines)
 def doctor(cfg: Optional[Dict[str, Any]] = None, deep: bool = True) -> Report:
     t = resolve_tools(cfg)
     r = Report(tools={"nerfstudioPython": t.ns_python, "nerfstudioBin": t.ns_bin, "colmap": t.colmap,
-                      "ffmpeg": t.ffmpeg, "ffprobe": t.ffprobe, "maskModel": t.mask_model})
+                      "ffmpeg": t.ffmpeg, "ffprobe": t.ffprobe, "maskModel": t.mask_model,
+                      "glomap": t.glomap, "vocabTree": t.vocab_tree})
     r.checks.append(Check("Worker Python", "PASS", "%s (%s)" % (sys.version.split()[0], sys.executable)))
     r.checks.append(Check("FFmpeg", "PASS" if t.ffmpeg else "FAIL", t.ffmpeg or "not found",
                           "" if t.ffmpeg else "winget install Gyan.FFmpeg  (or put ffmpeg.exe on PATH)"))
@@ -533,6 +556,27 @@ def doctor(cfg: Optional[Dict[str, Any]] = None, deep: bool = True) -> Report:
             why = "segmentation model not installed" if not t.mask_model else "transformers not installed in the env"
             r.checks.append(Check("Masking (optional)", "SKIP", why + " - run scripts\\pf360\\setup_masking.ps1 "
                                   "(~0.5 GB) to enable people/vehicle/sky masking"))
+
+    # Optional camera-solver add-ons: never FAIL (the default COLMAP path does not need them).
+    if t.glomap:
+        ok = False
+        try:
+            cp = procrun.capture([t.glomap, "mapper", "-h"], timeout=60,
+                                 env=procrun.child_env(glomap_path_dirs(t.glomap)))
+            ok = "--database_path" in _decode(cp.stdout) + _decode(cp.stderr)
+        except Exception:
+            ok = False
+        r.glomap = ok
+        r.checks.append(Check("GLOMAP (optional)", "PASS" if ok else "WARN",
+                              t.glomap if ok else t.glomap + " (does not start)",
+                              "" if ok else "Reinstall the GLOMAP engine pack."))
+    else:
+        r.checks.append(Check("GLOMAP (optional)", "SKIP", "not installed - download the GLOMAP engine pack for the "
+                              "fast global camera solver"))
+    r.vocab_tree = bool(t.vocab_tree)
+    r.checks.append(Check("Vocabulary tree (optional)", "PASS" if t.vocab_tree else "SKIP",
+                          t.vocab_tree or "not installed - download the vocabulary tree engine pack for loop "
+                          "detection (fewer, larger camera models)"))
 
     smi = query_nvidia_smi()
     r.gpu = smi

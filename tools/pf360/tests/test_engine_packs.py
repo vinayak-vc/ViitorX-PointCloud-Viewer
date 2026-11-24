@@ -110,6 +110,22 @@ class SigningTest(unittest.TestCase):
         self.assertFalse(cat["packs"][3]["required"])
         json.dumps(cat)
 
+    def test_adding_optional_packs_keeps_the_published_ones(self):
+        ep = load_engine_packs()
+        live = {"schema": 1, "packs": [
+            {"id": pid, "version": "old", "required": pid != "mask-model",
+             "files": [{"name": pid + ".zip", "url": "https://huggingface.co/o/r/resolve/OLD/" + pid + ".zip"}]}
+            for pid in ("pf360-runtime", "colmap", "ffmpeg", "mask-model")]}
+        new = {"vocab-tree": {"version": "256K", "installDir": "models/colmap-vocab-tree", "postInstall": "",
+                              "files": [{"name": "t.bin", "kind": "file", "size": 9, "sha256": "c" * 64}]}}
+        cat = ep.make_catalog(new, "https://huggingface.co/o/r/resolve/NEW", keep=live)
+        ids = [p["id"] for p in cat["packs"]]
+        self.assertEqual(ids, ["pf360-runtime", "colmap", "ffmpeg", "mask-model", "vocab-tree"])   # glomap not built
+        self.assertTrue(cat["packs"][1]["files"][0]["url"].endswith("/OLD/colmap.zip"))
+        vt = cat["packs"][-1]
+        self.assertFalse(vt["required"])
+        self.assertEqual(vt["files"][0]["url"], "https://huggingface.co/o/r/resolve/NEW/t.bin")
+
 
 if __name__ == "__main__":
     unittest.main()

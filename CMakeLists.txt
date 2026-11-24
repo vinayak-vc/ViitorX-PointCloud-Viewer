@@ -411,14 +411,12 @@ add_dependencies(pfview embed_worker_header)
 # 360 Reconstruction Studio: ship the standalone pf360 Python worker beside the
 # exe (<exe dir>/pf360/pf360/...). Recon360.cpp also finds tools/pf360 in the
 # source tree for dev builds. The worker is stdlib-only Python; nothing is compiled.
+# If <exe dir>/pf360 is a link to tools/pf360 (live worker for development), the
+# script skips the copy instead of writing the worker onto itself.
 add_custom_command(TARGET pfview POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_directory
-            ${CMAKE_SOURCE_DIR}/tools/pf360/pf360
-            $<TARGET_FILE_DIR:pfview>/pf360/pf360
-    COMMAND ${CMAKE_COMMAND} -E remove_directory
-            $<TARGET_FILE_DIR:pfview>/pf360/pf360/__pycache__
-    COMMAND ${CMAKE_COMMAND} -E remove_directory
-            $<TARGET_FILE_DIR:pfview>/pf360/pf360/ns_helpers/__pycache__
+    COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_SOURCE_DIR}/tools/pf360/pf360
+            -DDST=$<TARGET_FILE_DIR:pfview>/pf360/pf360
+            -P ${CMAKE_SOURCE_DIR}/tools/copy_worker.cmake
     COMMENT "Copying pf360 reconstruction worker")
 if(WIN32)
     target_link_libraries(pfview PRIVATE ws2_32 iphlpapi)

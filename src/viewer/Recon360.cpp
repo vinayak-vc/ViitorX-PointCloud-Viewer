@@ -544,6 +544,8 @@ Recon360Doctor recon360RunDoctor(const Recon360Settings& s, bool quick) {
             d.checks.push_back({str(c, "name"), str(c, "status"), str(c, "detail"), str(c, "fix")});
         d.methods = strList(j, "methods");
         d.masking = boolean(j, "masking");
+        d.glomap = boolean(j, "glomap");
+        d.vocabTree = boolean(j, "vocab_tree");
         const json tools = j.value("tools", json::object());
         d.maskModelDir = str(tools, "maskModel");
         d.nsPython = str(tools, "nerfstudioPython");
@@ -679,7 +681,11 @@ bool recon360WriteManifest(const Recon360JobSpec& sp, const Recon360Settings& s,
                   {"endTimeSeconds", sp.endSeconds > 0 ? json(sp.endSeconds) : json(nullptr)}};
     m["processing"] = {{"targetFrames", sp.targetFrames}, {"imagesPerEquirect", sp.imagesPerEquirect},
                        {"cropTop", sp.cropTop}, {"cropBottom", sp.cropBottom}, {"cropLeft", sp.cropLeft},
-                       {"cropRight", sp.cropRight}, {"matchingMethod", sp.matchingMethod}};
+                       {"cropRight", sp.cropRight}, {"matchingMethod", sp.matchingMethod},
+                       {"cameraSolver", sp.cameraSolver == "glomap" ? "glomap" : "colmap"},
+                       {"loopDetection", sp.loopDetection && sp.matchingMethod == "sequential"},
+                       {"globalRefinement", sp.globalRefinement},
+                       {"gpuBundleAdjustment", sp.gpuBundleAdjustment}};
     {
         json groups = json::array();
         if (sp.maskPeople)   groups.push_back("people");
@@ -737,6 +743,10 @@ bool recon360SpecFromManifest(const std::string& text, Recon360JobSpec& sp, std:
         sp.cropTop = pr.value("cropTop", 0.0f); sp.cropBottom = pr.value("cropBottom", 0.0f);
         sp.cropLeft = pr.value("cropLeft", 0.0f); sp.cropRight = pr.value("cropRight", 0.0f);
         sp.matchingMethod = pr.value("matchingMethod", "sequential");
+        sp.cameraSolver = pr.value("cameraSolver", "colmap");
+        sp.loopDetection = pr.value("loopDetection", false);
+        sp.globalRefinement = pr.value("globalRefinement", "balanced");
+        sp.gpuBundleAdjustment = pr.value("gpuBundleAdjustment", false);
         if (pr.contains("masking") && pr["masking"].is_object()) {
             const json& mk = pr["masking"];
             sp.maskEnabled = mk.value("enabled", false);

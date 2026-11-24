@@ -85,6 +85,12 @@ def resolve(raw: Dict[str, Any], video_duration: Optional[float] = None) -> Dict
     pr.setdefault("matchingMethod", base["matchingMethod"])
     for k in ("cropTop", "cropBottom", "cropLeft", "cropRight"):
         pr.setdefault(k, 0.0)
+    # Camera solve (COLMAP stage). Defaults = the proven incremental COLMAP path; GLOMAP and loop
+    # detection need their optional engine packs.
+    pr.setdefault("cameraSolver", "colmap")
+    pr.setdefault("loopDetection", False)
+    pr.setdefault("globalRefinement", "balanced")
+    pr.setdefault("gpuBundleAdjustment", False)
     mk = pr.setdefault("masking", {})
     if isinstance(mk, dict):
         mk.setdefault("enabled", False)
@@ -143,6 +149,15 @@ def validate(m: Dict[str, Any], check_files: bool = True) -> Dict[str, Any]:
         _in(problems, "processing." + k, pr.get(k, 0.0), clo, chi)
     if pr.get("matchingMethod") not in limits["matchingMethod"]:
         problems.append("processing.matchingMethod must be one of %s" % limits["matchingMethod"])
+    if pr.get("cameraSolver", "colmap") not in limits["cameraSolver"]:
+        problems.append("processing.cameraSolver must be one of %s" % limits["cameraSolver"])
+    if pr.get("globalRefinement", "balanced") not in limits["globalRefinement"]:
+        problems.append("processing.globalRefinement must be one of %s" % limits["globalRefinement"])
+    for k in ("loopDetection", "gpuBundleAdjustment"):
+        if not isinstance(pr.get(k, False), bool):
+            problems.append("processing.%s must be true/false" % k)
+    if pr.get("loopDetection") and pr.get("matchingMethod") != "sequential":
+        problems.append("processing.loopDetection only applies to sequential matching")
     if pr.get("imagesPerEquirect") in (8, 14) and all(_num(pr.get(k, 0.0)) for k in ("cropTop", "cropBottom", "cropLeft", "cropRight")):
         try:
             n = views_per_frame(pr["imagesPerEquirect"], (pr.get("cropTop", 0.0), pr.get("cropBottom", 0.0),

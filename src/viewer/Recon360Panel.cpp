@@ -261,6 +261,10 @@ Recon360JobSpec Recon360Panel::buildSpec(const std::string& video, const Recon36
     sp.imagesPerEquirect = viewsIdx == 1 ? 14 : 8;
     sp.cropTop = crop[0]; sp.cropBottom = crop[1]; sp.cropLeft = crop[2]; sp.cropRight = crop[3];
     sp.matchingMethod = kMatching[matchingIdx];
+    sp.cameraSolver = solverIdx == 1 ? "glomap" : "colmap";
+    sp.loopDetection = loopDetection && matchingIdx == 0;
+    sp.globalRefinement = refineIdx == 0 ? "thorough" : refineIdx == 2 ? "fast" : "balanced";
+    sp.gpuBundleAdjustment = gpuBA;
     sp.qualityPreset = presetIdx < (int)presets.size() ? presets[(size_t)presetIdx].key : "custom";
     sp.method = kMethods[methodIdx];
     if (presetIdx < (int)presets.size()) sp.fallbackMethod = presets[(size_t)presetIdx].fallbackMethod;
@@ -290,6 +294,7 @@ void Recon360Panel::enqueue(Recon360PanelHost& host) {
     fs::create_directories(fs::u8path(parentBuf), ec);
     const Recon360JobSpec sp = buildSpec(probedPath, probe, (fs::u8path(parentBuf) / fs::u8path(projectBuf)).u8string(),
                                          plyBuf, projectionConfirmed, false, 0);
+    queueNeededPacks(host);             // optional engines first: the job queue runs in order
     job = host.jobs->enqueueRecon360(sp, *host.settings, autoLoad);
     jobStart = jobClockSec();
     jobEnd = 0;
@@ -449,6 +454,7 @@ void Recon360Panel::enqueueBatch(Recon360PanelHost& host) {
     fs::create_directories(fs::u8path(parentBuf), ec);
     batchJobs.clear();
     batchJobNames.clear();
+    queueNeededPacks(host);             // optional engines first: the job queue runs in order
     int idx = 0;
     for (const auto& b : batch) {
         if (!b.willRun) continue;
@@ -862,12 +868,7 @@ void Recon360Panel::refreshPackStatus() {
     }
 }
 
-void Recon360Panel::drawEngines(Recon360PanelHost& host) {
-    ImGui::SeparatorText("Engines (download)");
-    if (!catalogUrlLoaded) {
-        snprintf(catalogUrlBuf, sizeof(catalogUrlBuf), "%s", host.settings->engineCatalogUrl.c_str());
-        catalogUrlLoaded = true;
-    }
+void Recon360Panel::pollCatalog() {
     if (ready(catalogFut)) {
         CatalogResult r = catalogFut.get();
         catalogOk = r.ok;
@@ -875,21 +876,111 @@ void Recon360Panel::drawEngines(Recon360PanelHost& host) {
         if (r.ok) catalog = std::move(r.cat);
         refreshPackStatus();
     }
-    // A running / finished install job
-    if (engineJob) {
-        if (!engineJob->finished()) {
-            ImGui::ProgressBar(engineJob->progress.load(), ImVec2(-1, 0));
-            ImGui::TextWrapped("%s", engineJob->message().c_str());
-            if (ImGui::Button("Pause download")) JobQueue::cancel(engineJob);
-            ImGui::SetItemTooltip("Stops now. Downloaded parts are kept; Install again resumes where it stopped.");
-            return;
+}
+
+void Recon360Panel::pollEngineJob(Recon360PanelHost& host) {
+    if (!engineJob || !engineJob->finished()) return;
+    const bool ok = engineJob->state.load() == ConvertJob::State::Succeeded;
+    if (!ok) catalogErr = engineJob->message();
+    engineJob.reset();
+    refreshPackStatus();
+    doctor = Recon360Doctor{};
+    startDoctor(host, false);           // re-check with the new engines
+}
+
+// Fetches the signed catalog in the background (once per session; Engines > Refresh retries), so
+// optional packs can show their size and be queued ahead of a job.
+void Recon360Panel::fetchCatalog(Recon360PanelHost& host) {
+    if (catalogFut.valid() || catalogOk || catalogAutoTried || !engineHasSigningKey()) return;
+    const std::string u = host.settings->engineCatalogUrl.empty() ? engineDefaultCatalogUrl()
+                                                                  : host.settings->engineCatalogUrl;
+    if (u.empty()) return;
+    catalogAutoTried = true;
+    catalogErr.clear();
+    catalogFut = std::async(std::launch::async, [u]() {
+        CatalogResult r;
+        r.ok = engineFetchCatalog(u, engineRoot(), r.cat, r.err);
+        return r;
+    });
+}
+
+std::vector<std::string> Recon360Panel::neededPacks() const {
+    std::vector<std::string> ids;
+    if (solverIdx == 1 && !doctor.glomap) ids.push_back("glomap");
+    if (loopDetection && matchingIdx == 0 && !doctor.vocabTree) ids.push_back("vocab-tree");
+    return ids;
+}
+
+void Recon360Panel::queueNeededPacks(Recon360PanelHost& host) {
+    if (!host.jobs || !catalogOk || (engineJob && !engineJob->finished())) return;
+    std::vector<std::string> ids;
+    for (const auto& id : neededPacks())
+        if (catalog.find(id)) ids.push_back(id);
+    if (ids.empty()) return;
+    engineJob = host.jobs->enqueueEnginePacks(catalog, ids);
+    std::string names;
+    for (const auto& id : ids) names += (names.empty() ? "" : ", ") + id;
+    logInfo("[pf360] queued engine download ahead of the job: " + names);
+}
+
+// One status line under an option that needs an optional engine pack. Returns true when the
+// option will work for the next job (installed, or queued to download before it).
+bool Recon360Panel::packOptionRow(Recon360PanelHost& host, const char* packId, bool installed, bool wanted) {
+    ImGui::Indent();
+    bool ok = installed;
+    const EnginePack* p = catalogOk ? catalog.find(packId) : nullptr;
+    const bool downloading = engineJob && !engineJob->finished() &&
+                             std::find(engineJob->enginePackIds.begin(), engineJob->enginePackIds.end(),
+                                       std::string(packId)) != engineJob->enginePackIds.end();
+    if (installed) {
+        ImGui::TextColored(kGood, "Installed");
+    } else if (downloading) {
+        ImGui::TextColored(kWarn, "Downloading... %d%%", (int)(engineJob->progress.load() * 100.0f));
+        ok = true;
+    } else if (p) {
+        if (wanted)
+            wrapped(kWarn, "Not installed yet: " + fmtBytes(p->downloadBytes()) +
+                               " downloads automatically before the job starts.");
+        else
+            ImGui::TextDisabled("Optional download: %s", fmtBytes(p->downloadBytes()).c_str());
+        ImGui::PushID(packId);
+        ImGui::BeginDisabled(!host.jobs || (engineJob && !engineJob->finished()));
+        if (ImGui::SmallButton("Download now") && host.jobs) {
+            engineJob = host.jobs->enqueueEnginePacks(catalog, {std::string(packId)});
+            if (host.showJobsPanel) host.showJobsPanel();
         }
-        const bool ok = engineJob->state.load() == ConvertJob::State::Succeeded;
-        if (!ok) catalogErr = engineJob->message();
-        engineJob.reset();
-        refreshPackStatus();
-        doctor = Recon360Doctor{};
-        startDoctor(host, false);           // re-check with the new engines
+        ImGui::EndDisabled();
+        ImGui::SetItemTooltip("%s\n\nLicence: %s", p->description.c_str(), p->license.c_str());
+        ImGui::PopID();
+        ok = wanted;
+    } else if (catalogFut.valid()) {
+        ImGui::TextDisabled("Checking the download size...");
+    } else {
+        wrapped(wanted ? kWarn : kDim,
+                std::string("Not installed, and no download is available right now") +
+                    (catalogErr.empty() ? "" : " (" + catalogErr + ")") +
+                    ". Install it under Environment > Engines (download)." +
+                    (wanted ? " Without it the job falls back to the default." : ""));
+    }
+    ImGui::Unindent();
+    return ok;
+}
+
+void Recon360Panel::drawEngines(Recon360PanelHost& host) {
+    ImGui::SeparatorText("Engines (download)");
+    if (!catalogUrlLoaded) {
+        snprintf(catalogUrlBuf, sizeof(catalogUrlBuf), "%s", host.settings->engineCatalogUrl.c_str());
+        catalogUrlLoaded = true;
+    }
+    pollCatalog();
+    pollEngineJob(host);
+    // A running install job
+    if (engineJob) {
+        ImGui::ProgressBar(engineJob->progress.load(), ImVec2(-1, 0));
+        ImGui::TextWrapped("%s", engineJob->message().c_str());
+        if (ImGui::Button("Pause download")) JobQueue::cancel(engineJob);
+        ImGui::SetItemTooltip("Stops now. Downloaded parts are kept; Install again resumes where it stopped.");
+        return;
     }
 
     const std::string url = host.settings->engineCatalogUrl.empty() ? engineDefaultCatalogUrl()
@@ -1261,7 +1352,91 @@ void Recon360Panel::drawStepProcessing(Recon360PanelHost& host) {
     helpMarker("sequential: matches neighbouring images in capture order (Nerfstudio's default for video, fast).\n"
                "exhaustive: every pair (robust, slow beyond ~500 images).\n"
                "vocab_tree: scalable retrieval (Nerfstudio downloads a vocabulary file on first use).");
+    drawCameraSolve(host);
     drawMasking(host);
+}
+
+// Camera solve: which solver finds the camera positions, and the speed / robustness knobs.
+// Every choice explains its effect with a concrete example, so users know what they trade.
+void Recon360Panel::drawCameraSolve(Recon360PanelHost& host) {
+    ImGui::SeparatorText("Camera solve (speed vs. robustness)");
+    if (!doctor.ran && !doctorFut.valid() && doctor.error.empty()) startDoctor(host, false);
+    pollCatalog();
+    pollEngineJob(host);
+    if (solverIdx == 1 || loopDetection) fetchCatalog(host);   // sizes for the packs they need
+    const float wrapW = std::min(ImGui::GetContentRegionAvail().x, 640.0f * host.uiScale);
+    auto explain = [&](const char* text) {
+        ImGui::Indent();
+        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + wrapW);
+        ImGui::TextDisabled("%s", text);
+        ImGui::PopTextWrapPos();
+        ImGui::Unindent();
+    };
+
+    // 1. Solver
+    ImGui::TextUnformatted("Camera solver");
+    ImGui::RadioButton("COLMAP incremental (default)", &solverIdx, 0);
+    explain("Adds the views one at a time and re-optimises as it goes. Proven on PointForge's test clips. On long "
+            "walks it is slow and can split the path into many separate pieces. Example: a 3-minute walk with "
+            "2,000 frames x 14 views (28,000 images) kept this solver busy for many hours, mostly re-optimising.");
+    ImGui::RadioButton("GLOMAP global (faster, optional download)", &solverIdx, 1);
+    explain("Solves all cameras together in one pass (rotations first, then positions, then one refinement). "
+            "Usually several times faster on long walks, and it does not grow the path piece by piece. "
+            "Example: 60 frames of a real walk (840 views): GLOMAP 2 min 40 s, one piece with 810 views; "
+            "COLMAP 5 min 40 s, 13 pieces, the largest 323 views. Trade-offs: needs good matches across the "
+            "whole video, and it is newer in PointForge. If GLOMAP fails, the job automatically falls back to "
+            "COLMAP incremental.");
+    if (solverIdx == 1 || !doctor.glomap) packOptionRow(host, "glomap", doctor.glomap, solverIdx == 1);
+
+    // 2. Loop detection
+    ImGui::Spacing();
+    ImGui::BeginDisabled(matchingIdx != 0);
+    ImGui::Checkbox("Loop detection (fewer, larger pieces)", &loopDetection);
+    ImGui::EndDisabled();
+    if (matchingIdx != 0) ImGui::SetItemTooltip("Only for sequential matching.");
+    explain("Sequential matching only compares neighbouring frames. With loop detection every 10th image is also "
+            "compared with its 50 most similar images anywhere in the video. Example: you walk round a building "
+            "and come back to the entrance, or a dark corridor breaks the chain - the two sides now get matched, "
+            "so the camera path stays in one piece instead of several that cannot be joined. Measured on 840 views "
+            "of a real walk: twice as many matched image pairs (3,595 -> 7,037); matching took about twice as long "
+            "and the solve too (GLOMAP 2 min 40 s -> 7 min 41 s; COLMAP incremental became much slower still). "
+            "Worth it when the path revisits places or keeps breaking into pieces; on a short one-way walk "
+            "it mostly costs time.");
+    if (matchingIdx == 0 && (loopDetection || !doctor.vocabTree))
+        packOptionRow(host, "vocab-tree", doctor.vocabTree, loopDetection);
+
+    // 3. Global refinement interval (COLMAP incremental + the extension rounds)
+    ImGui::Spacing();
+    static const char* kRefine[] = {"Thorough (COLMAP default)", "Balanced (recommended)", "Fast"};
+    ImGui::SetNextItemWidth(220.0f * host.uiScale);
+    ImGui::Combo("Re-optimise the whole model", &refineIdx, kRefine, 3);
+    switch (refineIdx) {
+        case 0:
+            explain("After every 500 new views COLMAP re-optimises every camera and point. Most accurate, slowest. "
+                    "Example: at 20,000 views one full re-optimisation took 7-20 minutes, and registering the "
+                    "next 500 views only ~20 seconds - so ~95% of the time is spent re-optimising.");
+            break;
+        case 2:
+            explain("Re-optimises only after the model grows by 20%. Fewest pauses; small errors can build up a "
+                    "little more between them on long straight walks. Example: from 10,000 views the next full "
+                    "re-optimisation comes at 12,000.");
+            break;
+        default:
+            explain("Re-optimises after 10% growth (COLMAP's own rule) instead of every 500 views. Small models "
+                    "behave exactly like Thorough; big ones re-optimise 3-4x less often. Example: from 20,000 views "
+                    "the next one comes at 22,000 instead of 20,500.");
+            break;
+    }
+    if (solverIdx == 1) explain("(With GLOMAP this applies only when the job has to fall back to COLMAP or grows "
+                                "the model with extension rounds.)");
+
+    // 4. GPU bundle adjustment
+    ImGui::Spacing();
+    ImGui::Checkbox("Use the GPU for re-optimisation (experimental)", &gpuBA);
+    explain("Asks COLMAP to run bundle adjustment on the NVIDIA GPU. This COLMAP build has no GPU solver for "
+            "large problems, so big re-optimisations still run on the CPU (the log says 'Falling back to "
+            "CPU-based sparse solvers'). Example: on an 840-view test it was slower, 7 min 21 s instead of "
+            "5 min 40 s on the CPU. Leave it off unless you are testing. No download."); 
 }
 
 std::string Recon360Panel::maskGroups() const {

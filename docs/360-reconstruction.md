@@ -131,6 +131,8 @@ the resolved copy is stored as `<workspace>/manifest.json`.
             "projectionConfirmed": true, "startTimeSeconds": 0, "endTimeSeconds": null},
   "processing": {"targetFrames": 90, "imagesPerEquirect": 14, "cropTop": 0, "cropBottom": 0.2,
                  "cropLeft": 0, "cropRight": 0, "matchingMethod": "sequential",
+                 "cameraSolver": "colmap", "loopDetection": false, "globalRefinement": "balanced",
+                 "gpuBundleAdjustment": false,
                  "masking": {"enabled": true, "groups": ["people", "vehicles"], "dilatePx": 8}},
   "training": {"qualityPreset": "high", "method": "splatfacto-big", "fallbackMethod": "splatfacto",
                "iterations": 40000, "downscaleFactor": 1, "shDegree": 3, "randomSeed": 42,
@@ -157,6 +159,30 @@ the resolved copy is stored as `<workspace>/manifest.json`.
   copied to `processed/masks*/frame_NNNNN.png` at the exact size of each `images_N` file and
   referenced as `mask_path` in `transforms.json` (Splatfacto multiplies both rendered and
   ground-truth images by the mask). The image-name mapping is verified by pixel comparison.
+* Camera solve (wizard: *Processing > Camera solve*; each choice is explained there with an example):
+  * `cameraSolver`: `colmap` (incremental `mapper`, default) | `glomap` (GLOMAP 1.2 global mapper on
+    the same COLMAP database, intrinsics fixed; needs the optional `glomap` pack). If GLOMAP is
+    missing or produces no model the job warns and runs COLMAP's mapper instead. Runs with
+    `--skip_retriangulation 1` (GLOMAP 1.2's retriangulation aborts on a COLMAP 3.11 database) and
+    adds empty rigs/frames tables to the database, which COLMAP 3.11 ignores. Measured on 60
+    panoramas / 840 views (8 threads, the long job running alongside): GLOMAP 160 s, 1 model with
+    810 views, all panoramas rig-consistent, path jerk 0.16; COLMAP 340 s, 13 models, largest 323. Joining, rig
+    completion, triangulation and extension rounds run the same for both.
+  * `loopDetection` (sequential matching only): `--SequentialMatching.loop_detection 1` with the
+    vocabulary-tree pack (every 10th image vs its 50 most similar images;
+    `loop_detection_max_num_features 512` for the retrieval index - uncapped it took 2.6 s/image,
+    capped 0.05 s). Measured on 840 views: verified pairs 3,595 -> 7,037, matching ~2x longer;
+    GLOMAP 160 s -> 461 s (813 views, path jerk 0.12); COLMAP incremental > 36 min (stopped; one model
+    past 410 views vs 323 largest without). Pays off on revisits / broken chains, not short one-way walks.
+    Missing tree = warning, matching continues without it. `vocab_tree` matching also prefers the pack over Nerfstudio's download.
+  * `globalRefinement`: `thorough` = COLMAP defaults (global BA every 500 views / 250k points or 10%
+    growth); `balanced` (default) = freq 2000 / 1M so the 10% ratio decides on big models; `fast` =
+    20% ratio, freq 5000 / 5M. Applies to the mapper and the extension rounds. Measured on a 28,000-view
+    clip: global BA every 500 views, 7-20 min each, ~95% of the mapper's wall time.
+  * `gpuBundleAdjustment`: `--Mapper.ba_use_gpu 1`. The conda COLMAP 3.11.1 / Ceres 2.2 build has no
+    cuDSS, so large (sparse) BAs log "Falling back to CPU-based sparse solvers" - only small models gain.
+  * Only non-default `cameraSolver` / `loopDetection` enter the camera-stage fingerprint, so older
+    jobs still resume.
 * Crop semantics are Nerfstudio's: top/bottom remove elevation rings, left/right
   narrow the yaw span. Top+bottom combos that make Nerfstudio 1.1.5 crash are
   rejected up front (port verified identical on 1,800 combinations).
@@ -231,6 +257,16 @@ are missing) installs them as **engine packs** from a signed catalog on Hugging 
 | `colmap` | `colmap-conda\` — COLMAP 3.11.1 CUDA (conda-forge), build-time files stripped | ~1.9 GB | yes |
 | `ffmpeg` | `ffmpeg\bin\` — FFmpeg 9.0.2 shared build | ~0.1 GB | yes |
 | `mask-model` | `models\upernet-convnext-base-ade20k\` — fetched straight from `openmmlab/upernet-convnext-base` at the pinned revision | ~0.5 GB | optional |
+| `glomap` | `glomap-conda\` — GLOMAP 1.2.0 CUDA 12.9 (conda-forge), build-time files stripped | ~1.65 GB | optional (Camera solver: GLOMAP) |
+| `vocab-tree` | `models\colmap-vocab-tree\vocab_tree_flickr100K_words256K.bin` — mirrored in our repo, SHA-256 pinned | 0.12 GB | optional (Loop detection) |
+
+Optional packs are never preselected. When a job's settings need one that is missing, the wizard
+shows its size and queues the download **ahead of the job** on the same FIFO queue (so a copied
+exe on a new PC fetches only what the chosen settings use); *Download now* fetches it right away.
+Developer setup of the two new packs (once, then `engine_packs.py build --only glomap,vocab-tree`
+and `publish`): `micromamba create -p %LOCALAPPDATA%\ViitorX\PointForge\engines\glomap-conda
+-c conda-forge --override-channels "glomap=1.2.0=cuda_129*"` and download
+`https://demuc.de/colmap/vocab_tree_flickr100K_words256K.bin` into `engines\models\colmap-vocab-tree\`.
 
 The pf360 worker itself is compiled into the exe (`tools/embed_worker.cmake` →
 `EmbeddedWorker.h`) and extracted on first use to
@@ -341,7 +377,7 @@ in the UI; `environment.backend` is the extension point for them.
 | pip fails building `fpsample` (`nmake` / `CMAKE_CXX_COMPILER not set`) | no C++ compiler visible; re-run the setup script (it imports vcvars) |
 | COLMAP FAIL "no --SiftExtraction.use_gpu option" | COLMAP too new for Nerfstudio 1.1.5; install 3.11.x (see §8) |
 | COLMAP release download resets | some networks block `release-assets.githubusercontent.com`; use the conda-forge route in §8 |
-| "Only N of M perspective images could be placed" on real walking footage | COLMAP 3.11 has no rig model, so it tends to register only some view directions. pf360 now (a) poses every view of a panorama from any registered one (`ns_helpers/rig_complete.py`, exact rotations of Nerfstudio's projection, verified to 0.06° against a full COLMAP model), (b) matches across 5 panoramas, (c) starts the mapper at 4° instead of 16°, (d) **joins COLMAP's separate models** through panoramas they share (`rig_complete.py --sparse`: rotation from the rig, scale + offset from the panorama centres; real walking footage splits into forward-facing / backward-facing models over the same stretch), then re-triangulates the joined model with `colmap point_triangulator` (poses fixed). A failed job resumes with its COLMAP features + matches kept. If it still fails: bottom crop (the person / stick moving with the camera creates bogus matches), mask People, 8 views, fewer frames |
+| "Only N of M perspective images could be placed" on real walking footage | COLMAP 3.11 has no rig model, so it tends to register only some view directions. pf360 now (a) poses every view of a panorama from any registered one (`ns_helpers/rig_complete.py`, exact rotations of Nerfstudio's projection, verified to 0.06° against a full COLMAP model), (b) matches across 5 panoramas, (c) starts the mapper at 4° instead of 16°, (d) **joins COLMAP's separate models** through panoramas they share (`rig_complete.py --sparse`: rotation from the rig, scale + offset from the panorama centres; real walking footage splits into forward-facing / backward-facing models over the same stretch), then re-triangulates the joined model with `colmap point_triangulator` (poses fixed), (e) **extends** the joined model: `colmap mapper --input_path` with the existing cameras fixed lets views of the following panoramas register against the now all-direction points, then completes + joins again (up to 3 rounds while it grows). A failed job resumes with its COLMAP features + matches kept. If it still fails: bottom crop (the person / stick moving with the camera creates bogus matches), mask People, 8 views, fewer frames |
 | "registered cameras barely move" | the camera rotated in place; recapture walking through the scene |
 | Low registration % | too little overlap/texture; try 14 views, more frames, or `exhaustive` matching |
 | CUDA out of memory | raise downscale factor, fewer frames, standard Splatfacto, close GPU apps |
@@ -393,6 +429,7 @@ in the UI; `environment.backend` is the extension point for them.
 | Pause / resume | **done 2026-11-21** on the GPU (synthetic clip, masking on, 3000 its): paused in projection (112 views kept), masking (72 masks kept), COLMAP matching (database kept, extraction skipped on resume), training twice (stopped 1–2 s after Pause with checkpoints at steps 1356 and 2115); resumed each time, training continued 1356 → 2115 → 3000 (no extra steps), final 360,952 Gaussians, validated PLY. Found + fixed on the way: Nerfstudio 1.1.5 Splatfacto resume crash (optimizers bound to pre-load tensors) — `train_resumable.py` re-binds them. `pf360hosttest` 126/126 (manifest → job round trip, unfinished list), Python 91 |
 | Panorama rig completion | math verified against a full COLMAP model (0.03° spread); knock-out test: from 1 of 8 views per panorama all 240 views restored within 0.06° / 0.16 % of the scene extent. **Not yet run on the failing real clip** |
 | Model joining | **done 2026-11-21**: a real COLMAP model of the synthetic clip cut into 5 pieces (different view directions, overlapping time ranges, random scale/rotation/offset) joined back: 240/240 views, max 0.04° / 0.11 % of the walk; `point_triangulator` kept every pose exactly (38,693 points, all views linked); full worker run passes; `tests/test_rig_merge.py`. **Not yet run on the real clips** |
+| Model extension | **done 2026-11-22**: deliberately broken mapper result (3 directions of panoramas 1-10 + 2 directions of 20-30, disjoint, random Sim3) -> 1 round -> 30/30 panoramas, 240/240 views, max 0.05° / 0.16 % vs the full model; fixed cameras unchanged. Real clip `083443_001-004` (979 panoramas) had reached only 352 before this (COLMAP pieces 0-353, 392-574, 567-695, ... with 1-8 panorama overlaps) — re-run pending |
 | Real-world batch (5 clips, 14 views, High) | 3 succeeded; 2 failed at 26 % / 16 % placed — logs showed COLMAP split each walk into many direction-wise models (largest 604 / 289 views), only the largest was used → model joining above; re-run pending |
 | Real-world 360 footage | first real run (5.7K, 192 s, 14 views, High) **failed at camera reconstruction: 347/5600 views (6 %)** — fixes above, re-run pending |
 | Real-world 360 footage (older note) | **not run yet** (masking not yet exercised on real moving people/traffic) |

@@ -60,6 +60,8 @@
     "densifyGradThresh": [0.00001, 0.01],
     "cullScaleThresh": [0.01, 5.0],
     "matchingMethod": ["sequential", "exhaustive", "vocab_tree"],
+    "cameraSolver": ["colmap", "glomap"],
+    "globalRefinement": ["thorough", "balanced", "fast"],
     "maskGroups": ["people", "vehicles", "animals", "sky"],
     "maskDilatePx": [0, 64],
     "method": ["splatfacto", "splatfacto-big"]

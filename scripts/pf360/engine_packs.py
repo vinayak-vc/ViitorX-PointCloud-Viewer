@@ -186,11 +186,19 @@ def build_runtime(engines: Path, out: Path) -> dict:
 
 
 def build_colmap(engines: Path, out: Path) -> dict:
-    env = engines / "colmap-conda"
-    exe = env / "Library" / "bin" / "colmap.exe"
+    return build_conda_tool(engines, out, "colmap", "colmap-conda", "colmap")
+
+
+def build_conda_tool(engines: Path, out: Path, pack_id: str, env_name: str, tool: str) -> dict:
+    """Zips a conda-forge env holding one CLI tool (COLMAP, GLOMAP); build-time files are left out.
+
+    GLOMAP env (developers, once): micromamba create -p %LOCALAPPDATA%\ViitorX\PointForge\engines\glomap-conda
+    -c conda-forge --override-channels "glomap=1.2.0=cuda_129*"   (~1 GB download)."""
+    env = engines / env_name
+    exe = env / "Library" / "bin" / (tool + ".exe")
     if not exe.is_file():
-        raise SystemExit("COLMAP conda env not found: " + str(env))
-    meta = sorted(env.glob("conda-meta/colmap-*.json"))
+        raise SystemExit("%s conda env not found: %s" % (tool, env))
+    meta = sorted(env.glob("conda-meta/%s-[0-9]*.json" % tool))
     version = json.loads(meta[-1].read_text())["version"] if meta else "?"
     skip_dirs = {"pkgs", "include", "libs", "Library/include", "Library/cmake", "Library/mkspecs", "Library/doc",
                  "Library/share/doc", "Library/qml", "Library/translations", "Library/phrasebooks"}
@@ -200,11 +208,33 @@ def build_colmap(engines: Path, out: Path) -> dict:
         # import / static libraries are build-time only
         return (low.startswith("library/lib/") and low.endswith((".lib", ".a"))) or low.endswith(".pdb")
 
-    zb = ZipBuilder(out / "colmap-conda.zip")
-    zb.add_tree(env, "colmap-conda", skip_dir=lambda rel: rel in skip_dirs, skip_file=skip_file)
+    zb = ZipBuilder(out / (env_name + ".zip"))
+    zb.add_tree(env, env_name, skip_dir=lambda rel: rel in skip_dirs, skip_file=skip_file)
     rec = zb.close()
-    log("colmap: %d files, %.2f GB -> %.2f GB" % (rec["fileCount"], rec["installedBytes"] / 1e9, rec["size"] / 1e9))
-    return {"id": "colmap", "version": version, "installDir": "colmap-conda", "postInstall": "", "files": [rec]}
+    log("%s: %d files, %.2f GB -> %.2f GB" % (pack_id, rec["fileCount"], rec["installedBytes"] / 1e9, rec["size"] / 1e9))
+    return {"id": pack_id, "version": version, "installDir": env_name, "postInstall": "", "files": [rec]}
+
+
+# COLMAP 3.11's (FLANN-format) vocabulary tree, 256K words: COLMAP's recommendation for 10k-100k images.
+VOCAB_TREE = "vocab_tree_flickr100K_words256K.bin"
+VOCAB_TREE_SRC = "https://demuc.de/colmap/" + VOCAB_TREE
+
+
+def build_vocab_tree(engines: Path, out: Path) -> dict:
+    """Mirrors the vocabulary tree into the packs folder (served from our own Hugging Face repo, pinned
+    by SHA-256, so installs do not depend on the original host).
+    Developers, once: download VOCAB_TREE_SRC into engines\models\colmap-vocab-tree\."""
+    import shutil
+    src = engines / "models" / "colmap-vocab-tree" / VOCAB_TREE
+    if not src.is_file():
+        raise SystemExit("vocabulary tree missing (download %s into %s)" % (VOCAB_TREE_SRC, src.parent))
+    dst = out / VOCAB_TREE
+    if not dst.is_file() or dst.stat().st_size != src.stat().st_size:
+        shutil.copyfile(src, dst)
+    rec = {"name": VOCAB_TREE, "kind": "file", "size": dst.stat().st_size, "sha256": sha256_file(dst)}
+    log("vocab-tree: %.2f GB" % (rec["size"] / 1e9))
+    return {"id": "vocab-tree", "version": "flickr100K-256K", "installDir": "models/colmap-vocab-tree",
+            "postInstall": "", "files": [rec]}
 
 
 def build_ffmpeg(ffmpeg_dir: Path, out: Path) -> dict:
@@ -236,13 +266,15 @@ def cmd_build(a) -> None:
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
     engines = Path(a.engines) if a.engines else engines_root()
-    only = set(a.only.split(",")) if a.only else {"pf360-runtime", "colmap", "ffmpeg"}
+    only = set(a.only.split(",")) if a.only else {"pf360-runtime", "colmap", "ffmpeg", "glomap", "vocab-tree"}
     manifest_path = out / "packs.json"
     packs = json.loads(manifest_path.read_text()) if manifest_path.is_file() else {}
     t0 = time.time()
     builders = [("ffmpeg", lambda: build_ffmpeg(Path(a.ffmpeg_dir) if a.ffmpeg_dir else find_ffmpeg_dir(), out)),
                 ("colmap", lambda: build_colmap(engines, out)),
-                ("pf360-runtime", lambda: build_runtime(engines, out))]
+                ("pf360-runtime", lambda: build_runtime(engines, out)),
+                ("glomap", lambda: build_conda_tool(engines, out, "glomap", "glomap-conda", "glomap")),
+                ("vocab-tree", lambda: build_vocab_tree(engines, out))]
     for pid, fn in builders:
         if pid in only:
             packs[pid] = fn()
@@ -261,6 +293,15 @@ PACK_TEXT = {
     "ffmpeg": ("FFmpeg", "Reads the 360 video and extracts frames.",
                "FFmpeg GPL-3.0 build (gyan.dev). Run as a separate program; the GPL source offer applies to these "
                "binaries.", True),
+    "glomap": ("GLOMAP fast camera solver (optional)",
+               "Global structure-from-motion: solves all cameras at once instead of adding them one by one. "
+               "Often several times faster than COLMAP's mapper on long walks (CUDA build, conda-forge).",
+               "GLOMAP BSD-3; bundled libraries (Ceres, SuiteSparse, Boost) under their own licences; NVIDIA CUDA "
+               "libraries under the NVIDIA CUDA EULA (redistributable components).", False),
+    "vocab-tree": ("Loop detection vocabulary (optional)",
+                   "COLMAP vocabulary tree (Flickr100K, 256K words). Finds images of the same place anywhere "
+                   "in the video, so pieces the camera path broke into can be joined.",
+                   "COLMAP BSD-3 (vocabulary tree published by the COLMAP authors).", False),
     "mask-model": ("Masking model (optional)",
                    "UperNet-ConvNeXt segmentation model. Hides people, vehicles, animals or sky during "
                    "reconstruction.", "MIT (openmmlab/upernet-convnext-base)", False),
@@ -282,10 +323,38 @@ def mask_model_pack() -> dict:
             "postInstall": "", "files": files}
 
 
-def make_catalog(packs: dict, base_url: str) -> dict:
+def fetch_live_catalog(url: str, public_key_hex: str = "") -> dict:
+    """The currently published catalog (to keep its packs when publishing only new ones).
+    With `public_key_hex` its signature is checked against that key."""
+    import urllib.request
+    with urllib.request.urlopen(url, timeout=60) as r:
+        data = r.read()
+    if public_key_hex:
+        with urllib.request.urlopen(url + ".sig", timeout=60) as r:
+            sig = r.read().decode("ascii").strip()
+        if not verify_bytes(public_key_hex, data, sig):
+            raise SystemExit("live catalog signature does not verify: " + url)
+    cat = json.loads(data.decode("utf-8"))
+    if cat.get("schema") != CATALOG_SCHEMA:
+        raise SystemExit("live catalog has schema %r, expected %d" % (cat.get("schema"), CATALOG_SCHEMA))
+    return cat
+
+
+def make_catalog(packs: dict, base_url: str, keep: dict = None) -> dict:
+    """`keep`: a live catalog whose entries are reused (same URLs, already pinned to their upload
+    commit) for every pack NOT built locally - so new packs can be added without re-uploading
+    the big ones."""
+    kept = {e["id"]: e for e in (keep or {}).get("packs", [])}
     out = []
-    for pid in ("pf360-runtime", "colmap", "ffmpeg", "mask-model"):
+    for pid in ("pf360-runtime", "colmap", "ffmpeg", "mask-model", "glomap", "vocab-tree"):
+        if pid not in packs and pid in kept:
+            out.append(kept[pid])
+            log("keeping the published %s %s" % (pid, kept[pid].get("version")))
+            continue
         p = mask_model_pack() if pid == "mask-model" else packs.get(pid)
+        if not p and not PACK_TEXT[pid][3]:
+            log("optional pack not built, left out of the catalog: " + pid)
+            continue
         if not p:
             raise SystemExit("pack not built: " + pid)
         title, desc, lic, required = PACK_TEXT[pid]
@@ -309,7 +378,8 @@ def make_catalog(packs: dict, base_url: str) -> dict:
 
 def cmd_catalog(a) -> None:
     packs = json.loads((Path(a.packs_dir) / "packs.json").read_text())
-    cat = make_catalog(packs, a.base_url)
+    keep = fetch_live_catalog(a.keep_from, a.keep_key_hex) if a.keep_from else None
+    cat = make_catalog(packs, a.base_url, keep)
     Path(a.out).write_text(json.dumps(cat, indent=1), encoding="utf-8")
     log("wrote " + a.out)
 
@@ -441,7 +511,8 @@ def cmd_publish(a) -> None:
                                allow_patterns=names, commit_message="engine packs")
     rev = commit.oid
     prefix = "https://huggingface.co/" + ("datasets/" if a.repo_type == "dataset" else "") + a.repo
-    cat = make_catalog(packs, "%s/resolve/%s" % (prefix, rev))   # pack URLs pinned to this commit
+    keep = fetch_live_catalog(a.keep_from, a.keep_key_hex) if a.keep_from else None
+    cat = make_catalog(packs, "%s/resolve/%s" % (prefix, rev), keep)   # new pack URLs pinned to this commit
     data = json.dumps(cat, indent=1).encode("utf-8")
     sig = sign_bytes(key, data)
     (packs_dir / "catalog.json").write_bytes(data)
@@ -460,7 +531,7 @@ def main(argv=None) -> None:
     b.add_argument("--out", required=True)
     b.add_argument("--engines", help="engines root (default %%LOCALAPPDATA%%\\ViitorX\\PointForge\\engines)")
     b.add_argument("--ffmpeg-dir", help="FFmpeg folder containing bin\\ffmpeg.exe (default: from PATH)")
-    b.add_argument("--only", help="comma list: pf360-runtime,colmap,ffmpeg")
+    b.add_argument("--only", help="comma list: pf360-runtime,colmap,ffmpeg,glomap,vocab-tree")
     k = sub.add_parser("keygen", help="create the catalog signing key")
     k.add_argument("--private-key", required=True)
     k.add_argument("--header", default=str(KEY_HEADER), help="C++ header to write the public key into")
@@ -471,6 +542,8 @@ def main(argv=None) -> None:
     c.add_argument("--packs-dir", required=True)
     c.add_argument("--base-url", required=True)
     c.add_argument("--out", required=True)
+    c.add_argument("--keep-from", help="live catalog URL: reuse its entries for packs not built locally")
+    c.add_argument("--keep-key-hex", default="", help="public key (hex) to verify the --keep-from catalog")
     s = sub.add_parser("sign", help="write <catalog>.sig")
     s.add_argument("--catalog", required=True)
     s.add_argument("--private-key", required=True)
@@ -484,6 +557,8 @@ def main(argv=None) -> None:
     p.add_argument("--packs-dir", required=True)
     p.add_argument("--private-key", required=True)
     p.add_argument("--no-passphrase", action="store_true")
+    p.add_argument("--keep-from", help="live catalog URL: keep its packs (e.g. add only glomap + vocab-tree)")
+    p.add_argument("--keep-key-hex", default="", help="public key (hex) to verify the --keep-from catalog")
     a = ap.parse_args(argv)
     {"build": cmd_build, "keygen": cmd_keygen, "catalog": cmd_catalog, "sign": cmd_sign, "verify": cmd_verify,
      "publish": cmd_publish}[a.cmd](a)

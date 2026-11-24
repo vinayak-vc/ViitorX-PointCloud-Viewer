@@ -128,6 +128,21 @@ private:
     int viewsIdx = 0;            // 0 -> 8, 1 -> 14
     float crop[4] = {0, 0, 0, 0};   // top, bottom, left, right
     int matchingIdx = 0;         // sequential, exhaustive, vocab_tree
+    // camera solve (optional engine packs "glomap" / "vocab-tree")
+    int solverIdx = 0;           // 0 COLMAP incremental, 1 GLOMAP global
+    bool loopDetection = false;
+    int refineIdx = 1;           // thorough, balanced, fast
+    bool gpuBA = false;
+    void drawCameraSolve(Recon360PanelHost& host);
+    void fetchCatalog(Recon360PanelHost& host);
+    void pollCatalog();
+    void pollEngineJob(Recon360PanelHost& host);   // re-checks packs + doctor when an install finished
+    bool catalogAutoTried = false;
+    // Optional packs the chosen settings need that are not installed yet (by catalog id).
+    std::vector<std::string> neededPacks() const;
+    // Queues the download of neededPacks() ahead of the reconstruction (same FIFO job queue).
+    void queueNeededPacks(Recon360PanelHost& host);
+    bool packOptionRow(Recon360PanelHost& host, const char* packId, bool installed, bool wanted);
 
     // masking (optional add-on)
     bool maskEnabled = false;
