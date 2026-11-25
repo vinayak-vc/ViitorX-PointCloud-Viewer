@@ -2529,7 +2529,7 @@ int main(int argc, char** argv) {
 
     auto startVideoExport = [&]() -> bool {
         const CamPath& path = allCamPaths[loadedDir];
-        if (!octreeActive || path.keys.size() < 2 || path.duration() <= 0.01) return false;
+        if (!octreeLoaded || path.keys.size() < 2 || path.duration() <= 0.01) return false;
         if (vex.active) return false;
         vex.cfg.width = kExportRes[exportResIdx][0];
         vex.cfg.height = kExportRes[exportResIdx][1];
@@ -2735,12 +2735,12 @@ int main(int argc, char** argv) {
     // cloud, start the export via the exact dialog path, quit when it ends.
     bool exportHookArmed = false;
     if (!exportVideoOnStart.empty()) {
-        if (!octreeActive) {
-            logError("--export-video: needs an octree cloud loaded (splats cannot export video)");
+        if (!octreeLoaded) {
+            logError("--export-video: needs a cloud loaded");
         } else {
             CamPath& cp = allCamPaths[loadedDir];
             cp.keys.clear();
-            const double cs = activeStore().cube(activeStore().rootIndex()).size;
+            const double cs = activeCloudSize();
             const float dist = (float)(cs * 0.5 / std::tan(glm::radians(cam.fovY * 0.5f)) * 1.4);
             const Camera savedCam = cam;
             for (int i = 0; i < 3; ++i) {
@@ -3665,10 +3665,12 @@ int main(int argc, char** argv) {
             if (vex.active) {
                 // Extra absorption beyond the main loop's uploadsPerFrame cap:
                 // settling wants loads on the GPU as fast as they decode.
-                for (int i = 0; i < 512; ++i) {
-                    LoadResult res;
-                    if (!activeStore().popResult(res)) break;
-                    activeRenderer().upload(res.nodeIndex, res.verts);
+                if (octreeActive) {
+                    for (int i = 0; i < 512; ++i) {
+                        LoadResult res;
+                        if (!activeStore().popResult(res)) break;
+                        activeRenderer().upload(res.nodeIndex, res.verts);
+                    }
                 }
                 ensureExportFbo(vex.cfg.width, vex.cfg.height);
                 const Uint64 stepStart = SDL_GetPerformanceCounter();
