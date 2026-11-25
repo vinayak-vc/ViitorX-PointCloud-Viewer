@@ -3,7 +3,19 @@
 ## Session (2026-11-25) - LichtFeld-Studio integration & A/B tooling (cards BT-1, BT-2, BT-3, BT-8)
 
 - **Role**: Antigravity (Senior C++ Implementer); Claude (Tech Lead / Architect / Reviewer).
-- **BT-12 Completed & In Review (Tile training for large scenes)**:
+- **BT-14 In Review (Packaging LichtFeld-Studio as downloadable engine pack + GPL-3.0 compliance)**:
+  - **Distribution Build (`C:\lfs\build_lfs_dist.cmd`, `C:\lfs\dist-lichtfeld`)**:
+    - Single MSVC toolset (`14.44.35207`) for both vcpkg and app via `C:\lfs\overlay-triplets\x64-windows.cmake` — `compat_msvc_stl.c` dropped completely (verified via `dumpbin /imports` on `LichtFeld-Studio.exe` and `glslang.dll`).
+    - Explicit CUDA archs `75-real;80-real;86-real;89-real;90-real;120-real;120-virtual` + `BUILD_PORTABLE=ON` (`C:\lfs\patches\lfs-dist-cuda-arch.patch`), plus `${CUDAToolkit_BIN_DIR}/x64` for CUDA 13.0 `nvjpeg64_13.dll`, and `-Dmax_align_t=double` in `C:\lfs\overlay-ports\libplacebo\portfile.cmake`.
+    - `LichtFeld-Studio.exe`: `962,890,240` bytes (`918.3 MB`), SHA-256 `7B480D598AB3D18DC8509868BF760320F746D430198450EF3119160EDB001201`.
+    - Verified: `--help` exit `0`; 10 s MRNF 30k parity on `_preview10s_ab\data`: `22.996 dB` PSNR, `0.7779` SSIM, `0.2163` LPIPS (`1,660,000` splats).
+  - **Engine Pack & Viewer UI**:
+    - `scripts/pf360/engine_packs.py`: added `build_lichtfeld()` and `PACK_TEXT["lichtfeld"]` (`installDir="lichtfeld"`, optional); built `C:\lfs\engine-packs\lichtfeld.zip` (`1,498` files, `4.81 GB -> 0.96 GB`, SHA-256 `3544e91ab54cb14db10fe18fe0e929bcab35b61f1029b0d90f6905f0dff12742`) with `LICENSE`, `LICENSE-EXCEPTION.txt`, `THIRD-PARTY-LICENSES.md`, `BUILD_NOTES.md`, `SOURCE_OFFER.txt`, and `patches/`.
+    - `Recon360Panel.{h,cpp}` & `main.cpp`: added `"Download LichtFeld engine"` button in wizard and under `"Edit in LichtFeld..."` when missing; added `Help > Third-party licences` modal + About-dialog line.
+    - Verified real `lichtfeld.zip` install via signed loopback HTTP catalog (`pf360hosttest.exe --install`, `7 s`). Stopped before signing/HF upload (Owner runs publish/sign).
+- **BT-21 Completed (Accepted in [C-28], commit `fb82e6e`)**:
+  - Gravity-aligned transforms + seed PLY (`level_scene_for_lfs()` in `lichtfeld_engine.py`, isolated to `training/lfs_input/` with relative `file_path` back to `processed/images`, leaving `processed/` byte-identical), `"camerasFile"` in sidecar + `Recon360.cpp` camera path, and `AUTO_TILE_VIEW_THRESHOLD = 20000` in `tiles.py`. Full-video proof: `21.847 dB` PSNR with dead-level horizon.
+- **BT-12 Completed (Accepted in [C-22], commit `2ebd01c`)**:
   - **Architecture & Implementation (`tools/pf360/pf360/tiles.py`)**:
     - `plan_tiles_from_cameras` / `plan_tiles_from_transforms`: analyzes camera trajectory in transforms frame, identifies principal walk dimension ($Y$ axis, extent 11.64 units), partitions camera bounds into $N$ equal segments with fractional overlap (`overlap_fraction = 0.15` / 15% of walk extent) and wide scene margin (2000 units on non-walk axes to preserve full sky, horizon, and distant geometry).
     - `box_to_lfs`: converts transforms bounding boxes $(x, y, z)$ to LichtFeld COLMAP frame $(x, -y, -z)$ ensuring each minimum strictly precedes its maximum.

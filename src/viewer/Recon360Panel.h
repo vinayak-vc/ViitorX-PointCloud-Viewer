@@ -37,6 +37,8 @@ public:
     void draw(Recon360PanelHost& host);
     // Tool-path settings + diagnostic (also embedded in Edit > Preferences).
     void drawEnvironmentSettings(Recon360PanelHost& host);
+    // Inline "Download LichtFeld engine" button when LichtFeld-Studio.exe is missing.
+    void drawLichtfeldDownloadButton(Recon360PanelHost& host);
     // True when a dropped file looks like a video this wizard accepts.
     static bool isVideoFile(const std::string& path);
     // Releases the GL preview texture (call before GL context teardown).

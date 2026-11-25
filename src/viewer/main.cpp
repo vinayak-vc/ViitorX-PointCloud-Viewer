@@ -2153,6 +2153,7 @@ int main(int argc, char** argv) {
     bool firstJobRevealed = false;     // first-ever job auto-opens the Jobs panel once
     bool resetDockLayout = false;      // Window > Reset Layout
     bool aboutOpenReq = false;
+    bool thirdPartyOpenReq = false;
     std::vector<Toast> toasts;
     uint32_t lastMtimeCheckTicks = 0;
     bool showLfsRunningModal = false;
@@ -4609,6 +4610,7 @@ int main(int argc, char** argv) {
                     if (ImGui::MenuItem("Keyboard Shortcuts", "F1")) showHelp = true;
                     if (ImGui::MenuItem("Command Palette", "Ctrl+P")) { showPalette = true; paletteBuf[0] = 0; }
                     ImGui::Separator();
+                    if (ImGui::MenuItem("Third-party licences")) thirdPartyOpenReq = true;
                     if (ImGui::MenuItem("About ViitorX PointCloud Viewer")) aboutOpenReq = true;
                     ImGui::EndMenu();
                 }
@@ -4807,6 +4809,15 @@ int main(int argc, char** argv) {
                             }
                             ImGui::EndDisabled();
                             if (!editLfsTip.empty()) ImGui::SetItemTooltip("%s", editLfsTip.c_str());
+                            if (!canEditLfs && getCachedLfsExe().empty() &&
+                                !c.dir.empty() && pf::SplatReader::detectFormat(c.dir) == pf::SplatFileFormat::PlyGaussians) {
+                                pf::Recon360PanelHost h;
+                                h.jobs = &jobs;
+                                h.settings = &recon360Settings;
+                                h.uiScale = S;
+                                h.showJobsPanel = [&] { showJobsPanel = true; };
+                                recon360Panel.drawLichtfeldDownloadButton(h);
+                            }
 
                             if (watchedSplatChanged && !offeredReloadPath.empty()) {
                                 ImGui::Spacing();
@@ -6844,6 +6855,32 @@ int main(int argc, char** argv) {
                 ImGui::Text("ViitorX PointCloud Viewer 0.1.0");
                 ImGui::TextDisabled("Out-of-core point cloud importer + viewer");
                 ImGui::TextDisabled("SDL2 - OpenGL 3.3 - Dear ImGui (docking)");
+                ImGui::TextDisabled("Optional 360 engines (incl. LichtFeld-Studio, GPL-3.0): Help > Third-party licences");
+                ImGui::Spacing();
+                if (ImGui::Button("Close", ImVec2(100, 0))) ImGui::CloseCurrentPopup();
+                ImGui::EndPopup();
+            }
+
+            // ---- Third-party licences modal ----------------------------------------
+            if (thirdPartyOpenReq) { ImGui::OpenPopup("Third-party licences"); thirdPartyOpenReq = false; }
+            ImGui::SetNextWindowPos(ImVec2(winW * 0.5f, winH * 0.5f), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+            if (ImGui::BeginPopupModal("Third-party licences", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+                ImGui::Text("Optional Downloadable 360 Engines (separate programs)");
+                ImGui::Separator();
+                ImGui::Spacing();
+                ImGui::Text("LichtFeld-Studio (GPL-3.0-or-later + NVIDIA GPU Library Exception v1.0)");
+                ImGui::TextWrapped("Runs as a separate program communicating only by command line and files. "
+                                   "Installed into %%LOCALAPPDATA%%\\ViitorX\\PointForge\\engines\\lichtfeld\\ "
+                                   "(with LICENSE, LICENSE-EXCEPTION.txt, THIRD-PARTY-LICENSES.md, patches/, and SOURCE_OFFER.txt).");
+                ImGui::TextDisabled("Source: https://github.com/MrNeRF/LichtFeld-Studio (commit 8c366f5)");
+                ImGui::Spacing();
+                ImGui::Text("FFmpeg (GPL-3.0, gyan.dev build) - separate program");
+                ImGui::Text("Nerfstudio & gsplat (Apache-2.0) | PyTorch, COLMAP, GLOMAP (BSD-3)");
+                ImGui::Text("NVIDIA CUDA Runtime libraries (NVIDIA CUDA EULA redistributable components)");
+                ImGui::Spacing();
+                ImGui::Text("Viewer Libraries");
+                ImGui::Separator();
+                ImGui::TextDisabled("SDL2 (zlib) | GLEW (Modified BSD / MIT) | Dear ImGui (MIT) | glm (MIT) | nlohmann/json (MIT) | zstd (BSD-3)");
                 ImGui::Spacing();
                 if (ImGui::Button("Close", ImVec2(100, 0))) ImGui::CloseCurrentPopup();
                 ImGui::EndPopup();

@@ -944,6 +944,37 @@ void Recon360Panel::pollEngineJob(Recon360PanelHost& host) {
     startDoctor(host, false);           // re-check with the new engines
 }
 
+void Recon360Panel::drawLichtfeldDownloadButton(Recon360PanelHost& host) {
+    if (!host.settings) return;
+    fetchCatalog(host);
+    pollCatalog();
+    pollEngineJob(host);
+    const EnginePack* p = catalogOk ? catalog.find("lichtfeld") : nullptr;
+    const bool downloading = engineJob && !engineJob->finished() &&
+                             std::find(engineJob->enginePackIds.begin(), engineJob->enginePackIds.end(),
+                                       std::string("lichtfeld")) != engineJob->enginePackIds.end();
+    if (downloading) {
+        ImGui::TextColored(kWarn, "Downloading LichtFeld engine... %d%%",
+                           (int)(engineJob->progress.load() * 100.0f));
+    } else if (p) {
+        ImGui::BeginDisabled(!host.jobs || (engineJob && !engineJob->finished()));
+        std::string label = "Download LichtFeld engine (" + fmtBytes(p->downloadBytes()) + ")";
+        if (ImGui::Button(label.c_str()) && host.jobs) {
+            engineJob = host.jobs->enqueueEnginePacks(catalog, {"lichtfeld"});
+            if (host.showJobsPanel) host.showJobsPanel();
+        }
+        ImGui::EndDisabled();
+        ImGui::SetItemTooltip("%s\n\nLicence: %s", p->description.c_str(), p->license.c_str());
+    } else if (catalogFut.valid()) {
+        ImGui::TextDisabled("Checking LichtFeld engine download...");
+    } else {
+        if (ImGui::Button("Download LichtFeld engine...")) {
+            show();
+        }
+        ImGui::SetItemTooltip("Configure or download the LichtFeld engine pack in Preferences > 360 Reconstruction > Environment.");
+    }
+}
+
 // Fetches the signed catalog in the background (once per session; Engines > Refresh retries), so
 // optional packs can show their size and be queued ahead of a job.
 void Recon360Panel::fetchCatalog(Recon360PanelHost& host) {
@@ -1617,6 +1648,9 @@ void Recon360Panel::drawStepQuality(Recon360PanelHost& host) {
     }
     ImGui::EndDisabled();
     if (!lfsAvail && !lfsDisabledTip.empty()) ImGui::SetItemTooltip("%s", lfsDisabledTip.c_str());
+    if (!lfsAvail && lfsExe.empty()) {
+        drawLichtfeldDownloadButton(host);
+    }
 
     // Impact text using measured A/B numbers
     if (engineIdx == 0) {

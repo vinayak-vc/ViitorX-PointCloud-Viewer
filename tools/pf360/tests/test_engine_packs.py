@@ -126,6 +126,40 @@ class SigningTest(unittest.TestCase):
         self.assertFalse(vt["required"])
         self.assertEqual(vt["files"][0]["url"], "https://huggingface.co/o/r/resolve/NEW/t.bin")
 
+    def test_lichtfeld_pack_includes_compliance_and_catalog_entry(self):
+        import zipfile
+        ep = load_engine_packs()
+        with tempfile.TemporaryDirectory() as d:
+            lfs_dir = Path(d, "dist-lichtfeld")
+            out_dir = Path(d, "out")
+            lfs_dir.mkdir()
+            out_dir.mkdir()
+            (lfs_dir / "LichtFeld-Studio.exe").write_bytes(b"MZ")
+            (lfs_dir / "LICENSE").write_text("GPL-3.0", encoding="utf-8")
+            (lfs_dir / "LICENSE-EXCEPTION.txt").write_text("NVIDIA Exception", encoding="utf-8")
+            (lfs_dir / "THIRD-PARTY-LICENSES.md").write_text("# Notices", encoding="utf-8")
+            rec = ep.build_lichtfeld(lfs_dir, out_dir, version="8c366f5")
+            self.assertEqual(rec["id"], "lichtfeld")
+            self.assertEqual(rec["installDir"], "lichtfeld")
+            zip_path = out_dir / "lichtfeld.zip"
+            self.assertTrue(zip_path.is_file())
+            with zipfile.ZipFile(zip_path) as zf:
+                names = set(zf.namelist())
+            self.assertIn("lichtfeld/LichtFeld-Studio.exe", names)
+            self.assertIn("lichtfeld/LICENSE", names)
+            self.assertIn("lichtfeld/LICENSE-EXCEPTION.txt", names)
+            self.assertIn("lichtfeld/THIRD-PARTY-LICENSES.md", names)
+            self.assertIn("lichtfeld/SOURCE_OFFER.txt", names)
+            live = {"schema": 1, "packs": [
+                {"id": pid, "version": "old", "required": True,
+                 "files": [{"name": pid + ".zip", "url": "https://huggingface.co/o/r/resolve/OLD/" + pid + ".zip"}]}
+                for pid in ("pf360-runtime", "colmap", "ffmpeg")]}
+            cat = ep.make_catalog({"lichtfeld": rec}, "https://huggingface.co/o/r/resolve/NEW", keep=live)
+            lfs_entry = [p for p in cat["packs"] if p["id"] == "lichtfeld"][0]
+            self.assertFalse(lfs_entry["required"])
+            self.assertEqual(lfs_entry["installDir"], "lichtfeld")
+            self.assertIn("GPL-3.0", lfs_entry["license"])
+
 
 if __name__ == "__main__":
     unittest.main()

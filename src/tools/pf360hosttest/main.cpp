@@ -842,6 +842,50 @@ static void testEnginePacks(const fs::path& tmp) {
         CHECK(!engineFetchCatalog(server.url("catalog.json"), root.u8string(), c5, err, key.pubHex));
         CHECK(err.find("INVALID") != std::string::npos);
     }
+
+    // --- lichtfeld optional engine pack via loopback catalog
+    {
+        const fs::path lfsZip = srv / "lichtfeld.zip";
+        writeText(src / "lichtfeld" / "LichtFeld-Studio.exe", "MZ-dummy-lfs");
+        writeText(src / "lichtfeld" / "LICENSE", "GPL-3.0");
+        writeText(src / "lichtfeld" / "LICENSE-EXCEPTION.txt", "NVIDIA exception");
+        writeText(src / "lichtfeld" / "SOURCE_OFFER.txt", "source offer");
+        const std::wstring lfsTar = L"tar.exe -a -c -f \"" + lfsZip.wstring() + L"\" -C \"" +
+                                    src.wstring() + L"\" lichtfeld";
+        CHECK(_wsystem(lfsTar.c_str()) == 0);
+        std::string lfsSha;
+        CHECK(engineSha256File(lfsZip.u8string(), lfsSha));
+        const uint64_t lfsSz = fs::file_size(lfsZip);
+        nlohmann::json j = catalogJson(401, zipSha);
+        j["packs"].push_back({
+            {"id", "lichtfeld"},
+            {"title", "LichtFeld-Studio"},
+            {"description", "Optional 3DGS trainer"},
+            {"version", "8c366f5"},
+            {"group", "recon360"},
+            {"installDir", "lichtfeld"},
+            {"postInstall", ""},
+            {"license", "GPL-3.0-or-later + NVIDIA GPU Library Exception"},
+            {"required", false},
+            {"installedBytes", 4096},
+            {"files", nlohmann::json::array({{
+                {"name", "lichtfeld.zip"}, {"kind", "zip"}, {"url", server.url("lichtfeld.zip")},
+                {"sha256", lfsSha}, {"size", lfsSz}
+            }})}
+        });
+        publish(j);
+        EngineCatalog cLfs;
+        err.clear();
+        CHECK(engineFetchCatalog(server.url("catalog.json"), root.u8string(), cLfs, err, key.pubHex));
+        const EnginePack* lfsPack = cLfs.find("lichtfeld");
+        CHECK(lfsPack != nullptr);
+        CHECK(engineStatus(root.u8string(), *lfsPack).state == EnginePackStatus::State::Missing);
+        CHECK(engineInstallPacks(cLfs, {"lichtfeld"}, root.u8string(), cancel, nullptr, err));
+        CHECK(engineStatus(root.u8string(), *lfsPack).state == EnginePackStatus::State::Installed);
+        CHECK(fs::exists(root / "lichtfeld" / "LichtFeld-Studio.exe"));
+        CHECK(fs::exists(root / "lichtfeld" / "SOURCE_OFFER.txt"));
+        CHECK(fs::exists(root / "lichtfeld" / "LICENSE"));
+    }
 }
 #endif
 

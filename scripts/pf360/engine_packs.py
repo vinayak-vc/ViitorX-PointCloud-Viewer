@@ -262,19 +262,82 @@ def find_ffmpeg_dir() -> Path:
     return Path(exe).resolve().parent.parent
 
 
+def build_lichtfeld(lfs_dir: Path, out: Path, version: str = "8c366f5") -> dict:
+    """Packages a portable LichtFeld-Studio distribution (with GPL-3.0 licences,
+    THIRD-PARTY-LICENSES.md, BUILD_NOTES.md, overlay patches, and SOURCE_OFFER.txt)."""
+    exe = lfs_dir / "LichtFeld-Studio.exe"
+    if not exe.is_file():
+        raise SystemExit("LichtFeld-Studio.exe not found in --lichtfeld-dir: %s" % lfs_dir)
+
+    zb = ZipBuilder(out / "lichtfeld.zip")
+    root = "lichtfeld"
+    log("lichtfeld: packaging %s" % lfs_dir)
+    zb.add_tree(lfs_dir, root, skip_file=lambda rel: rel.lower().endswith((".pdb", ".lib", ".a")))
+
+    # Ensure required compliance & source-offer files are present inside the pack.
+    lfs_repo = Path(r"C:\lfs\LichtFeld-Studio")
+    for fname in ("LICENSE", "LICENSE-EXCEPTION.txt", "THIRD-PARTY-LICENSES.md"):
+        arc = root + "/" + fname
+        if arc not in zb.names:
+            for cand in (lfs_dir / fname, lfs_repo / fname):
+                if cand.is_file():
+                    zb.add(cand, arc)
+                    break
+
+    build_notes = Path(r"C:\lfs\BUILD_NOTES.md")
+    if (root + "/BUILD_NOTES.md") not in zb.names and build_notes.is_file():
+        zb.add(build_notes, root + "/BUILD_NOTES.md")
+
+    for patch_src, arc_rel in (
+        (Path(r"C:\lfs\overlay-ports\libplacebo\portfile.cmake"), "patches/overlay-ports/libplacebo/portfile.cmake"),
+        (Path(r"C:\lfs\overlay-triplets\x64-windows.cmake"), "patches/overlay-triplets/x64-windows.cmake"),
+        (Path(r"C:\lfs\patches\lfs-dist-cuda-arch.patch"), "patches/lfs-dist-cuda-arch.patch"),
+    ):
+        arc = root + "/" + arc_rel
+        if arc not in zb.names and patch_src.is_file():
+            zb.add(patch_src, arc)
+
+    if (root + "/SOURCE_OFFER.txt") not in zb.names:
+        offer = (
+            "LichtFeld-Studio Source Offer (GPL-3.0-or-later + NVIDIA GPU Library Exception v1.0)\n"
+            "===================================================================================\n\n"
+            "LichtFeld-Studio is a separate program distributed alongside ViitorX PointCloud Viewer.\n"
+            "ViitorX PointCloud Viewer communicates with LichtFeld-Studio.exe only by command-line\n"
+            "arguments and files on disk (transforms.json, .ply, stdout/stderr).\n\n"
+            "Upstream repository : https://github.com/MrNeRF/LichtFeld-Studio\n"
+            "Upstream commit     : 8c366f5\n"
+            "Local build patches : see patches/ and BUILD_NOTES.md in this folder.\n"
+            "Licenses            : see LICENSE (GPL-3.0), LICENSE-EXCEPTION.txt, and THIRD-PARTY-LICENSES.md.\n\n"
+            "Written source offer: the complete corresponding source code for this build\n"
+            "(upstream commit 8c366f5 plus the overlay port, overlay triplet, and CMake patch\n"
+            "included in patches/) is available upon request from ViitorX.\n"
+        )
+        zb.zf.writestr(root + "/SOURCE_OFFER.txt", offer)
+
+    rec = zb.close()
+    log("lichtfeld: %d files, %.2f GB -> %.2f GB" % (rec["fileCount"], rec["installedBytes"] / 1e9,
+                                                    rec["size"] / 1e9))
+    return {"id": "lichtfeld", "version": version, "installDir": "lichtfeld", "postInstall": "",
+            "files": [rec]}
+
+
 def cmd_build(a) -> None:
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
     engines = Path(a.engines) if a.engines else engines_root()
     only = set(a.only.split(",")) if a.only else {"pf360-runtime", "colmap", "ffmpeg", "glomap", "vocab-tree"}
+    if a.lichtfeld_dir and not a.only:
+        only.add("lichtfeld")
     manifest_path = out / "packs.json"
     packs = json.loads(manifest_path.read_text()) if manifest_path.is_file() else {}
     t0 = time.time()
+    lfs_dir = Path(a.lichtfeld_dir) if a.lichtfeld_dir else Path(r"C:\lfs\dist-lichtfeld")
     builders = [("ffmpeg", lambda: build_ffmpeg(Path(a.ffmpeg_dir) if a.ffmpeg_dir else find_ffmpeg_dir(), out)),
                 ("colmap", lambda: build_colmap(engines, out)),
                 ("pf360-runtime", lambda: build_runtime(engines, out)),
                 ("glomap", lambda: build_conda_tool(engines, out, "glomap", "glomap-conda", "glomap")),
-                ("vocab-tree", lambda: build_vocab_tree(engines, out))]
+                ("vocab-tree", lambda: build_vocab_tree(engines, out)),
+                ("lichtfeld", lambda: build_lichtfeld(lfs_dir, out, version=a.lichtfeld_version))]
     for pid, fn in builders:
         if pid in only:
             packs[pid] = fn()
@@ -305,6 +368,12 @@ PACK_TEXT = {
     "mask-model": ("Masking model (optional)",
                    "UperNet-ConvNeXt segmentation model. Hides people, vehicles, animals or sky during "
                    "reconstruction.", "MIT (openmmlab/upernet-convnext-base)", False),
+    "lichtfeld": ("LichtFeld-Studio training & editor engine (optional)",
+                  "Fast CUDA 3D Gaussian Splatting trainer and interactive editor (MRNF / MCMC). "
+                  "Runs as a separate program via command line and files.",
+                  "GPL-3.0-or-later + LichtFeld Studio NVIDIA GPU Library Exception v1.0 "
+                  "(commit 8c366f5; source offer in SOURCE_OFFER.txt); NVIDIA CUDA runtime libraries under "
+                  "the NVIDIA CUDA EULA (redistributable components).", False),
 }
 
 
@@ -346,7 +415,7 @@ def make_catalog(packs: dict, base_url: str, keep: dict = None) -> dict:
     the big ones."""
     kept = {e["id"]: e for e in (keep or {}).get("packs", [])}
     out = []
-    for pid in ("pf360-runtime", "colmap", "ffmpeg", "mask-model", "glomap", "vocab-tree"):
+    for pid in ("pf360-runtime", "colmap", "ffmpeg", "mask-model", "glomap", "vocab-tree", "lichtfeld"):
         if pid not in packs and pid in kept:
             out.append(kept[pid])
             log("keeping the published %s %s" % (pid, kept[pid].get("version")))
@@ -531,7 +600,9 @@ def main(argv=None) -> None:
     b.add_argument("--out", required=True)
     b.add_argument("--engines", help="engines root (default %%LOCALAPPDATA%%\\ViitorX\\PointForge\\engines)")
     b.add_argument("--ffmpeg-dir", help="FFmpeg folder containing bin\\ffmpeg.exe (default: from PATH)")
-    b.add_argument("--only", help="comma list: pf360-runtime,colmap,ffmpeg,glomap,vocab-tree")
+    b.add_argument("--lichtfeld-dir", help="Portable LichtFeld-Studio install folder (default: C:\\lfs\\dist-lichtfeld)")
+    b.add_argument("--lichtfeld-version", default="8c366f5", help="Version tag for the lichtfeld pack")
+    b.add_argument("--only", help="comma list: pf360-runtime,colmap,ffmpeg,glomap,vocab-tree,lichtfeld")
     k = sub.add_parser("keygen", help="create the catalog signing key")
     k.add_argument("--private-key", required=True)
     k.add_argument("--header", default=str(KEY_HEADER), help="C++ header to write the public key into")
