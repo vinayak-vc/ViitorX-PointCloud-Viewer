@@ -23,7 +23,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
-from . import environment, procrun, training_prep
+from . import environment, lichtfeld_engine, procrun, training_prep
 from .backend import ReconstructionBackend, StageContext, StageFailed
 from .views import perspective_size, views_per_frame, yaw_pitch_pairs
 
@@ -366,14 +366,39 @@ class NerfstudioBackend(ReconstructionBackend):
     # ------------------------------------------------------------------ env
     def check_environment(self, tools, manifest) -> List[str]:
         p: List[str] = []
+        if manifest.get("training", {}).get("engine") == "lichtfeld":
+            if not tools.lichtfeld:
+                p.append("LichtFeld-Studio executable not found (run `python -m pf360 doctor` or set PF360_LICHTFELD).")
+            smi = environment.query_nvidia_smi()
+            if smi.get("gpus"):
+                g = smi["gpus"][0]
+                driver = g.get("driver", "0")
+                try:
+                    drv_major = int(driver.split(".")[0])
+                    if drv_major < 570:
+                        p.append("LichtFeld-Studio requires NVIDIA driver >= 570 (detected driver %s)." % driver)
+                except (ValueError, IndexError):
+                    pass
+                cap = g.get("compute_cap")
+                if cap:
+                    try:
+                        if float(cap) < 7.5:
+                            p.append("LichtFeld-Studio requires GPU compute capability >= 7.5 (detected %s)." % cap)
+                    except ValueError:
+                        pass
+            else:
+                p.append("LichtFeld-Studio requires an NVIDIA GPU with driver >= 570.")
         if _masking_on(manifest) and not tools.mask_model:
             p.append("Masking is enabled but the segmentation model is not installed "
                      "(run scripts\\pf360\\setup_masking.ps1, ~0.5 GB, or turn masking off).")
         if not tools.ns_python:
             p.append("No Nerfstudio Python environment found (run `python -m pf360 doctor`).")
-        for t in ("ns-process-data", "ns-train", "ns-export"):
-            if tools.ns_python and not tools.ns(t):
-                p.append("%s not found next to %s" % (t, tools.ns_python))
+        if manifest.get("training", {}).get("engine") != "lichtfeld":
+            for t in ("ns-train", "ns-export"):
+                if tools.ns_python and not tools.ns(t):
+                    p.append("%s not found next to %s" % (t, tools.ns_python))
+        if tools.ns_python and not tools.ns("ns-process-data"):
+            p.append("ns-process-data not found next to %s" % tools.ns_python)
         if not tools.colmap:
             p.append("COLMAP not found.")
         if not tools.ffmpeg:
@@ -424,6 +449,22 @@ class NerfstudioBackend(ReconstructionBackend):
                 inputs["loopDetection"] = True
             return inputs
         if stage == "training":
+            if tr.get("engine") == "lichtfeld":
+                inputs = {
+                    "engine": "lichtfeld",
+                    "lfsStrategy": tr.get("lfsStrategy", "mrnf"),
+                    "maxGaussians": tr.get("maxGaussians", 2_000_000),
+                    "iterations": tr.get("iterations"),
+                    "downscaleFactor": tr.get("downscaleFactor"),
+                    "shDegree": tr.get("shDegree"),
+                }
+                if tr.get("seedPointCap", training_prep.DEFAULT_SEED_POINT_CAP) != training_prep.DEFAULT_SEED_POINT_CAP:
+                    inputs["seedPointCap"] = tr["seedPointCap"]
+                if tr.get("dropMisplacedPanoramas", True) is not True:
+                    inputs["dropMisplacedPanoramas"] = False
+                if tr.get("maxTrainingViews", 0):
+                    inputs["maxTrainingViews"] = tr["maxTrainingViews"]
+                return inputs
             keys = ("method", "iterations", "downscaleFactor", "shDegree", "randomSeed", "useScaleRegularization",
                     "cullAlphaThresh", "densifyGradThresh", "cullScaleThresh")
             inputs = {k: tr.get(k) for k in keys}
@@ -444,6 +485,7 @@ class NerfstudioBackend(ReconstructionBackend):
 
     def stage_outputs_exist(self, stage: str, ctx: StageContext) -> bool:
         ws = ctx.workspace
+        tr = ctx.manifest.get("training", {})
         if stage == "panorama_projection":
             return _count_images(ws.planar_dir) > 0
         if stage == "masking":
@@ -452,6 +494,9 @@ class NerfstudioBackend(ReconstructionBackend):
         if stage == "camera_reconstruction":
             return (ws.processed_dir / "transforms.json").is_file()
         if stage == "training":
+            if tr.get("engine") == "lichtfeld":
+                target = ws.training_dir / "lfs" / ("splat_%d.ply" % int(tr.get("iterations", 30000)))
+                return target.is_file()
             return self._find_config(ctx) is not None
         if stage == "export":
             return ws.export_ply.is_file()
@@ -1060,6 +1105,8 @@ class NerfstudioBackend(ReconstructionBackend):
         return args
 
     def _training(self, ctx: StageContext) -> Dict[str, Any]:
+        if ctx.manifest.get("training", {}).get("engine") == "lichtfeld":
+            return lichtfeld_engine.train_lfs(ctx)
         ws, tr = ctx.workspace, ctx.manifest["training"]
         tool = ctx.tools.ns("ns-train")
         method = tr["method"]
@@ -1216,6 +1263,8 @@ class NerfstudioBackend(ReconstructionBackend):
         return None
 
     def _export(self, ctx: StageContext) -> Dict[str, Any]:
+        if ctx.manifest.get("training", {}).get("engine") == "lichtfeld":
+            return lichtfeld_engine.export_lfs(ctx)
         ws = ctx.workspace
         cfg = self._find_config(ctx)
         if cfg is None:
@@ -1238,6 +1287,13 @@ class NerfstudioBackend(ReconstructionBackend):
                 raise StageFailed("ns-export reported success but wrote no .ply in %s" % ws.export_dir)
             newest = max(changed, key=lambda p: p.stat().st_mtime)
             newest.replace(target)
+        # Write sidecar for Nerfstudio output
+        sidecar = {"engine": "nerfstudio", "frame": "ns_dataparser"}
+        try:
+            with open(str(target) + ".pf360.json", "w", encoding="utf-8") as sf:
+                json.dump(sidecar, sf, indent=2)
+        except OSError:
+            pass
         return {"path": str(target), "fileSizeBytes": target.stat().st_size}
 
     def result_ply(self, ctx: StageContext) -> Optional[Path]:

@@ -971,6 +971,14 @@ bool recon360Run(const Recon360JobSpec& spec, const Recon360Settings& s, std::at
 
 bool recon360IsZUpOutput(const std::string& plyPath) {
     std::error_code ec;
+    const fs::path sidecar = fs::path(widen(plyPath + ".pf360.json"));
+    if (fs::exists(sidecar, ec)) {
+        try {
+            std::ifstream f(sidecar);
+            json j = json::parse(f);
+            if (j.value("upAxis", "") == "z_up") return true;
+        } catch (...) {}
+    }
     const fs::path ply = fs::path(widen(plyPath));
     const fs::path report = ply.parent_path().parent_path() / L"reconstruction_report.json";
     if (!fs::exists(report, ec)) return false;
@@ -988,9 +996,59 @@ bool recon360IsZUpOutput(const std::string& plyPath) {
 Recon360CameraPath recon360CameraPath(const std::string& plyPath) {
     Recon360CameraPath out;
     std::error_code ec;
-    const fs::path ws = fs::path(widen(plyPath)).parent_path().parent_path();
-    if (!fs::exists(ws / L"reconstruction_report.json", ec)) return out;
+    const fs::path ply = fs::path(widen(plyPath));
+    const fs::path ws = ply.parent_path().parent_path();
     const fs::path tfPath = ws / L"processed" / L"transforms.json";
+    if (!fs::exists(tfPath, ec)) return out;
+
+    // Check sidecar or report to determine coordinate frame
+    std::string frameType = "ns_dataparser";
+    const fs::path sidecarPath = fs::path(widen(plyPath + ".pf360.json"));
+    if (fs::exists(sidecarPath, ec)) {
+        try {
+            std::ifstream sf(sidecarPath);
+            json sc = json::parse(sf);
+            frameType = sc.value("frame", "ns_dataparser");
+        } catch (...) {}
+    } else if (fs::exists(ws / L"reconstruction_report.json", ec)) {
+        try {
+            std::ifstream rf(ws / L"reconstruction_report.json");
+            json rj = json::parse(rf);
+            if (rj.contains("training") && rj["training"].value("engine", "") == "lichtfeld") {
+                frameType = "transforms";
+            }
+        } catch (...) {}
+    }
+
+    if (frameType == "transforms") {
+        try {
+            std::ifstream ftf(tfPath);
+            const json tf = json::parse(ftf);
+            double upSum[3] = {0, 0, 0};
+            for (const json& fr : tf.at("frames")) {
+                const json& m = fr.at("transform_matrix");
+                std::array<double, 3> P{}, F{};
+                for (int r = 0; r < 3; ++r) {
+                    P[r] = m.at(r).at(3).get<double>();
+                    F[r] = -m.at(r).at(2).get<double>();   // OpenGL camera looks down -Z
+                    upSum[r] += m.at(r).at(1).get<double>();
+                }
+                const double fl = std::sqrt(F[0] * F[0] + F[1] * F[1] + F[2] * F[2]);
+                if (fl > 0) for (double& v : F) v /= fl;
+                out.pos.push_back(P);
+                out.fwd.push_back(F);
+            }
+            const double ul = std::sqrt(upSum[0] * upSum[0] + upSum[1] * upSum[1] + upSum[2] * upSum[2]);
+            if (out.pos.empty() || !(ul > 0)) return Recon360CameraPath{};
+            for (int r = 0; r < 3; ++r) out.up[r] = upSum[r] / ul;
+            out.ok = true;
+            return out;
+        } catch (...) {
+            return Recon360CameraPath{};
+        }
+    }
+
+    if (!fs::exists(ws / L"reconstruction_report.json", ec)) return out;
     // dataparser_transforms.json of the training run (newest if several).
     fs::path dpPath;
     fs::file_time_type dpTime{};
@@ -1000,7 +1058,7 @@ Recon360CameraPath recon360CameraPath(const std::string& plyPath) {
         const auto t = fs::last_write_time(it->path(), ec);
         if (dpPath.empty() || t > dpTime) { dpPath = it->path(); dpTime = t; }
     }
-    if (dpPath.empty() || !fs::exists(tfPath, ec)) return out;
+    if (dpPath.empty()) return out;
     try {
         std::ifstream fdp(dpPath), ftf(tfPath);
         const json dp = json::parse(fdp), tf = json::parse(ftf);

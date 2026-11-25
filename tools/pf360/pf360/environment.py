@@ -225,6 +225,7 @@ class Tools:
     mask_model: Optional[str] = None   # local segmentation model dir (optional masking add-on)
     glomap: Optional[str] = None       # optional GLOMAP global mapper (engine pack "glomap")
     vocab_tree: Optional[str] = None   # optional COLMAP vocabulary tree (engine pack "vocab-tree")
+    lichtfeld: Optional[str] = None    # optional LichtFeld-Studio training engine (engines/lichtfeld)
 
     def ns(self, tool: str) -> Optional[str]:
         if not self.ns_bin:
@@ -299,6 +300,9 @@ def resolve_tools(cfg: Optional[Dict[str, Any]] = None) -> Tools:
                 or shutil.which("glomap"))
     t.vocab_tree = (_file(cfg.get("vocabTreePath")) or _file(os.environ.get("PF360_VOCAB_TREE"))
                     or _file(str(engines_root() / "models" / VOCAB_TREE_DIRNAME / VOCAB_TREE_FILE)))
+    t.lichtfeld = (_file(cfg.get("lichtfeldExe")) or _file(os.environ.get("PF360_LICHTFELD"))
+                   or _file(str(engines_root() / "lichtfeld" / ("LichtFeld-Studio" + EXE)))
+                   or shutil.which("LichtFeld-Studio"))
     return t
 
 
@@ -409,7 +413,7 @@ def query_nvidia_smi() -> Dict[str, Any]:
     if not smi:
         return {}
     try:
-        cp = procrun.capture([smi, "--query-gpu=name,memory.total,memory.free,driver_version",
+        cp = procrun.capture([smi, "--query-gpu=name,memory.total,memory.free,driver_version,compute_cap",
                               "--format=csv,noheader,nounits"], timeout=20)
     except Exception:
         return {}
@@ -420,8 +424,11 @@ def query_nvidia_smi() -> Dict[str, Any]:
         parts = [s.strip() for s in line.split(",")]
         if len(parts) >= 4:
             try:
-                gpus.append({"name": parts[0], "totalMB": int(float(parts[1])), "freeMB": int(float(parts[2])),
-                             "driver": parts[3]})
+                g = {"name": parts[0], "totalMB": int(float(parts[1])), "freeMB": int(float(parts[2])),
+                     "driver": parts[3]}
+                if len(parts) >= 5:
+                    g["compute_cap"] = parts[4]
+                gpus.append(g)
             except ValueError:
                 continue
     return {"gpus": gpus} if gpus else {}
@@ -473,7 +480,7 @@ def doctor(cfg: Optional[Dict[str, Any]] = None, deep: bool = True) -> Report:
     t = resolve_tools(cfg)
     r = Report(tools={"nerfstudioPython": t.ns_python, "nerfstudioBin": t.ns_bin, "colmap": t.colmap,
                       "ffmpeg": t.ffmpeg, "ffprobe": t.ffprobe, "maskModel": t.mask_model,
-                      "glomap": t.glomap, "vocabTree": t.vocab_tree})
+                      "glomap": t.glomap, "vocabTree": t.vocab_tree, "lichtfeld": t.lichtfeld})
     r.checks.append(Check("Worker Python", "PASS", "%s (%s)" % (sys.version.split()[0], sys.executable)))
     r.checks.append(Check("FFmpeg", "PASS" if t.ffmpeg else "FAIL", t.ffmpeg or "not found",
                           "" if t.ffmpeg else "winget install Gyan.FFmpeg  (or put ffmpeg.exe on PATH)"))
@@ -577,6 +584,11 @@ def doctor(cfg: Optional[Dict[str, Any]] = None, deep: bool = True) -> Report:
     r.checks.append(Check("Vocabulary tree (optional)", "PASS" if t.vocab_tree else "SKIP",
                           t.vocab_tree or "not installed - download the vocabulary tree engine pack for loop "
                           "detection (fewer, larger camera models)"))
+    if t.lichtfeld:
+        r.checks.append(Check("LichtFeld-Studio (optional)", "PASS", t.lichtfeld))
+    else:
+        r.checks.append(Check("LichtFeld-Studio (optional)", "SKIP",
+                              "not installed - optional fast training backend (engines/lichtfeld)"))
 
     smi = query_nvidia_smi()
     r.gpu = smi

@@ -2,6 +2,12 @@
 
 This document records major design decisions.
 
+## LichtFeld PLY Post-Rotation & Frame Normalisation (Option 1)
+- **Status**: ACCEPTED (BT-10)
+- **Decision**: `pf360` normalises exported LichtFeld-Studio PLYs by applying a post-rotation of `diag(1, -1, -1)` (180 deg around X): positions $(x, y, z) \mapsto (x, -y, -z)$, quaternions $q' = (0, 1, 0, 0) \otimes q = (-x, w, -z, y)$ (normalized), and spherical harmonic real-basis polynomials multiplied by $(-1)^{\text{deg}_y + \text{deg}_z}$. Sidecar `<ply>.pf360.json` is written with `{"engine": "lichtfeld", "frame": "transforms", "upAxis": "z_up"}`. Viewer `recon360CameraPath` uses `transforms.json` cameras directly without dataparser T or scale.
+- **Reason**: Normalises coordinate frame upstream in `pf360` so the viewer, mesh export pipelines (GLB/FBX), and downstream tools operate on standard Z-up coordinates without requiring custom branch logic for LFS. Equivalence proven: `ab_score.py --frame raw` on rotated PLY matches `--frame colmap` on original to 0.000 dB (23.093 dB).
+
+
 ## LichtFeld-Studio Subprocess Isolation (GPL-3.0 Compliance)
 - **Status**: PROPOSED (pending A/B gate and Owner approval)
 - **Decision**: LichtFeld-Studio would run as an external, isolated standalone subprocess communicating via CLI parameters, stdout progress telemetry, and standard 3DGS PLY files, rather than linking in-process as a dynamic/static library.

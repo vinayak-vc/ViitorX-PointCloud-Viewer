@@ -79,6 +79,10 @@ def resolve(raw: Dict[str, Any], video_duration: Optional[float] = None) -> Dict
     tr.setdefault("shDegree", base["shDegree"])
     tr.setdefault("useScaleRegularization", base["useScaleRegularization"])
     tr.setdefault("randomSeed", 42)
+    # Training engine (nerfstudio | lichtfeld) and LichtFeld-specific settings
+    tr.setdefault("engine", "nerfstudio")
+    tr.setdefault("lfsStrategy", "mrnf")
+    tr.setdefault("maxGaussians", 2_000_000)
     # Training-data clean-up (training_prep): 0 = no cap.
     tr.setdefault("seedPointCap", 500_000)
     tr.setdefault("dropMisplacedPanoramas", True)
@@ -188,6 +192,13 @@ def validate(m: Dict[str, Any], check_files: bool = True) -> Dict[str, Any]:
         _in(problems, "processing.masking.dilatePx", mk.get("dilatePx", 8), *limits["maskDilatePx"], integer=True)
 
     tr = m.get("training") or {}
+    engine = tr.get("engine", "nerfstudio")
+    if engine not in ("nerfstudio", "lichtfeld"):
+        problems.append("training.engine must be 'nerfstudio' or 'lichtfeld'")
+    if tr.get("lfsStrategy", "mrnf") not in ("mrnf", "mcmc"):
+        problems.append("training.lfsStrategy must be 'mrnf' or 'mcmc'")
+    mg = tr.get("maxGaussians", 2_000_000)
+    _in(problems, "training.maxGaussians", mg, 1000, 50_000_000, integer=True)
     if tr.get("method") not in limits["method"]:
         problems.append("training.method must be one of %s" % limits["method"])
     _in(problems, "training.iterations", tr.get("iterations"), *limits["iterations"], integer=True)
@@ -231,7 +242,7 @@ def validate(m: Dict[str, Any], check_files: bool = True) -> Dict[str, Any]:
     env = m.get("environment") or {}
     if env.get("backend", "native") != "native":
         problems.append("environment.backend: only 'native' is implemented in this version")
-    for k in ("nerfstudioPython", "colmapExe", "ffmpegExe", "ffprobeExe"):
+    for k in ("nerfstudioPython", "colmapExe", "ffmpegExe", "ffprobeExe", "lichtfeldExe"):
         v = env.get(k)
         if v not in (None, "") and (not isinstance(v, str) or (check_files and not os.path.isfile(v))):
             problems.append("environment.%s is not an existing file: %s" % (k, v))

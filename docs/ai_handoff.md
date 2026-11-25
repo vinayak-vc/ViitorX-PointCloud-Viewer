@@ -56,13 +56,36 @@
     - Extracted `C:\lfs\test_ops\horizon_frame_01.png`: confirms scene is tilted 90° sideways because mean camera UP in the LFS PLY frame is $-Z$ (Z-down), and pfview default `YDown` applies $-90^\circ$ rotation mapping $-Z \mapsto -Y$. Formulated two fix options for BT-9 decision: Option 1 (`pf360` worker post-rotates by `diag(1, -1, -1)`) vs Option 2 (viewer adds `SplatUpAxis::ZDown`).
     - Deep mesh reload (`verify_mesh_export.py`): GLB parsed with 5 accessors all having count = 1,660,000 (`POSITION`, `ROTATION`, `SCALE`, `OPACITY`, `SH_DEGREE_0_COEF_0`); FBX parsed with 1,660,000 vertices and 1,660,000 colors.
   - Card moved to `review`.
+- **BT-10 Completed (pf360: LichtFeld training backend, cancel/resume, frame normalisation, report)**:
+  - Deliverables:
+    - `tools/pf360/pf360/lichtfeld_engine.py`: command builder, subprocess execution with `CREATE_NEW_PROCESS_GROUP`, graceful cancel/pause via `CTRL_BREAK_EVENT` (up to 150s grace period for `project.licht`), progress parser, and chunked PLY rotation stream.
+    - `tools/pf360/pf360/manifest.py`: schema resolution (`engine="nerfstudio"`, `lfsStrategy="mrnf"`, `maxGaussians=2_000_000`) and validation.
+    - `tools/pf360/pf360/environment.py`: `Tools.lichtfeld` discovery and `query_nvidia_smi` GPU capability extraction.
+    - `tools/pf360/pf360/nerfstudio_backend.py`: dispatch to `lichtfeld_engine` for training and export, fingerprint isolation (`engine`, `lfsStrategy`, `maxGaussians` added ONLY for LFS), sidecar `<ply>.pf360.json` generation.
+    - `tools/pf360/pf360/worker.py`: report enhancements (LFS strategy, commit 8c366f5, exe SHA256).
+    - `src/viewer/Recon360.cpp`: sidecar inspection for `frame == "transforms"`; reads `transforms.json` cameras directly without dataparser T or scale.
+    - `tools/pf360/tests/test_lichtfeld_engine.py`: 7 tests verifying manifest defaults/validation, tool discovery, command building, progress regex, PLY rotation with SH signs, fingerprint stability, and strict export failure if target iteration PLY missing.
+  - Review Fixes Verified:
+    - `environment.py`: removed hardcoded `C:\lfs` dev fallback.
+    - `nerfstudio_backend.py`: non-default `seedPointCap`, `dropMisplacedPanoramas`, `maxTrainingViews` included in LFS fingerprints.
+    - `lichtfeld_engine.py`: `export_lfs` strictly fails on missing iteration target (no partial fallback).
+    - `test_lfs_cancel_real.py`: Cancel proven on 10s preview clip — CTRL_BREAK stopped trainer at step 516 with `* Training stopped by user at iteration 516 (checkpoint saved)` (exit 0, 0 proc/GPU leak, `project.licht` 71 MB). Resume from `project.licht` reached 3000 steps (`splat_3000.ply` 124 MB).
+  - Scorer Equivalence Proof:
+    - Post-rotated PLY scored with `ab_score.py <rotated_ply> <data> --frame raw` produced PSNR 23.093 dB, SSIM 0.7783, LPIPS 0.2168, exactly matching the original PLY scored with `--frame colmap` (23.093 dB, 0.7783, 0.2168).
+  - Test Suites:
+    - `test_lichtfeld_engine.py`: 7/7 passed.
+    - Full `pf360` Python test suite: 152/152 passed (1 skipped).
+    - C++ `pf360hosttest`: 128/128 passed.
+    - C++ `pftest`: passed.
+  - Accepted by Lead in C-7.
 - **Kanban Board State**:
-  - `done`: BT-1, BT-8 (and BT-4, BT-5, BT-17 accepted by Lead in C-4)
-  - `review`: BT-2, BT-3, BT-18
-  - `backlog`: BT-6 (skipped), BT-7, BT-9 through BT-16
+  - `done`: BT-1, BT-8, BT-4, BT-5, BT-17, BT-18, BT-9, BT-10
+  - `todo` / `in-progress`: BT-11
+  - `review`: BT-2, BT-3
+  - `backlog`: BT-6 (skipped), BT-7, BT-12 through BT-16
 - **Next Recommended Task**:
-  - Await Claude's sign-off on BT-18, BT-2, and BT-3.
-  - Upon Lead promotion of Phase 1 cards, proceed to BT-9 (manifest schema) / BT-10 (backend subprocess wrapper).
+  - Implement BT-11 (Wizard UI for LichtFeld training backend in Recon360Panel).
+
 
 ## Session (2026-11-23) - real re-run on the user machine; mapper progress in the UI
 
