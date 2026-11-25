@@ -195,6 +195,7 @@ uniform mat4 uProj;
 uniform mat4 uView;
 uniform vec2 uViewportSize;
 uniform float uMinPx;   // LOD: cull splats whose 3-sigma radius is below this (px); 0 = off
+uniform float uNearCull; // splats closer than this to the eye (scene units) are skipped
 
 out vec3 vColor;
 out float vOpacity;
@@ -239,7 +240,9 @@ void main() {
     vec4 camPos = uView * vec4(inPos, 1.0);
     // Cull splats behind or too close to the eye. Near-eye splats have a
     // J ~ 1/z footprint that covers the whole screen (the "big colour" blob).
-    if (camPos.z >= -0.2) {
+    // The distance is a uniform: 3DGS scenes come in arbitrary units (COLMAP),
+    // so a fixed 0.2 could be metres of street and hide everything nearby.
+    if (camPos.z >= -uNearCull) {
         gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
         return;
     }

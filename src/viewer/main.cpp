@@ -521,6 +521,8 @@ static const KeyBindInfo kKeyBinds[] = {
     { "Wheel",        "Zoom to cursor",                  "Navigation" },
     { "Ctrl+Wheel",   "Point size",                      "Navigation" },
     { "WASD / Q E",   "Fly (Shift = fast)",              "Navigation" },
+    { "Wheel (flying)", "Fly speed (hold RMB or WASD)",  "Navigation" },
+    { "Home",         "Back to start spot (inside splats)", "Navigation" },
     { "F",            "Frame all",                       "Navigation" },
     { "1 / 3 / 7",    "Front / Side / Top view",         "Navigation" },
     { "5",            "Orthographic toggle",             "Navigation" },
@@ -541,6 +543,101 @@ static const KeyBindInfo kKeyBinds[] = {
     { "A / Y / X",    "Frame / measure / screenshot",    "Controller" },
     { "Start (or B)", "Toggle UI navigation mode",       "Controller" },
 };
+
+// ---- splat "spawn inside" -------------------------------------------------
+// 3DGS scenes from 360 walks are a shell of surfaces around the capture path,
+// plus floaters far outside it, so the bounding box (and Frame All) puts the
+// camera far outside. This finds a standing spot INSIDE the scene instead:
+//  1. robust box = 5th..95th percentile of opaque splat positions (drops floaters)
+//  2. 64-cell occupancy grid over that box
+//  3. the empty cell closest (horizontally) to the median of the splats that
+//     has free space around and above it, and ground 1..4 cells below it,
+//     i.e. "standing on the ground near the middle of the scene"
+//  4. look along the scene's long horizontal axis (e.g. down the street)
+// Positions are returned in splat-file space (Z up, before centring).
+struct SplatSpawn { bool ok = false; glm::dvec3 pos{0.0}; float yawDeg = 0.0f; double extent = 1.0; };
+
+static SplatSpawn findSplatSpawn(const pf::SplatCloudData& d) {
+    SplatSpawn out;
+    const size_t n = d.splats.size();
+    if (n < 100) return out;
+    // Sample at most ~300k opaque splats (stride) to keep this well under a second.
+    const size_t stride = std::max<size_t>(1, n / 300000);
+    std::vector<glm::dvec3> pts;
+    pts.reserve(n / stride + 1);
+    for (size_t i = 0; i < n; i += stride) {
+        const pf::GaussianSplat& g = d.splats[i];
+        if (g.opacity < 0.5f) continue;
+        pts.emplace_back(g.position.x, g.position.y, g.position.z);
+    }
+    if (pts.size() < 100) return out;
+
+    auto pct = [&](int axis, double q) {
+        std::vector<double> v(pts.size());
+        for (size_t i = 0; i < pts.size(); ++i) v[i] = pts[i][axis];
+        const size_t k = std::min(v.size() - 1, (size_t)(q * (double)(v.size() - 1)));
+        std::nth_element(v.begin(), v.begin() + (ptrdiff_t)k, v.end());
+        return v[k];
+    };
+    glm::dvec3 lo, hi, med;
+    for (int a = 0; a < 3; ++a) { lo[a] = pct(a, 0.05); hi[a] = pct(a, 0.95); med[a] = pct(a, 0.5); }
+    const glm::dvec3 size = hi - lo;
+    const double maxDim = std::max({size.x, size.y, size.z});
+    if (!(maxDim > 0.0)) return out;
+    out.extent = maxDim;
+
+    // Long horizontal axis (2x2 PCA of x/y inside the robust box) -> view yaw.
+    double sxx = 0, syy = 0, sxy = 0;
+    for (const glm::dvec3& p : pts) {
+        if (p.x < lo.x || p.x > hi.x || p.y < lo.y || p.y > hi.y || p.z < lo.z || p.z > hi.z) continue;
+        const double dx = p.x - med.x, dy = p.y - med.y;
+        sxx += dx * dx; syy += dy * dy; sxy += dx * dy;
+    }
+    const double ang = 0.5 * std::atan2(2.0 * sxy, sxx - syy);   // major axis angle from +X
+    // Camera yaw convention: forward = (sin yaw, cos yaw) in x/y.
+    out.yawDeg = (float)glm::degrees(std::atan2(std::cos(ang), std::sin(ang)));
+
+    // Occupancy grid, cubic cells, 64 along the longest side.
+    const double h = maxDim / 64.0;
+    const int nx = std::max(1, (int)std::ceil(size.x / h));
+    const int ny = std::max(1, (int)std::ceil(size.y / h));
+    const int nz = std::max(1, (int)std::ceil(size.z / h));
+    std::vector<uint16_t> occ((size_t)nx * ny * nz, 0);
+    auto idx = [&](int x, int y, int z) { return ((size_t)z * ny + y) * nx + x; };
+    for (const glm::dvec3& p : pts) {
+        const int x = (int)((p.x - lo.x) / h), y = (int)((p.y - lo.y) / h), z = (int)((p.z - lo.z) / h);
+        if (x < 0 || y < 0 || z < 0 || x >= nx || y >= ny || z >= nz) continue;
+        uint16_t& c = occ[idx(x, y, z)];
+        if (c < 65535) ++c;
+    }
+    auto full = [&](int x, int y, int z) {
+        if (x < 0 || y < 0 || x >= nx || y >= ny) return true;    // outside sideways = wall
+        if (z < 0 || z >= nz) return false;                        // above/below box = open
+        return occ[idx(x, y, z)] >= 2;
+    };
+    const double mx = (med.x - lo.x) / h, my = (med.y - lo.y) / h;
+    double best = 1e30; int bx = -1, by = -1, bz = -1;
+    for (int z = 1; z < nz; ++z)
+        for (int y = 1; y < ny - 1; ++y)
+            for (int x = 1; x < nx - 1; ++x) {
+                if (full(x, y, z) || full(x, y, z + 1)) continue;                  // head room
+                bool clear = true;                                                  // elbow room
+                for (int dy = -1; dy <= 1 && clear; ++dy)
+                    for (int dx = -1; dx <= 1 && clear; ++dx)
+                        if (full(x + dx, y + dy, z)) clear = false;
+                if (!clear) continue;
+                int ground = 0;                                                     // feet on something
+                for (int dz = 1; dz <= 4 && !ground; ++dz) if (full(x, y, z - dz)) ground = dz;
+                if (!ground) continue;
+                const double dh = std::hypot(x + 0.5 - mx, y + 0.5 - my);
+                const double score = dh + 0.25 * ground;    // near the middle, low above ground
+                if (score < best) { best = score; bx = x; by = y; bz = z; }
+            }
+    if (bx < 0) out.pos = med;   // no clear standing spot: the median is still inside the scene
+    else        out.pos = lo + glm::dvec3(bx + 0.5, by + 0.5, bz + 0.5) * h;
+    out.ok = true;
+    return out;
+}
 
 int main(int argc, char** argv) {
     std::string initialDir = "";
@@ -673,6 +770,13 @@ int main(int argc, char** argv) {
         std::string name;                 // display label (Scene panel / remote)
         bool visible = true;
         glm::dvec3 worldOffset = glm::dvec3(0.0);
+        // Splat clouds: where to start the camera, in the FILE frame (as stored).
+        // From the capture cameras of a 360 reconstruction when available, else
+        // from findSplatSpawn. Re-oriented with splatAxis on use.
+        bool       hasSpawn = false;
+        glm::dvec3 spawnPos{0.0};
+        glm::dvec3 spawnFwd{0.0, 1.0, 0.0};
+        double     sceneExtent = 1.0;   // size of the walk / robust box (scene units)
     };
     std::vector<SceneCloud> scene;
     int activeCloudIndex = -1;
@@ -871,6 +975,7 @@ int main(int argc, char** argv) {
 
     // ---- camera initial framing ------------------------------------------
     Camera cam;
+    std::function<bool()> spawnInsideSplats;   // assigned once the scene helpers exist
     auto setupCamera = [&]() {
         const double cubeSize = activeCloudSize();
         cam.position = glm::vec3(0.0f, -(float)cubeSize, 0.0f);
@@ -878,6 +983,9 @@ int main(int argc, char** argv) {
         cam.nearZ = (float)std::max(0.01, cubeSize / 5000.0);
         cam.farZ  = (float)(cubeSize * 8.0);
         cam.moveSpeed = (float)(cubeSize / 8.0);
+        // Splat clouds: start INSIDE the scene (see findSplatSpawn) instead of
+        // outside the floater-inflated bounding box.
+        if (spawnInsideSplats) spawnInsideSplats();
     };
     if (octreeLoaded) setupCamera();
 
@@ -888,6 +996,8 @@ int main(int argc, char** argv) {
     float pointSize   = 2.0f;
     float splatMinPx  = 0.5f;   // splat LOD: skip splats smaller than this on screen (px); 0 = LOD off
     bool  splatCpuCull = false; // splat: pre-cull the draw list on the sort thread (may gap on fast turns)
+    float splatNearClip = 0.02f; // splat: skip splats closer than this to the eye (scene units)
+    bool  splatNearAuto = true;  // splat: near clip = 0.2% of the scene size instead of splatNearClip
     int   splatUpAxis = (int)pf::SplatUpAxis::YDown;   // "up" in splat files (3DGS default: Y down)
     float sseBudget   = 1.5f;   // pixels; smaller = more detail loaded
     int   gpuBudgetMB = 1024;
@@ -993,6 +1103,7 @@ int main(int argc, char** argv) {
     glm::dvec3 hoverWorld(0.0);      // world point under the cursor this frame
     bool hoverValid = false;
     float navHintT = 0.0f;           // first-load fading nav hint (seconds left)
+    float speedHintT = 0.0f;         // "Fly speed" overlay after a wheel change (seconds left)
     float stereoHintT = 0.0f;        // "F9 to exit" hint when entering stereo
     std::string loadedDir;           // currently loaded octree directory
 
@@ -1019,6 +1130,7 @@ int main(int argc, char** argv) {
         clipMax[0]=1000.0f; clipMax[1]=1000.0f; clipMax[2]=1000.0f;
         stereoSBS = false; eyeSeparation = 0.05f; focalDistance = 10.0f;
         camSpeedMultiplier = 1.0f;
+        cam.keepLevel = true; splatNearClip = 0.02f; splatNearAuto = true;
         uiScale = autoUiScale;
         darkTheme = true;
         enableEDL = false; edlStrength = 1.0f; edlRadius = 1.5f;
@@ -1040,6 +1152,9 @@ int main(int argc, char** argv) {
         fprintf(f, "splatUpAxis=%d\n", splatUpAxis);
         fprintf(f, "splatMinPx=%f\n", splatMinPx);
         fprintf(f, "splatCpuCull=%d\n", (int)splatCpuCull);
+        fprintf(f, "splatNearClip=%f\n", splatNearClip);
+        fprintf(f, "splatNearAuto=%d\n", (int)splatNearAuto);
+        fprintf(f, "camKeepLevel=%d\n", (int)cam.keepLevel);
         fprintf(f, "sseBudget=%f\n", sseBudget);
         fprintf(f, "gpuBudgetMB=%d\n", gpuBudgetMB);
         fprintf(f, "uploadsPerFrame=%d\n", uploadsPerFrame);
@@ -1109,6 +1224,9 @@ int main(int argc, char** argv) {
             else if (sscanf(line, "splatUpAxis=%d", &i) == 1) splatUpAxis = std::clamp(i, 0, 2);
             else if (sscanf(line, "splatMinPx=%f", &f1) == 1) splatMinPx = std::clamp(f1, 0.0f, 4.0f);
             else if (sscanf(line, "splatCpuCull=%d", &i) == 1) splatCpuCull = (i != 0);
+            else if (sscanf(line, "splatNearClip=%f", &f1) == 1) splatNearClip = std::clamp(f1, 0.0001f, 1.0f);
+            else if (sscanf(line, "splatNearAuto=%d", &i) == 1) splatNearAuto = (i != 0);
+            else if (sscanf(line, "camKeepLevel=%d", &i) == 1) cam.keepLevel = (i != 0);
             else if (sscanf(line, "sseBudget=%f", &f1) == 1) sseBudget = f1;
             else if (sscanf(line, "gpuBudgetMB=%d", &i) == 1) gpuBudgetMB = i;
             else if (sscanf(line, "uploadsPerFrame=%d", &i) == 1) uploadsPerFrame = i;
@@ -1645,12 +1763,57 @@ int main(int argc, char** argv) {
                 // A PointForge 360 reconstruction (pf360 workspace report next to it)
                 // is Z-up already (Nerfstudio orientation_method="up"); every other
                 // file follows the user's "splat up axis" preference.
-                const pf::SplatUpAxis fileAxis = pf::recon360IsZUpOutput(d) ? pf::SplatUpAxis::ZUp
-                                                                            : (pf::SplatUpAxis)splatUpAxis;
+                pf::SplatUpAxis fileAxis = pf::recon360IsZUpOutput(d) ? pf::SplatUpAxis::ZUp
+                                                                      : (pf::SplatUpAxis)splatUpAxis;
+                // A 360 reconstruction carries its capture cameras: their mean up
+                // vector is the walk's true up (the report's "z_up" is not always
+                // right), and a capture position is the ideal place to start.
+                const pf::Recon360CameraPath path = pf::recon360CameraPath(d);
+                if (path.ok) {
+                    const double ax = std::fabs(path.up[0]), ay = std::fabs(path.up[1]), az = std::fabs(path.up[2]);
+                    if (ay > ax && ay > az) fileAxis = path.up[1] > 0 ? pf::SplatUpAxis::YUp : pf::SplatUpAxis::YDown;
+                    else if (az > ax && path.up[2] > 0) fileAxis = pf::SplatUpAxis::ZUp;
+                    // Start at the capture camera half-way along the walk that looks
+                    // most nearly level (cube-map faces include up/down views).
+                    const pf::Vec3d upV(path.up[0], path.up[1], path.up[2]);
+                    const size_t n = path.pos.size(), mid = n / 2;
+                    size_t best = mid; double bestTilt = 2.0;
+                    for (size_t k = mid; k < std::min(n, mid + 64); ++k) {
+                        const auto& f = path.fwd[k];
+                        const double tilt = std::fabs(f[0] * upV.x + f[1] * upV.y + f[2] * upV.z);
+                        if (tilt < bestTilt) { bestTilt = tilt; best = k; }
+                    }
+                    pf::Vec3d lo(1e30, 1e30, 1e30), hi(-1e30, -1e30, -1e30);
+                    for (const auto& p : path.pos) {
+                        lo.x = std::min(lo.x, p[0]); lo.y = std::min(lo.y, p[1]); lo.z = std::min(lo.z, p[2]);
+                        hi.x = std::max(hi.x, p[0]); hi.y = std::max(hi.y, p[1]); hi.z = std::max(hi.z, p[2]);
+                    }
+                    cloud.hasSpawn = true;
+                    cloud.spawnPos = glm::dvec3(path.pos[best][0], path.pos[best][1], path.pos[best][2]);
+                    cloud.spawnFwd = glm::dvec3(path.fwd[best][0], path.fwd[best][1], path.fwd[best][2]);
+                    cloud.sceneExtent = std::max({hi.x - lo.x, hi.y - lo.y, hi.z - lo.z, 1e-3});
+                    pf::logInfo("360 reconstruction: " + std::to_string(n) + " capture cameras, up axis " +
+                                (fileAxis == pf::SplatUpAxis::YUp ? "Y up" : fileAxis == pf::SplatUpAxis::YDown
+                                                                                 ? "Y down" : "Z up"));
+                }
                 if (fileAxis != (pf::SplatUpAxis)splatUpAxis)
-                    pf::logInfo("360 reconstruction output detected: loading as Z-up");
+                    pf::logInfo("360 reconstruction output detected: loading with its own up axis");
                 pf::reorientSplats(cloud.splatData, pf::SplatUpAxis::ZUp, fileAxis);
                 cloud.splatAxis = fileAxis;
+                if (!cloud.hasSpawn) {
+                    // No capture cameras: guess a standing spot in the upright (Z-up)
+                    // cloud, then store it back in the file frame like the cameras.
+                    const SplatSpawn sp = findSplatSpawn(cloud.splatData);
+                    if (sp.ok) {
+                        const double yr = glm::radians((double)sp.yawDeg);
+                        const pf::Vec3d p = pf::reorientPoint(pf::Vec3d(sp.pos.x, sp.pos.y, sp.pos.z), fileAxis, pf::SplatUpAxis::ZUp);
+                        const pf::Vec3d f = pf::reorientPoint(pf::Vec3d(std::sin(yr), std::cos(yr), 0.0), fileAxis, pf::SplatUpAxis::ZUp);
+                        cloud.hasSpawn = true;
+                        cloud.spawnPos = glm::dvec3(p.x, p.y, p.z);
+                        cloud.spawnFwd = glm::dvec3(f.x, f.y, f.z);
+                        cloud.sceneExtent = sp.extent;
+                    }
+                }
 
                 cloud.splatRenderer->upload(cloud.splatData);
 
@@ -1811,6 +1974,35 @@ int main(int argc, char** argv) {
         cam.lookAt(pivot);
         cam.orthoSize = (float)(maxDim * 0.6);
     };
+
+    // Put the camera inside the active splat cloud, standing near its middle and
+    // looking along its long axis. Returns false for non-splat clouds.
+    spawnInsideSplats = [&]() -> bool {
+        if (!octreeLoaded || scene.empty() || activeCloudIndex < 0) return false;
+        const SceneCloud& c = activeCloud();
+        if (c.type != CloudType::GaussianSplat || !c.splatData.ok) return false;
+        if (!c.hasSpawn) return false;
+        // Stored in the file frame; rotate into the cloud's current orientation.
+        // findSplatSpawn's guess assumed the file is Z-up; the capture cameras are exact.
+        const Vec3d p = pf::reorientPoint(Vec3d(c.spawnPos.x, c.spawnPos.y, c.spawnPos.z), pf::SplatUpAxis::ZUp, c.splatAxis);
+        const Vec3d f = pf::reorientPoint(Vec3d(c.spawnFwd.x, c.spawnFwd.y, c.spawnFwd.z), pf::SplatUpAxis::ZUp, c.splatAxis);
+        const Vec3d& ctr = c.splatData.center;
+        cam.position = glm::vec3((float)(p.x - ctr.x + c.worldOffset.x),
+                                 (float)(p.y - ctr.y + c.worldOffset.y),
+                                 (float)(p.z - ctr.z + c.worldOffset.z));
+        cam.yaw = (std::fabs(f.x) + std::fabs(f.y) > 1e-6) ? (float)glm::degrees(std::atan2(f.x, f.y)) : 0.0f;
+        cam.pitch = 0.0f;
+        cam.levelHorizon();
+        cam.isOrtho = false;
+        const double ext = c.sceneExtent;
+        cam.nearZ = (float)std::max(1e-5, ext / 20000.0);
+        cam.moveSpeed = (float)(ext / 10.0);   // walking pace inside, not fly-over pace
+        pivot = cam.position + cam.front() * (float)(ext * 0.05);
+        pf::logInfo("Spawned inside the splat scene (Home returns here)");
+        return true;
+    };
+    // The CLI / auto-load cloud was opened above, before this helper existed.
+    if (octreeLoaded && splatActive) spawnInsideSplats();
 
     bool running = true;
     bool mouseLook = false;
@@ -2678,7 +2870,18 @@ int main(int argc, char** argv) {
                 }
             } else if (e.type == SDL_MOUSEWHEEL) {
                 if (!ImGui::GetIO().WantCaptureMouse) {
-                    if (SDL_GetModState() & KMOD_CTRL) {
+                    const Uint8* wks = SDL_GetKeyboardState(nullptr);
+                    const bool flying = mouseLook || wks[SDL_SCANCODE_W] || wks[SDL_SCANCODE_A] ||
+                                        wks[SDL_SCANCODE_S] || wks[SDL_SCANCODE_D] ||
+                                        wks[SDL_SCANCODE_Q] || wks[SDL_SCANCODE_E];
+                    if (flying && octreeLoaded) {
+                        // While flying (RMB held or WASDQE down) the wheel sets fly
+                        // speed, like Unreal: x1.25 per notch, saved with settings.
+                        const float f = e.wheel.y > 0 ? 1.25f : (e.wheel.y < 0 ? 0.8f : 1.0f);
+                        camSpeedMultiplier = std::clamp(camSpeedMultiplier * f, 0.05f, 20.0f);
+                        speedHintT = 1.5f;
+                        saveSettings();
+                    } else if (SDL_GetModState() & KMOD_CTRL) {
                         // Ctrl+wheel adjusts point size (was plain wheel).
                         pointSize = std::clamp(pointSize + (e.wheel.y > 0 ? 1.0f : -1.0f), 1.0f, 16.0f);
                     } else if (octreeLoaded) {
@@ -2740,6 +2943,8 @@ int main(int argc, char** argv) {
                     camPresetTop();
                 } else if (!typing && octreeLoaded && k == SDLK_5) {
                     cam.isOrtho = !cam.isOrtho;
+                } else if (!typing && octreeLoaded && k == SDLK_HOME) {
+                    if (!spawnInsideSplats()) setupCamera();     // Home = back to the start spot
                 } else if (!typing && octreeLoaded && k == SDLK_g) {
                     cam.levelHorizon();                         // G = one-press level horizon
                 } else if (k == SDLK_ESCAPE) {
@@ -3212,6 +3417,8 @@ int main(int argc, char** argv) {
                             glm::mat4 cloudView = cam.view() * model;
                             cloud.splatRenderer->minPixelRadius = splatMinPx;
                             cloud.splatRenderer->cpuCull = splatCpuCull;
+                            cloud.splatRenderer->nearCull = splatNearAuto
+                                ? (float)std::max(1e-5, cloud.sceneExtent * 0.002) : splatNearClip;
                             cloud.splatRenderer->draw(cam.proj(), cloudView, glm::vec2((float)vpW, (float)vpH));
                         }
                         continue;
@@ -4356,6 +4563,18 @@ int main(int argc, char** argv) {
                             ImGui::SetItemTooltip("Also cull on the sort thread before drawing. Faster for very\n"
                                                   "large clouds, but fast turns can briefly show gaps.\n"
                                                   "Off = the GPU culls every frame (no gaps).");
+                            if (ImGui::Checkbox("Auto near clip", &splatNearAuto)) settingsChanged = true;
+                            ImGui::SetItemTooltip("On: hide only splats closer than 0.2%% of the scene size, so you\n"
+                                                  "can get close to surfaces at any scene scale (3DGS units vary).\n"
+                                                  "Off: use the fixed distance below.");
+                            if (!splatNearAuto &&
+                                ImGui::SliderFloat("Near clip", &splatNearClip, 0.0001f, 1.0f, "%.4f",
+                                                   ImGuiSliderFlags_Logarithmic))
+                                settingsChanged = true;
+                            ImGui::SetItemTooltip("Splats closer than this to the camera are hidden (scene units).\n"
+                                                  "Lower = you can fly right up to walls and the ground.\n"
+                                                  "Too low = large blurry blobs fill the view when you\n"
+                                                  "pass through a splat. Default 0.02.");
                         } else {
                             const char* quals[] = { "Low", "Medium", "High", "Ultra" };
                             if (ImGui::Combo("Quality", &qualityIdx, quals, IM_ARRAYSIZE(quals))) {
@@ -4401,14 +4620,23 @@ int main(int argc, char** argv) {
                         if (cam.isOrtho) {
                             if (ImGui::SliderFloat("Ortho Size", &cam.orthoSize, 1.0f, 5000.0f, "%.1f", ImGuiSliderFlags_Logarithmic)) settingsChanged = true;
                         }
-                        if (ImGui::SliderFloat("Fly Speed", &camSpeedMultiplier, 0.1f, 10.0f, "%.1fx")) settingsChanged = true;
+                        if (ImGui::SliderFloat("Fly Speed", &camSpeedMultiplier, 0.05f, 20.0f, "%.2fx", ImGuiSliderFlags_Logarithmic)) settingsChanged = true;
                         ImGui::BeginDisabled(!octreeLoaded);
                         if (ImGui::Button("Reset View")) setupCamera();
+                        ImGui::SetItemTooltip("Back to the start spot (Home). Splat scenes start inside the scene.");
                         ImGui::SameLine();
                         if (ImGui::Button("Frame All")) frameAllReq = true;
                         ImGui::SameLine();
                         if (ImGui::Button("Level Horizon (G)")) cam.levelHorizon();
                         ImGui::SetItemTooltip("Remove roll: keeps where you look, makes the horizon level.");
+                        if (ImGui::Checkbox("Keep horizon level", &cam.keepLevel)) {
+                            if (cam.keepLevel) cam.levelHorizon();
+                            settingsChanged = true;
+                        }
+                        ImGui::SetItemTooltip("On: turning is about world up and the horizon never tilts\n"
+                                              "(like Unreal / games). Looking up/down stops at straight up/down.\n"
+                                              "Off: free 6-DOF look about the camera's own axes; the view can\n"
+                                              "roll, and Z/X roll by hand.");
                         ImGui::Text("Presets:");
                         ImGui::SameLine(); if (ImGui::SmallButton("Front (1)")) camPresetFront();
                         ImGui::SameLine(); if (ImGui::SmallButton("Side (3)")) camPresetSide();
@@ -6305,6 +6533,18 @@ int main(int argc, char** argv) {
             }
 
             if (settingsChanged) saveSettings();
+
+            // ---- fly-speed overlay (wheel while flying) ---------------------------
+            if (speedHintT > 0.0f) {
+                speedHintT -= dt;
+                float a = std::clamp(speedHintT / 0.5f, 0.0f, 1.0f);
+                char msg[64];
+                snprintf(msg, sizeof(msg), "Fly speed %.2fx", camSpeedMultiplier);
+                ImVec2 ts = ImGui::CalcTextSize(msg);
+                ImGui::GetForegroundDrawList()->AddText(
+                    ImVec2(winW * 0.5f - ts.x * 0.5f, winH * 0.5f + 40.0f),
+                    IM_COL32(255, 255, 255, (int)(a * 230)), msg);
+            }
 
             // ---- first-load fading nav hint ---------------------------------------
             if (navHintT > 0.0f && octreeLoaded) {

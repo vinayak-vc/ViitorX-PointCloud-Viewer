@@ -375,6 +375,15 @@ int upAxisAngleDeg(SplatUpAxis a) {
 }
 } // namespace
 
+Vec3d reorientPoint(const Vec3d& p, SplatUpAxis from, SplatUpAxis to) {
+    int deg = (upAxisAngleDeg(to) - upAxisAngleDeg(from)) % 360;
+    if (deg < 0) deg += 360;
+    if (deg == 0) return p;
+    const double c = (deg == 180) ? -1.0 : 0.0;
+    const double s = (deg == 90) ? 1.0 : (deg == 270 ? -1.0 : 0.0);
+    return Vec3d(p.x, c * p.y - s * p.z, s * p.y + c * p.z);   // same as reorientSplats
+}
+
 void reorientSplats(SplatCloudData& data, SplatUpAxis from, SplatUpAxis to) {
     // Net rotation about X; multiples of 90 deg, so use exact sin/cos.
     int deg = (upAxisAngleDeg(to) - upAxisAngleDeg(from)) % 360;

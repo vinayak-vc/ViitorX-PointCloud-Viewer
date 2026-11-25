@@ -14,6 +14,7 @@
 //     events and forwards them to the job queue.
 //
 // Viewer-only (never include from pfcore). Non-Windows builds get stubs.
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <functional>
@@ -199,6 +200,19 @@ void recon360SetShuttingDown();
 // so) — such files are Z-up (Nerfstudio orientation_method="up"), unlike the
 // Y-down convention of most downloaded 3DGS files.
 bool recon360IsZUpOutput(const std::string& plyPath);
+
+// Capture cameras of a pf360 output, in the exported .ply's own frame (as
+// stored): processed/transforms.json mapped by the training run's
+// dataparser_transforms.json (p' = scale * (T * p)). `up` is the mean camera up
+// vector - the true "up" of the walk, whatever the report says. Empty (ok =
+// false) when `plyPath` is not inside a pf360 workspace or the files are missing.
+struct Recon360CameraPath {
+    bool ok = false;
+    std::vector<std::array<double, 3>> pos;   // camera centres
+    std::vector<std::array<double, 3>> fwd;   // viewing directions (unit)
+    std::array<double, 3> up{0.0, 0.0, 0.0};
+};
+Recon360CameraPath recon360CameraPath(const std::string& plyPath);
 
 // ---- batch helpers (GUI-free, tested by pf360hosttest) -------------------------
 // MP4 / MOV / MKV files under `root` (UTF-8), sorted by path. Never descends into

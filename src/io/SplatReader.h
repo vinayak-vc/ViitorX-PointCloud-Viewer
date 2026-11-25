@@ -47,6 +47,9 @@ enum class SplatUpAxis : int {
 // follow the quaternion), then recomputes the bounds and centre. Loaders always
 // return the file as stored, which is the ZUp (identity) frame.
 void reorientSplats(SplatCloudData& data, SplatUpAxis from, SplatUpAxis to);
+// The same rotation applied to one point / direction (e.g. a capture camera
+// stored in the file frame, to place it in the re-oriented cloud).
+Vec3d reorientPoint(const Vec3d& p, SplatUpAxis from, SplatUpAxis to);
 
 class SplatReader {
 public:

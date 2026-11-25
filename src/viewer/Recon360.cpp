@@ -985,6 +985,74 @@ bool recon360IsZUpOutput(const std::string& plyPath) {
     }
 }
 
+Recon360CameraPath recon360CameraPath(const std::string& plyPath) {
+    Recon360CameraPath out;
+    std::error_code ec;
+    const fs::path ws = fs::path(widen(plyPath)).parent_path().parent_path();
+    if (!fs::exists(ws / L"reconstruction_report.json", ec)) return out;
+    const fs::path tfPath = ws / L"processed" / L"transforms.json";
+    // dataparser_transforms.json of the training run (newest if several).
+    fs::path dpPath;
+    fs::file_time_type dpTime{};
+    for (fs::recursive_directory_iterator it(ws / L"training", fs::directory_options::skip_permission_denied, ec), end;
+         !ec && it != end; it.increment(ec)) {
+        if (it->path().filename() != L"dataparser_transforms.json") continue;
+        const auto t = fs::last_write_time(it->path(), ec);
+        if (dpPath.empty() || t > dpTime) { dpPath = it->path(); dpTime = t; }
+    }
+    if (dpPath.empty() || !fs::exists(tfPath, ec)) return out;
+    try {
+        std::ifstream fdp(dpPath), ftf(tfPath);
+        const json dp = json::parse(fdp), tf = json::parse(ftf);
+        double T[3][4];
+        for (int r = 0; r < 3; ++r)
+            for (int c = 0; c < 4; ++c) T[r][c] = dp.at("transform").at(r).at(c).get<double>();
+        const double s = dp.at("scale").get<double>();
+        // Nerfstudio folds transforms.json's "applied_transform" (A, a pure
+        // rotation from ns-process-data) into the saved transform, so the frames
+        // of transforms.json map by T * A^-1 = T * A^T. Without this the cameras
+        // land rotated in the splat (verified against capture photos).
+        if (tf.contains("applied_transform")) {
+            double A[3][3], TA[3][3];
+            for (int r = 0; r < 3; ++r)
+                for (int c = 0; c < 3; ++c) A[r][c] = tf["applied_transform"].at(r).at(c).get<double>();
+            for (int r = 0; r < 3; ++r)
+                for (int c = 0; c < 3; ++c)
+                    TA[r][c] = T[r][0] * A[c][0] + T[r][1] * A[c][1] + T[r][2] * A[c][2];   // T * A^T
+            // Translation: A's own translation column is zero for ns-process-data.
+            for (int r = 0; r < 3; ++r)
+                for (int c = 0; c < 3; ++c) T[r][c] = TA[r][c];
+        }
+        double upSum[3] = {0, 0, 0};
+        for (const json& fr : tf.at("frames")) {
+            const json& m = fr.at("transform_matrix");
+            double p[3], f[3], u[3];
+            for (int r = 0; r < 3; ++r) {
+                p[r] = m.at(r).at(3).get<double>();
+                f[r] = -m.at(r).at(2).get<double>();   // OpenGL camera looks down -Z
+                u[r] = m.at(r).at(1).get<double>();
+            }
+            std::array<double, 3> P{}, F{};
+            for (int r = 0; r < 3; ++r) {
+                P[r] = s * (T[r][0] * p[0] + T[r][1] * p[1] + T[r][2] * p[2] + T[r][3]);
+                F[r] = T[r][0] * f[0] + T[r][1] * f[1] + T[r][2] * f[2];
+                upSum[r] += T[r][0] * u[0] + T[r][1] * u[1] + T[r][2] * u[2];
+            }
+            const double fl = std::sqrt(F[0] * F[0] + F[1] * F[1] + F[2] * F[2]);
+            if (fl > 0) for (double& v : F) v /= fl;
+            out.pos.push_back(P);
+            out.fwd.push_back(F);
+        }
+        const double ul = std::sqrt(upSum[0] * upSum[0] + upSum[1] * upSum[1] + upSum[2] * upSum[2]);
+        if (out.pos.empty() || !(ul > 0)) return Recon360CameraPath{};
+        for (int r = 0; r < 3; ++r) out.up[r] = upSum[r] / ul;
+        out.ok = true;
+    } catch (...) {
+        return Recon360CameraPath{};
+    }
+    return out;
+}
+
 void recon360Reveal(const std::string& path, bool selectFile) {
     std::wstring w = widen(path);
     if (selectFile) {
@@ -1018,6 +1086,7 @@ bool recon360Run(const Recon360JobSpec&, const Recon360Settings&, std::atomic<bo
     err = "360 reconstruction is only implemented on Windows"; return false;
 }
 bool recon360IsZUpOutput(const std::string&) { return false; }
+Recon360CameraPath recon360CameraPath(const std::string&) { return {}; }
 void recon360Reveal(const std::string&, bool) {}
 std::vector<Recon360Unfinished> recon360ListUnfinished() { return {}; }
 bool recon360SpecFromManifest(const std::string&, Recon360JobSpec&, std::string& err) { err = "Windows only"; return false; }

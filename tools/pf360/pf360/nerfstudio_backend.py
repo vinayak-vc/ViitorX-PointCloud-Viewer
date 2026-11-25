@@ -23,7 +23,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
-from . import environment, procrun
+from . import environment, procrun, training_prep
 from .backend import ReconstructionBackend, StageContext, StageFailed
 from .views import perspective_size, views_per_frame, yaw_pitch_pairs
 
@@ -61,6 +61,9 @@ def mapper_ba_args(pr: Dict[str, Any], cuda: bool = True) -> List[str]:
 EXTEND_ROUNDS = 3
 # Training restore points: periodic checkpoint interval, and how long a pause may take to save one.
 TRAIN_STEPS_PER_SAVE = 1000
+LONG_SCHEDULE_MIN_ITS = 30000      # Splatfacto's own schedule is tuned for 30k steps
+REFINE_EVERY = 100                 # Splatfacto refine_every (steps)
+DEFAULT_RESET_ALPHA_EVERY = 30     # Splatfacto reset_alpha_every (refinements) = 3000 steps
 TRAIN_PAUSE_GRACE_S = 150
 # Written into colmap/sparse after `mapper` exits 0; a resumed camera stage then keeps the models.
 MAPPER_DONE = "mapper_done.json"
@@ -423,7 +426,18 @@ class NerfstudioBackend(ReconstructionBackend):
         if stage == "training":
             keys = ("method", "iterations", "downscaleFactor", "shDegree", "randomSeed", "useScaleRegularization",
                     "cullAlphaThresh", "densifyGradThresh", "cullScaleThresh")
-            return {k: tr.get(k) for k in keys}
+            inputs = {k: tr.get(k) for k in keys}
+            # Clean-up options enter the fingerprint only when changed from the defaults, so
+            # finished jobs from before these options do not retrain on resume.
+            if tr.get("seedPointCap", training_prep.DEFAULT_SEED_POINT_CAP) != training_prep.DEFAULT_SEED_POINT_CAP:
+                inputs["seedPointCap"] = tr["seedPointCap"]
+            if tr.get("dropMisplacedPanoramas", True) is not True:
+                inputs["dropMisplacedPanoramas"] = False
+            if tr.get("maxTrainingViews", 0):
+                inputs["maxTrainingViews"] = tr["maxTrainingViews"]
+            if tr.get("longSchedule"):
+                inputs["longSchedule"] = 2          # v2: opacity reset scaled to the view count
+            return inputs
         if stage == "export":
             return {"plyFileName": ctx.manifest["output"].get("plyFileName")}
         return {}
@@ -727,6 +741,12 @@ class NerfstudioBackend(ReconstructionBackend):
             rc = procrun.run(args, cancel=ctx.cancel, on_line=ticker.seen, log=log, env=env, cwd=str(ws.root))
             if rc != 0:
                 raise StageFailed("ns-process-data failed (exit %d) - see logs/colmap.log" % rc)
+            # A fresh transforms.json: the training clean-up must start again from it.
+            for stale in (training_prep.ALL_TRANSFORMS, training_prep.TRAIN_PLY):
+                try:
+                    (ws.processed_dir / stale).unlink()
+                except FileNotFoundError:
+                    pass
             if masks_on:
                 # Splatfacto: per-frame mask_path + masks_N matching images_N sizes.
                 ticker.set(96.0, "attaching masks for training")
@@ -1003,6 +1023,40 @@ class NerfstudioBackend(ReconstructionBackend):
                                 "random points.", stage="camera_reconstruction")
         return data
 
+    @staticmethod
+    def _long_schedule_args(ctx: StageContext, flags, total_its: int, views: int = 0) -> List[str]:
+        """training.longSchedule: Splatfacto splits/clones Gaussians only until step 15000 and decays
+        the position learning rate over 30000 steps, whatever --max-num-iterations says. On a long
+        run the rest of the steps only polish what exists. Stretch both over the run (split for
+        the first half, like the 15k-of-30k default), so more steps also mean more Gaussians.
+
+        With many training views the opacity reset (every 30 x 100 = 3000 steps) also has to stretch:
+        a reset fades every Gaussian, and only the ones seen again before the next refinement get
+        their opacity back - the rest are pruned. Seen on a 19,222-view run: ~120k of ~390k Gaussians
+        pruned after every reset, so the count saw-toothed and never grew past the seed cloud. The
+        reset then comes every ~2 passes over the views (as in the original 3DGS, which resets every
+        3000 steps on a few hundred images), capped so at least two cycles fit before splitting stops."""
+        if not ctx.manifest["training"].get("longSchedule") or total_its <= LONG_SCHEDULE_MIN_ITS:
+            return []
+        args: List[str] = []
+        if flags.has("--pipeline.model.stop-split-at"):
+            args += ["--pipeline.model.stop-split-at", str(total_its // 2)]
+        if flags.has("--optimizers.means.scheduler.max-steps"):
+            args += ["--optimizers.means.scheduler.max-steps", str(total_its)]
+        # reset-alpha-every counts refinements (refine_every = 100 steps, Splatfacto's default).
+        resets = min(-(-2 * views // REFINE_EVERY), total_its // 2 // 2 // REFINE_EVERY)
+        if resets > DEFAULT_RESET_ALPHA_EVERY and flags.has("--pipeline.model.reset-alpha-every"):
+            args += ["--pipeline.model.reset-alpha-every", str(resets)]
+        if args:
+            ctx.emitter.log("long schedule: Gaussians split until step %d, position learning rate decays over "
+                            "%d steps, opacity reset every %d steps" % (
+                                total_its // 2, total_its, max(resets, DEFAULT_RESET_ALPHA_EVERY) * REFINE_EVERY),
+                            stage="training")
+        else:
+            ctx.emitter.warning("This Nerfstudio version has no stop-split-at / scheduler flags; the long "
+                                "schedule option is ignored.", stage="training")
+        return args
+
     def _training(self, ctx: StageContext) -> Dict[str, Any]:
         ws, tr = ctx.workspace, ctx.manifest["training"]
         tool = ctx.tools.ns("ns-train")
@@ -1031,6 +1085,7 @@ class NerfstudioBackend(ReconstructionBackend):
             ctx.emitter.log("resuming training from checkpoint step %d / %d" % (ckpt[0], total_its), stage="training")
         else:
             ws.reset_dir(ws.training_dir)
+        prep = self._prepare_training_data(ctx)
         # Nerfstudio trains max_num_iterations MORE steps after a loaded checkpoint, so pass the remainder.
         args = [tool, method, "--data", str(ws.processed_dir), "--output-dir", str(ws.training_dir),
                 "--experiment-name", "pf360", "--timestamp", "run",
@@ -1054,6 +1109,7 @@ class NerfstudioBackend(ReconstructionBackend):
                           ("cullScaleThresh", "--pipeline.model.cull-scale-thresh")):
             if tr.get(key) is not None:
                 args += [flag, repr(float(tr[key]))]
+        args += self._long_schedule_args(ctx, flags, total_its, int(prep.get("trainingViews") or 0))
         args += ["nerfstudio-data", "--downscale-factor", str(int(tr["downscaleFactor"]))]
         last = {"pct": -1.0, "step": 0}
         tail: List[str] = []
@@ -1070,8 +1126,9 @@ class NerfstudioBackend(ReconstructionBackend):
                     last["pct"] = pct
                     ctx.emitter.progress("training", pct, "step %s / %d" % (m.group(1), int(tr["iterations"])))
             elif "out of memory" in l.lower():
-                ctx.emitter.warning("CUDA out of memory: lower the training resolution (downscale factor), use fewer "
-                                    "frames, choose standard Splatfacto, or close other GPU applications.",
+                ctx.emitter.warning("CUDA out of memory: lower the training resolution (downscale factor), lower the "
+                                    "seed point cap, use fewer frames, choose standard Splatfacto, or close other "
+                                    "GPU applications.",
                                     stage="training")
         # Run through ns_helpers/train_resumable.py (= ns-train + graceful pause). On pause/cancel
         # the trainer is asked to save a checkpoint and stop; it is killed only if that takes
@@ -1117,7 +1174,34 @@ class NerfstudioBackend(ReconstructionBackend):
         out = {"method": method, "iterations": total_its, "lastLoggedStep": last["step"], "config": str(cfg)}
         if ckpt:
             out["resumedFromStep"] = ckpt[0]
+        out.update({k: prep[k] for k in ("seedPoints", "seedPointsUsed", "droppedPanoramas", "droppedViews",
+                                         "trainingViews", "viewBudget", "panoramasUsed") if k in prep})
         return out
+
+    def _prepare_training_data(self, ctx: StageContext) -> Dict[str, Any]:
+        """Seed-cloud cap + misplaced-panorama filter (training_prep). Deterministic, so it gives
+        the same data again when training resumes from a checkpoint."""
+        tr = ctx.manifest["training"]
+        cap = int(tr.get("seedPointCap", training_prep.DEFAULT_SEED_POINT_CAP))
+        drop = bool(tr.get("dropMisplacedPanoramas", True))
+        ctx.emitter.progress("training", None, "preparing training data")
+        try:
+            stats = training_prep.prepare(ctx.workspace.processed_dir, ctx.workspace.planar_dir, seed_cap=cap,
+                                          drop_misplaced=drop, max_views=int(tr.get("maxTrainingViews", 0)),
+                                          downscale=int(tr["downscaleFactor"]), seed=int(tr["randomSeed"]),
+                                          log=lambda m: ctx.emitter.log(m, stage="training"))
+        except (OSError, ValueError) as e:
+            # Training can still run on the camera stage's data, as before this step existed.
+            ctx.emitter.warning("Training-data clean-up skipped (%s); training on the full camera set." % e,
+                                stage="training")
+            return {}
+        if stats.get("viewBudget"):
+            ctx.emitter.warning("Training uses %d of the views: all of them would not fit in RAM (Splatfacto keeps "
+                                "every image decoded in memory)." % stats["trainingViews"], stage="training")
+        if stats.get("droppedPanoramas"):
+            ctx.emitter.warning("%d panorama(s) had cameras placed inconsistently and were left out of training."
+                                % stats["droppedPanoramas"], stage="training")
+        return stats
 
     def _find_config(self, ctx: StageContext) -> Optional[Path]:
         root = ctx.workspace.training_dir

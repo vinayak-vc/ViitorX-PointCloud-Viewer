@@ -27,6 +27,10 @@ public:
     float orthoSize = 100.0f; // Half-height of ortho view
     float moveSpeed = 10.0f;     // units/sec
     float lookSpeed = 0.15f;     // degrees/pixel
+    // true: mouse look yaws about WORLD up (+Z) and pitch is clamped to +-89 deg,
+    // so the horizon never tilts (Unreal / game style). false: free 6-DOF look
+    // about the camera's own axes, which slowly accumulates roll.
+    bool  keepLevel = true;
 
     glm::vec3 front() const;   // camera forward
     glm::vec3 right() const;   // camera right
@@ -35,7 +39,8 @@ public:
     glm::mat4 proj() const;
     glm::mat4 viewProj() const { return proj() * view(); }
 
-    // Rotate the camera about its OWN axes by dYaw / dPitch (scaled by lookSpeed).
+    // Rotate the camera by dYaw / dPitch (scaled by lookSpeed): about world up and
+    // with no roll when keepLevel is on, else about its OWN axes.
     void addYawPitch(float dYaw, float dPitch);
     // Roll about the camera's FORWARD axis by dDeg (keeps forward, tilts the horizon).
     void roll(float dDeg);

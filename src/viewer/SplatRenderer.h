@@ -50,6 +50,9 @@ public:
     // Their contribution is sub-pixel, so skipping them trades little detail for
     // GPU time. 0 disables LOD.
     float minPixelRadius = 0.5f;
+    // Splats closer than this to the eye (scene units) are skipped. Smaller =
+    // you can walk closer to surfaces; too small = huge blurry blobs in front.
+    float nearCull = 0.02f;
 
     // Pre-cull the draw list on the sort thread (guard-banded frustum + relaxed
     // LOD). Off by default: the vertex shader culls exactly, every frame.

@@ -79,6 +79,11 @@ def resolve(raw: Dict[str, Any], video_duration: Optional[float] = None) -> Dict
     tr.setdefault("shDegree", base["shDegree"])
     tr.setdefault("useScaleRegularization", base["useScaleRegularization"])
     tr.setdefault("randomSeed", 42)
+    # Training-data clean-up (training_prep): 0 = no cap.
+    tr.setdefault("seedPointCap", 500_000)
+    tr.setdefault("dropMisplacedPanoramas", True)
+    tr.setdefault("maxTrainingViews", 0)          # 0 = auto: as many as fit in RAM
+    tr.setdefault("longSchedule", False)          # stretch densify + LR decay over all iterations
     if "fallbackMethod" in base:
         tr.setdefault("fallbackMethod", base["fallbackMethod"])
     pr.setdefault("imagesPerEquirect", base["imagesPerEquirect"])
@@ -195,6 +200,16 @@ def validate(m: Dict[str, Any], check_files: bool = True) -> Dict[str, Any]:
             _in(problems, "training." + k, tr.get(k), *limits[k])
     if not isinstance(tr.get("useScaleRegularization", False), bool):
         problems.append("training.useScaleRegularization must be true/false")
+    if not isinstance(tr.get("longSchedule", False), bool):
+        problems.append("training.longSchedule must be true/false")
+    if not isinstance(tr.get("dropMisplacedPanoramas", True), bool):
+        problems.append("training.dropMisplacedPanoramas must be true/false")
+    cap = tr.get("seedPointCap", 500_000)
+    if isinstance(cap, bool) or not isinstance(cap, int) or not (cap == 0 or 10_000 <= cap <= 20_000_000):
+        problems.append("training.seedPointCap must be 0 (no cap) or an integer from 10000 to 20000000")
+    mv = tr.get("maxTrainingViews", 0)
+    if isinstance(mv, bool) or not isinstance(mv, int) or not (mv == 0 or 50 <= mv <= 1_000_000):
+        problems.append("training.maxTrainingViews must be 0 (auto, fit in RAM) or an integer from 50 to 1000000")
 
     out = m.get("output") or {}
     d = out.get("directory")

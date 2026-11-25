@@ -52,6 +52,20 @@ glm::mat4 Camera::proj() const {
 
 void Camera::addYawPitch(float dYaw, float dPitch) {
     sync();
+    if (keepLevel) {
+        // World-up yaw + clamped pitch, rebuilt roll-free every time: turning
+        // while looking up/down can no longer tilt the horizon. The clamp stops
+        // short of the poles so forward never lines up with world up.
+        yaw   += dYaw * lookSpeed;
+        if (yaw > 180.0f)  yaw -= 360.0f;
+        if (yaw < -180.0f) yaw += 360.0f;
+        pitch = std::clamp(pitch + dPitch * lookSpeed, -89.0f, 89.0f);
+        orient_ = fromYawPitch(yaw, pitch);
+        syncYaw_ = yaw;
+        syncPitch_ = pitch;
+        orientValid_ = true;
+        return;
+    }
     const float yawRad   = glm::radians(dYaw * lookSpeed);
     const float pitchRad = glm::radians(dPitch * lookSpeed);
 
@@ -73,6 +87,7 @@ void Camera::addYawPitch(float dYaw, float dPitch) {
 }
 
 void Camera::roll(float dDeg) {
+    if (keepLevel) return;   // roll is a free-look feature; level mode never tilts
     sync();
     // Local forward is +Y in camera space, so rolling is a local rotation about Y.
     // Forward and yaw/pitch are unchanged, so the yaw/pitch cache stays valid.

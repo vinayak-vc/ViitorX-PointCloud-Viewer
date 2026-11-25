@@ -375,6 +375,7 @@ void SplatRenderer::draw(const glm::mat4& proj, const glm::mat4& view, const glm
     shader_.setMat4("uView", &view[0][0]);
     shader_.setVec2("uViewportSize", viewportSize.x, viewportSize.y);
     shader_.setFloat("uMinPx", minPixelRadius);
+    shader_.setFloat("uNearCull", nearCull);
 
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_BUFFER, dataTex_);
