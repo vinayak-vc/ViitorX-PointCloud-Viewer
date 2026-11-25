@@ -3,7 +3,7 @@ setlocal enabledelayedexpansion
 rem Dynamic build (fast iteration). Always builds into "build\" at the project
 rem root, regardless of the directory this script is invoked from.
 cd /d "%~dp0"
-
+set "VCPKG_ROOT=Z:\"
 if not defined VCPKG_ROOT (
     if exist "C:\vcpkg\scripts\buildsystems\vcpkg.cmake" (
         set "VCPKG_ROOT=C:\vcpkg"
