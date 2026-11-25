@@ -173,7 +173,11 @@ void Recon360Panel::applyPreset(int idx) {
     const Recon360Preset& p = presets[(size_t)idx];
     methodIdx = p.method == "splatfacto-big" ? 1 : 0;
     iterations = p.iterations;
-    for (int i = 0; i < 4; ++i) if (kDownscales[i] == p.downscaleFactor) downscaleIdx = i;
+    int df = p.downscaleFactor;
+    if (engineIdx == 0) {
+        df = (idx == 0) ? 2 : 1;
+    }
+    for (int i = 0; i < 4; ++i) if (kDownscales[i] == df) downscaleIdx = i;
     shDegree = p.shDegree;
     scaleReg = p.useScaleRegularization;
     viewsIdx = p.imagesPerEquirect == 14 ? 1 : 0;
@@ -315,6 +319,13 @@ Recon360JobSpec Recon360Panel::buildSpec(const std::string& video, const Recon36
     if (presetIdx < (int)presets.size()) sp.fallbackMethod = presets[(size_t)presetIdx].fallbackMethod;
     sp.iterations = iterations;
     sp.downscaleFactor = kDownscales[downscaleIdx];
+    if (presetIdx < (int)presets.size()) {
+        if (sp.trainingEngine == "lichtfeld") {
+            sp.downscaleFactor = (presetIdx == 0) ? 2 : 1;
+        } else {
+            sp.downscaleFactor = presets[(size_t)presetIdx].downscaleFactor;
+        }
+    }
     sp.shDegree = shDegree;
     sp.randomSeed = seed;
     sp.useScaleRegularization = scaleReg;
@@ -1591,7 +1602,10 @@ void Recon360Panel::drawStepQuality(Recon360PanelHost& host) {
     ImGui::SeparatorText("Training engine");
     std::string lfsExe, lfsDisabledTip;
     const bool lfsAvail = checkLichtfeldAvailability(host.settings, doctor, &lfsExe, &lfsDisabledTip);
-    if (!lfsAvail && engineIdx == 0) engineIdx = 1;  // fall back gracefully to Nerfstudio
+    if (!lfsAvail && engineIdx == 0) {
+        engineIdx = 1;  // fall back gracefully to Nerfstudio
+        if (presetIdx < 3) applyPreset(presetIdx);
+    }
 
     const char* kEngines[] = {"LichtFeld (recommended)", "Nerfstudio"};
     ImGui::BeginDisabled(!lfsAvail);
@@ -1599,6 +1613,7 @@ void Recon360Panel::drawStepQuality(Recon360PanelHost& host) {
     if (ImGui::Combo("Training engine", &engineIdx, kEngines, 2)) {
         if (host.settings) host.settings->trainingEngine = (engineIdx == 0) ? "lichtfeld" : "nerfstudio";
         if (host.saveSettings) host.saveSettings();
+        if (presetIdx < 3) applyPreset(presetIdx);
     }
     ImGui::EndDisabled();
     if (!lfsAvail && !lfsDisabledTip.empty()) ImGui::SetItemTooltip("%s", lfsDisabledTip.c_str());
@@ -1643,6 +1658,13 @@ void Recon360Panel::drawStepQuality(Recon360PanelHost& host) {
                 desc.replace(pos, 14, "LichtFeld (" + std::string(lfsStrategyIdx == 0 ? "MRNF" : "MCMC") + ")");
             while ((pos = desc.find("Splatfacto")) != std::string::npos)
                 desc.replace(pos, 10, "LichtFeld (" + std::string(lfsStrategyIdx == 0 ? "MRNF" : "MCMC") + ")");
+            if (presetIdx == 0) {
+                while ((pos = desc.find("quarter-resolution")) != std::string::npos)
+                    desc.replace(pos, 18, "half-resolution");
+            } else if (presetIdx == 1) {
+                while ((pos = desc.find("half-resolution")) != std::string::npos)
+                    desc.replace(pos, 15, "full-resolution");
+            }
         }
         ImGui::TextWrapped("%s", desc.c_str());
         if (engineIdx == 1) {
@@ -1651,7 +1673,8 @@ void Recon360Panel::drawStepQuality(Recon360PanelHost& host) {
         } else {
             ImGui::BulletText("Engine: LichtFeld (%s)", lfsStrategyIdx == 0 ? "Quality / MRNF" : "Fast / MCMC");
         }
-        ImGui::BulletText("Training images: 1/%d resolution, %d iterations", p.downscaleFactor, p.iterations);
+        const int effDownscale = (engineIdx == 0) ? (presetIdx == 0 ? 2 : 1) : p.downscaleFactor;
+        ImGui::BulletText("Training images: 1/%d resolution, %d iterations", effDownscale, p.iterations);
         ImGui::BulletText("Sampling: ~%.0f frames/s (%d-%d frames), %d views per frame", p.framesPerSecond,
                           p.minFrames, p.maxFrames, p.imagesPerEquirect);
         ImGui::BulletText("Cost: %s", p.costNote.c_str());
@@ -1911,6 +1934,7 @@ void Recon360Panel::draw(Recon360PanelHost& host) {
         lfsStrategyIdx = (host.settings->lfsStrategy == "mcmc") ? 1 : 0;
         maxGaussians = host.settings->maxGaussians > 0 ? host.settings->maxGaussians : 2000000;
         settingsSynced = true;
+        if (presetIdx < 3) applyPreset(presetIdx);
     }
     if (!open) return;
     const float S = host.uiScale;

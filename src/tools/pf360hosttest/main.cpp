@@ -143,12 +143,12 @@ static void testManifest(const fs::path& tmp) {
         CHECK(jlfs["training"]["maxGaussians"] == 1500000);
     }
 
-    // Balanced-preset LichtFeld job: downscaleFactor 2, iterations 30000, strategy mrnf
+    // Balanced-preset LichtFeld job: downscaleFactor 1 (BT-19), iterations 30000, strategy mrnf
     sp.jobId = "hosttest_manifest_balanced_lfs";
     sp.trainingEngine = "lichtfeld";
     sp.qualityPreset = "balanced";
     sp.lfsStrategy = "mrnf";
-    sp.downscaleFactor = 2;
+    sp.downscaleFactor = 1;
     sp.iterations = 30000;
     sp.maxGaussians = 2000000;
     CHECK(recon360WriteManifest(sp, st, path, err));
@@ -158,13 +158,29 @@ static void testManifest(const fs::path& tmp) {
         CHECK(jbal["training"]["engine"] == "lichtfeld");
         CHECK(jbal["training"]["qualityPreset"] == "balanced");
         CHECK(jbal["training"]["lfsStrategy"] == "mrnf");
-        CHECK(jbal["training"]["downscaleFactor"] == 2);
+        CHECK(jbal["training"]["downscaleFactor"] == 1);
         CHECK(jbal["training"]["iterations"] == 30000);
         CHECK(jbal["training"]["maxGaussians"] == 2000000);
         std::ofstream fev("C:/lfs/evidence_balanced_lfs_manifest.json");
         if (fev.is_open()) {
             fev << jbal.dump(2);
         }
+    }
+
+    // Balanced-preset Nerfstudio job: downscaleFactor 2 (remains 2), iterations 30000
+    sp.jobId = "hosttest_manifest_balanced_ns";
+    sp.trainingEngine = "nerfstudio";
+    sp.qualityPreset = "balanced";
+    sp.downscaleFactor = 2;
+    sp.iterations = 30000;
+    CHECK(recon360WriteManifest(sp, st, path, err));
+    {
+        std::ifstream fns(fs::u8path(path));
+        auto jns = nlohmann::json::parse(fns);
+        CHECK(jns["training"]["engine"] == "nerfstudio");
+        CHECK(jns["training"]["qualityPreset"] == "balanced");
+        CHECK(jns["training"]["downscaleFactor"] == 2);
+        CHECK(jns["training"]["iterations"] == 30000);
     }
     sp.trainingEngine = "nerfstudio";  // reset for further tests
 

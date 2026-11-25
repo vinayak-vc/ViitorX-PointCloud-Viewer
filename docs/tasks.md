@@ -1,7 +1,7 @@
 # Tasks
 
 ## In Progress / In Review
-- [ ] BT-19: LFS preset resolution: Balanced/High use -r 1, Preview -r 2.
+- [ ] BT-19: LFS preset resolution: Balanced/High use -r 1, Preview -r 2 (implemented, verified with pf360hosttest 146/146, Python 152/152; uncommitted pending review).
 - [ ] BT-13: 'Edit in LichtFeld' button (launch editor with the PLY).
 
 ## Completed

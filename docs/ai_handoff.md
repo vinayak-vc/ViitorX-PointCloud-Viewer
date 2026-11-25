@@ -3,6 +3,20 @@
 ## Session (2026-11-25) - LichtFeld-Studio integration & A/B tooling (cards BT-1, BT-2, BT-3, BT-8)
 
 - **Role**: Antigravity (Senior C++ Implementer); Claude (Tech Lead / Architect / Reviewer).
+- **BT-19 Completed (LFS preset resolution: Balanced/High use -r 1, Preview -r 2)**:
+  - Updated `src/viewer/Recon360Panel.cpp`:
+    - `applyPreset(int idx)`: when `engineIdx == 0` (LichtFeld), Balanced (`idx == 1`) and High (`idx == 2`) set `downscaleFactor = 1`, while Preview (`idx == 0`) sets `downscaleFactor = 2`. When `engineIdx == 1` (Nerfstudio), presets retain 4/2/1.
+    - `buildSpec()`: enforces `sp.downscaleFactor` = 1 (Balanced/High) or 2 (Preview) for LichtFeld presets, while Custom preset retains user-selected downscale factor from `kDownscales[downscaleIdx]`. Nerfstudio presets retain 4/2/1.
+    - `drawStepQuality()`: bullet text displays effective downscale `effDownscale`: `"Training images: 1/%d resolution, %d iterations"` (1/1 for Balanced/High, 1/2 for Preview). Preset descriptions replace "half-resolution" with "full-resolution" for Balanced and "quarter-resolution" with "half-resolution" for Preview when LichtFeld is selected.
+    - Re-applies active preset whenever `engineIdx` is changed or falls back.
+  - Updated `tools/pf360/pf360/manifest.py`:
+    - In `resolve()`, when `tr["engine"] == "lichtfeld"` and `downscaleFactor` is omitted, defaults to 1 for Balanced and High, and 2 for Preview.
+  - Updated tests:
+    - `src/tools/pf360hosttest/main.cpp`: added assertions verifying Balanced+LFS writes `downscaleFactor = 1` and Balanced+NS writes `downscaleFactor = 2`. Tested and passed 146/146.
+    - `tools/pf360/tests/test_manifest.py`: added assertions verifying LFS presets resolve to 1/1/2 and NS presets resolve to 1/2/4. Tested and passed 152/152 (1 skip).
+  - Built `ViitorXPCViewer_v10152.exe` and captured panel screenshot `C:\lfs\evidence_bt11_panel.png`.
+  - Manifest evidence exported: `C:\lfs\evidence_balanced_lfs_manifest.json` (`downscaleFactor: 1`).
+  - Card moved to `review`. Uncommitted pending Claude's review.
 - **BT-15 Completed (End-to-end verification: 10s preview clip through pf360 with LichtFeld on Balanced preset)**:
   - **Balanced Run Pipeline**:
     - Ran `python -m pf360 run` with Balanced preset: `downscaleFactor=2` (`-r 2`), `iterations=30000`, `engine="lichtfeld"`, `lfsStrategy="mrnf"`, `maxGaussians=2000000`.

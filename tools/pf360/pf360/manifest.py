@@ -75,14 +75,25 @@ def resolve(raw: Dict[str, Any], video_duration: Optional[float] = None) -> Dict
 
     tr.setdefault("method", base["method"])
     tr.setdefault("iterations", base["iterations"])
-    tr.setdefault("downscaleFactor", base["downscaleFactor"])
-    tr.setdefault("shDegree", base["shDegree"])
-    tr.setdefault("useScaleRegularization", base["useScaleRegularization"])
-    tr.setdefault("randomSeed", 42)
     # Training engine (nerfstudio | lichtfeld) and LichtFeld-specific settings
     tr.setdefault("engine", "nerfstudio")
     tr.setdefault("lfsStrategy", "mrnf")
     tr.setdefault("maxGaussians", 2_000_000)
+
+    # Resolution downscale factor: LichtFeld Balanced/High default to 1 (-r 1), Preview to 2 (-r 2).
+    # Nerfstudio presets remain unchanged (Preview: 4, Balanced: 2, High: 1).
+    if tr.get("engine") == "lichtfeld" and "downscaleFactor" not in tr:
+        if preset_name in ("balanced", "high"):
+            tr["downscaleFactor"] = 1
+        elif preset_name == "preview":
+            tr["downscaleFactor"] = 2
+        else:
+            tr["downscaleFactor"] = base["downscaleFactor"]
+    else:
+        tr.setdefault("downscaleFactor", base["downscaleFactor"])
+    tr.setdefault("shDegree", base["shDegree"])
+    tr.setdefault("useScaleRegularization", base["useScaleRegularization"])
+    tr.setdefault("randomSeed", 42)
     # Training-data clean-up (training_prep): 0 = no cap.
     tr.setdefault("seedPointCap", 500_000)
     tr.setdefault("dropMisplacedPanoramas", True)

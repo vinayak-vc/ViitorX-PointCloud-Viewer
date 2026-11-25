@@ -29,6 +29,17 @@ class ManifestTests(unittest.TestCase):
             self.assertEqual(m["training"]["method"], method)
             self.assertEqual(m["processing"]["imagesPerEquirect"], views)
             self.assertGreaterEqual(m["processing"]["targetFrames"], 2)
+            # Default engine (nerfstudio) downscale factors: Preview=4, Balanced=2, High=1
+            expected_df = {"preview": 4, "balanced": 2, "high": 1}[preset]
+            self.assertEqual(m["training"]["downscaleFactor"], expected_df)
+
+        # LichtFeld engine preset downscale factors: Balanced/High -> 1, Preview -> 2
+        for preset, expected_df in (("preview", 2), ("balanced", 1), ("high", 1)):
+            raw = base(self.tmp, self.video)
+            raw["training"]["engine"] = "lichtfeld"
+            raw["training"]["qualityPreset"] = preset
+            m = manifest.validate(manifest.resolve(raw, video_duration=60.0))
+            self.assertEqual(m["training"]["downscaleFactor"], expected_df)
 
     def test_frames_for_window_clamps(self):
         self.assertEqual(manifest.frames_for_window(3.0, 30.0, 30, 300), 90)
