@@ -35,12 +35,18 @@ struct Recon360Settings {
     std::string ffprobeExe;
     std::string maskModelDir;   // optional masking add-on (scripts/pf360/setup_masking.ps1)
     std::string engineCatalogUrl;   // signed engine-pack catalog; "" = build default (EnginePacks.h)
+    std::string lichtfeldExe;   // optional LichtFeld-Studio executable
+    std::string trainingEngine = "lichtfeld"; // preferred training engine ("lichtfeld" | "nerfstudio")
+    std::string lfsStrategy = "mrnf";         // default strategy ("mrnf" | "mcmc")
+    int maxGaussians = 2000000;               // default gaussian cap
 };
 
 // Folder that contains the `pf360` package (worker root), or "" if missing.
 std::string recon360WorkerRoot();
 // Interpreter used to run the worker ("" if none found).
 std::string recon360FindPython(const Recon360Settings& s);
+// Path to LichtFeld-Studio executable ("" if none found).
+std::string recon360FindLichtfeld(const Recon360Settings& s);
 
 // ---- presets ------------------------------------------------------------------
 struct Recon360Preset {
@@ -73,10 +79,13 @@ struct Recon360Doctor {
     bool glomap = false;       // optional GLOMAP engine pack usable (fast global camera solver)
     bool vocabTree = false;    // optional vocabulary-tree engine pack present (loop detection)
     std::string maskModelDir, nsPython;   // resolved by the worker (for the mask preview)
+    std::string lichtfeldExe;  // resolved LichtFeld executable if present
     std::string error;         // why the doctor itself could not run
     std::vector<Recon360Check> checks;
     std::vector<std::string> methods;   // splatfacto variants the install registers
     std::string gpuName, nerfstudioVersion, torchVersion;
+    std::string gpuDriver;
+    float gpuComputeCap = 0.0f;
     int gpuTotalMB = 0, gpuFreeMB = 0;
 };
 // Spawns `python -m pf360 doctor --json` (slow: imports torch). Background thread only.
@@ -116,6 +125,9 @@ struct Recon360JobSpec {
     bool loopDetection = false;        // sequential matching + vocabulary tree (optional pack)
     bool gpuBundleAdjustment = false;  // COLMAP mapper --Mapper.ba_use_gpu
     std::string qualityPreset = "balanced", method = "splatfacto", fallbackMethod;
+    std::string trainingEngine = "nerfstudio"; // "nerfstudio" | "lichtfeld"
+    std::string lfsStrategy = "mrnf";          // "mrnf" | "mcmc"
+    int maxGaussians = 2000000;                // default 2,000,000
     int iterations = 30000, downscaleFactor = 2, shDegree = 3, randomSeed = 42;
     bool useScaleRegularization = false;
     // Custom-only overrides (<0 = method default)

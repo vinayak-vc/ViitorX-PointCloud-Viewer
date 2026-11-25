@@ -249,6 +249,7 @@ std::vector<wchar_t> buildEnv(const Recon360Settings& s, const std::wstring& wor
     if (!s.ffmpegExe.empty())  extra.push_back({L"PF360_FFMPEG", widen(s.ffmpegExe)});
     if (!s.ffprobeExe.empty()) extra.push_back({L"PF360_FFPROBE", widen(s.ffprobeExe)});
     if (!s.maskModelDir.empty()) extra.push_back({L"PF360_MASK_MODEL", widen(s.maskModelDir)});
+    if (!s.lichtfeldExe.empty()) extra.push_back({L"PF360_LICHTFELD", widen(s.lichtfeldExe)});
     std::vector<wchar_t> block;
     LPWCH cur = GetEnvironmentStringsW();
     for (LPWCH p = cur; p && *p;) {
@@ -491,6 +492,20 @@ std::string recon360FindPython(const Recon360Settings& s) {
     return v.empty() ? std::string() : narrow(v[0]) + (v.size() > 1 ? " " + narrow(v[1]) : "");
 }
 
+std::string recon360FindLichtfeld(const Recon360Settings& s) {
+    if (!s.lichtfeldExe.empty() && isFile(widen(s.lichtfeldExe)))
+        return s.lichtfeldExe;
+    if (const wchar_t* env = _wgetenv(L"PF360_LICHTFELD")) {
+        if (*env && isFile(env)) return narrow(env);
+    }
+    const fs::path enginePath = localAppData() / L"ViitorX" / L"PointForge" / L"engines" / L"lichtfeld" / L"LichtFeld-Studio.exe";
+    if (isFile(enginePath.wstring())) return narrow(enginePath.wstring());
+    wchar_t buf[MAX_PATH];
+    if (SearchPathW(nullptr, L"LichtFeld-Studio.exe", nullptr, MAX_PATH, buf, nullptr))
+        return narrow(buf);
+    return {};
+}
+
 std::vector<Recon360Preset> recon360LoadPresets(std::string& err) {
     std::vector<Recon360Preset> out;
     const std::string root = recon360WorkerRoot();
@@ -549,6 +564,7 @@ Recon360Doctor recon360RunDoctor(const Recon360Settings& s, bool quick) {
         const json tools = j.value("tools", json::object());
         d.maskModelDir = str(tools, "maskModel");
         d.nsPython = str(tools, "nerfstudioPython");
+        d.lichtfeldExe = str(tools, "lichtfeld");
         const json t = j.value("torch", json::object());
         d.cuda = boolean(t, "cuda");
         d.torchVersion = str(t, "torch");
@@ -557,6 +573,16 @@ Recon360Doctor recon360RunDoctor(const Recon360Settings& s, bool quick) {
         if (g.contains("gpus") && g["gpus"].is_array() && !g["gpus"].empty()) {
             const json& g0 = g["gpus"][0];
             d.gpuName = str(g0, "name");
+            d.gpuDriver = str(g0, "driver");
+            // Python environment.py emits compute_cap as a string (e.g. "8.6")
+            if (g0.contains("compute_cap")) {
+                const json& cc = g0["compute_cap"];
+                if (cc.is_number())
+                    d.gpuComputeCap = (float)cc.get<double>();
+                else if (cc.is_string()) {
+                    try { d.gpuComputeCap = std::stof(cc.get<std::string>()); } catch (...) {}
+                }
+            }
             d.gpuTotalMB = (int)num(g0, "totalMB");
             d.gpuFreeMB = (int)num(g0, "freeMB");
         }
@@ -695,9 +721,14 @@ bool recon360WriteManifest(const Recon360JobSpec& sp, const Recon360Settings& s,
         m["processing"]["masking"] = {{"enabled", sp.maskEnabled && !groups.empty()}, {"groups", groups},
                                       {"dilatePx", std::max(0, std::min(64, sp.maskDilatePx))}};
     }
-    json tr = {{"qualityPreset", sp.qualityPreset}, {"method", sp.method}, {"iterations", sp.iterations},
+    json tr = {{"engine", sp.trainingEngine.empty() ? "nerfstudio" : sp.trainingEngine},
+               {"qualityPreset", sp.qualityPreset}, {"method", sp.method}, {"iterations", sp.iterations},
                {"downscaleFactor", sp.downscaleFactor}, {"shDegree", sp.shDegree}, {"randomSeed", sp.randomSeed},
                {"useScaleRegularization", sp.useScaleRegularization}};
+    if (sp.trainingEngine == "lichtfeld") {
+        tr["lfsStrategy"] = sp.lfsStrategy.empty() ? "mrnf" : sp.lfsStrategy;
+        tr["maxGaussians"] = sp.maxGaussians > 0 ? sp.maxGaussians : 2000000;
+    }
     if (!sp.fallbackMethod.empty()) tr["fallbackMethod"] = sp.fallbackMethod;
     if (sp.cullAlphaThresh > 0)   tr["cullAlphaThresh"] = sp.cullAlphaThresh;
     if (sp.densifyGradThresh > 0) tr["densifyGradThresh"] = sp.densifyGradThresh;
@@ -711,6 +742,7 @@ bool recon360WriteManifest(const Recon360JobSpec& sp, const Recon360Settings& s,
     if (!s.ffmpegExe.empty())  env["ffmpegExe"] = s.ffmpegExe;
     if (!s.ffprobeExe.empty()) env["ffprobeExe"] = s.ffprobeExe;
     if (!s.maskModelDir.empty()) env["maskModelDir"] = s.maskModelDir;
+    if (!s.lichtfeldExe.empty()) env["lichtfeldExe"] = s.lichtfeldExe;
     m["environment"] = env;
     json opts = {{"allowCache", sp.allowCache}};
     if (!sp.stopAfter.empty()) opts["stopAfter"] = sp.stopAfter;
@@ -759,6 +791,9 @@ bool recon360SpecFromManifest(const std::string& text, Recon360JobSpec& sp, std:
             }
         }
         const json& tr = m.at("training");
+        sp.trainingEngine = tr.value("engine", "nerfstudio");
+        sp.lfsStrategy = tr.value("lfsStrategy", "mrnf");
+        sp.maxGaussians = tr.value("maxGaussians", 2000000);
         sp.qualityPreset = tr.value("qualityPreset", "balanced");
         sp.method = tr.value("method", "splatfacto");
         sp.fallbackMethod = tr.value("fallbackMethod", "");
@@ -1124,6 +1159,7 @@ void recon360Reveal(const std::string& path, bool selectFile) {
 #else  // ---------------------------------------------------------------- stubs
 std::string recon360WorkerRoot() { return {}; }
 std::string recon360FindPython(const Recon360Settings&) { return {}; }
+std::string recon360FindLichtfeld(const Recon360Settings&) { return {}; }
 std::vector<Recon360Preset> recon360LoadPresets(std::string& err) { err = "Windows only"; return {}; }
 int recon360FramesForWindow(const Recon360Preset& p, double) { return p.minFrames; }
 Recon360Doctor recon360RunDoctor(const Recon360Settings&, bool) { Recon360Doctor d; d.error = "Windows only"; return d; }

@@ -1,5 +1,8 @@
 # Tasks
 
+## In Progress / In Review
+- [ ] BT-11: Implement wizard engine toggle (LichtFeld / Nerfstudio) + impact text in Recon360Panel (all presets + Custom); engine/strategy/maxGaussians prefs persistence; availability fallback in buildSpec; driver >= 570 check; pf360hosttest 141/141, Python 152/152 (in review, re-review submitted).
+
 ## Completed
 - [x] BT-10: Implement pf360 LichtFeld training backend (spec sec 1+2), command builder, progress parser, cancel/resume via CTRL_BREAK, chunked PLY frame normalisation diag(1,-1,-1) with full SH parity signs, sidecar writer, Recon360 viewer camera path support, and comprehensive unit tests (accepted by Lead in C-7).
 - `[x]` BT-5: Execute LichtFeld-Studio A/B run #2 with MCMC strategy at matched Gaussian budget (1.66M, 30k iters); 182.7s training time, 2,529 MiB peak VRAM, 23.419 dB holdout PSNR (accepted by Lead in C-4).

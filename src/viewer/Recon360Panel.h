@@ -41,6 +41,9 @@ public:
     static bool isVideoFile(const std::string& path);
     // Releases the GL preview texture (call before GL context teardown).
     void shutdownGL();
+    // Step navigation (e.g. for screenshot hooks or automation)
+    void setStep(int s) { step = s; }
+    int getStep() const { return step; }
 
 private:
     void startProbe(Recon360PanelHost& host);
@@ -59,7 +62,8 @@ private:
     void uploadPreview();
     // Builds a job from the current wizard settings for one video (single + batch).
     Recon360JobSpec buildSpec(const std::string& video, const Recon360Probe& pr, const std::string& outputDir,
-                              const std::string& plyName, bool confirmed, bool fullLength, int index) const;
+                              const std::string& plyName, bool confirmed, bool fullLength, int index,
+                              const Recon360Settings* s = nullptr) const;
 
     // ---- restore points: unfinished jobs (paused / app closed / crashed / failed)
     std::vector<Recon360Unfinished> unfinished;
@@ -162,6 +166,11 @@ private:
     std::vector<Recon360Preset> presets;
     std::string presetErr;
     int presetIdx = 1;           // preview, balanced, high, custom(=3)
+    int engineIdx = 0;           // 0 = LichtFeld (recommended), 1 = Nerfstudio
+    int lfsStrategyIdx = 0;      // 0 = MRNF (Quality), 1 = MCMC (Fast)
+    int maxGaussians = 2000000;  // default 2,000,000 budget cap
+    bool settingsSynced = false;
+    const Recon360Settings* lastSettings = nullptr;
     int methodIdx = 0;           // splatfacto, splatfacto-big
     int iterations = 30000, downscaleIdx = 1, shDegree = 3, seed = 42;
     bool scaleReg = false;
@@ -188,7 +197,7 @@ private:
     Recon360Doctor doctor;
     std::future<Recon360Doctor> doctorFut;
     bool doctorDeep = false;
-    char pathBufs[6][1024] = {};
+    char pathBufs[7][1024] = {};
     bool pathBufsLoaded = false;
 
     // output

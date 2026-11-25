@@ -78,13 +78,38 @@
     - C++ `pf360hosttest`: 128/128 passed.
     - C++ `pftest`: passed.
   - Accepted by Lead in C-7.
+- **BT-11 Completed (Wizard: engine toggle + impact text — Recon360Panel C++)**:
+  - Deliverables:
+    - `src/viewer/Recon360.h`: `Recon360Settings` gains `lichtfeldExe`, `trainingEngine`, `lfsStrategy`, `maxGaussians`; `Recon360Doctor` gains `lichtfeldExe`, `gpuDriver`, `gpuComputeCap`; `Recon360JobSpec` gains `trainingEngine`, `lfsStrategy`, `maxGaussians`. Declares `recon360FindLichtfeld()`.
+    - `src/viewer/Recon360Panel.h`: `Recon360Panel` gains `engineIdx`, `lfsStrategyIdx`, `maxGaussians`, `settingsSynced`, `lastSettings`; `buildSpec` updated to accept `const Recon360Settings* s = nullptr`; `pathBufs[7]` (was 6).
+    - `src/viewer/Recon360.cpp`: `recon360FindLichtfeld()` (checks prefs, `PF360_LICHTFELD` env, `engines/lichtfeld/LichtFeld-Studio.exe`, PATH `SearchPathW`); `buildEnv()` injects `PF360_LICHTFELD`; `recon360RunDoctor()` reads `tools["lichtfeld"]`, `gpus[0]["driver"]`, `gpus[0]["compute_cap"]` (string, `std::stof`); `recon360WriteManifest()` writes `engine`/`lfsStrategy`/`maxGaussians` in training block; `recon360SpecFromManifest()` reads them back.
+    - `src/viewer/Recon360Panel.cpp`:
+      - Moved "Training engine" combo above the Quality presets section (independent and active for all presets: Preview, Balanced, High, Custom).
+      - Added `parseDriverMajor()` and `checkLichtfeldAvailability()`. Requires NVIDIA driver >= 570 and compute cap >= 7.5.
+      - Applied availability fallback in `buildSpec()`: automatically falls back to `"nerfstudio"` if LichtFeld binary or GPU requirements fail.
+      - Synced `engineIdx` from settings on panel init (`show()` and `draw()`).
+      - Exposed shared controls (Iterations + Image Downscale) for both engines in Custom preset.
+      - Updated impact text: explicitly notes measurements were at full resolution, MCMC is fastest with highest PSNR (+1.53 dB) but softer detail (LPIPS 0.246 vs MRNF 0.217), and Nerfstudio baseline was CPU-contended (~3x speedup).
+      - `drawEnvironmentSettings()`: 7 path fields with LichtFeld auto-detect status.
+    - `src/viewer/main.cpp`:
+      - `saveSettings`/`loadSettings` gain `r360LichtfeldExe`, `r360Engine`, `r360LfsStrategy`, `r360MaxGaussians`.
+      - Added `--screenshot-recon <out.png>` hook: renders wizard Quality step via native framebuffer capture (`readFramebufferRGBA` + `encodePNG`), exiting after layout settles without input injection.
+    - `src/tools/pf360hosttest/main.cpp`:
+      - Added test for Balanced preset LichtFeld manifest; exports `C:\lfs\evidence_balanced_lfs_manifest.json` showing `engine="lichtfeld"`, `qualityPreset="balanced"`, `lfsStrategy="mrnf"`, `downscaleFactor=2`, `iterations=30000`, `maxGaussians=2000000`.
+  - Evidence Generated:
+    - Panel screenshot: `C:\lfs\evidence_bt11_panel.png` (1280x720 RGBA, 75 KB, produced via native hook).
+    - Manifest evidence: `C:\lfs\evidence_balanced_lfs_manifest.json`.
+  - Test Results:
+    - `pf360hosttest`: 141/141 passed.
+    - Python test suite: 152/152 passed (1 skipped).
+  - Build: `ViitorXPCViewer_v10148.exe` in `build-r360/Release/` (exit 0).
+  - Uncommitted — pending Claude's review.
 - **Kanban Board State**:
   - `done`: BT-1, BT-8, BT-4, BT-5, BT-17, BT-18, BT-9, BT-10
-  - `todo` / `in-progress`: BT-11
-  - `review`: BT-2, BT-3
+  - `review`: BT-2, BT-3, BT-11
   - `backlog`: BT-6 (skipped), BT-7, BT-12 through BT-16
 - **Next Recommended Task**:
-  - Implement BT-11 (Wizard UI for LichtFeld training backend in Recon360Panel).
+  - Wait for Claude's review of BT-11; next likely cards: BT-15 (end-to-end 10s run), BT-13 (Edit in LichtFeld button), BT-12 (tile training).
 
 
 ## Session (2026-11-23) - real re-run on the user machine; mapper progress in the UI

@@ -662,6 +662,8 @@ int main(int argc, char** argv) {
     std::string exportGlbOnStart;
     // --export-fbx <out.fbx>: same as --export-glb but writes ASCII FBX.
     std::string exportFbxOnStart;
+    // --screenshot-recon <out.png>: opens Recon360 wizard at Quality step, captures after layout settles, quits.
+    std::string exportReconScreenshotOnStart;
     // Simple argument parsing
     for (int i = 1; i < argc; ++i) {
         const char* a = argv[i];
@@ -677,6 +679,8 @@ int main(int argc, char** argv) {
             exportGlbOnStart = argv[++i];
         } else if (strcmp(a, "--export-fbx") == 0 && i + 1 < argc) {
             exportFbxOnStart = argv[++i];
+        } else if (strcmp(a, "--screenshot-recon") == 0 && i + 1 < argc) {
+            exportReconScreenshotOnStart = argv[++i];
         } else if (i == 1) {
             // First positional argument interpreted as initial directory
             initialDir = a;
@@ -1199,6 +1203,10 @@ int main(int argc, char** argv) {
         fprintf(f, "r360Ffprobe=%s\n", recon360Settings.ffprobeExe.c_str());
         fprintf(f, "r360MaskModel=%s\n", recon360Settings.maskModelDir.c_str());
         fprintf(f, "r360EngineCatalog=%s\n", recon360Settings.engineCatalogUrl.c_str());
+        fprintf(f, "r360LichtfeldExe=%s\n", recon360Settings.lichtfeldExe.c_str());
+        fprintf(f, "r360Engine=%s\n", recon360Settings.trainingEngine.c_str());
+        fprintf(f, "r360LfsStrategy=%s\n", recon360Settings.lfsStrategy.c_str());
+        fprintf(f, "r360MaxGaussians=%d\n", recon360Settings.maxGaussians);
         for (const auto& r : recentDirs) {
             auto it = recentMeta.find(r);
             uint64_t p = it != recentMeta.end() ? it->second.points : 0;
@@ -1286,6 +1294,10 @@ int main(int argc, char** argv) {
                     else if (k == "r360Ffprobe") recon360Settings.ffprobeExe = v;
                     else if (k == "r360MaskModel") recon360Settings.maskModelDir = v;
                     else if (k == "r360EngineCatalog") recon360Settings.engineCatalogUrl = v;
+                    else if (k == "r360LichtfeldExe") recon360Settings.lichtfeldExe = v;
+                    else if (k == "r360Engine") recon360Settings.trainingEngine = v;
+                    else if (k == "r360LfsStrategy") recon360Settings.lfsStrategy = v;
+                    else if (k == "r360MaxGaussians") { try { recon360Settings.maxGaussians = std::stoi(v); } catch (...) {} }
                 }
             }
             else if (strncmp(line, "recent=", 7) == 0) {
@@ -2729,6 +2741,12 @@ int main(int argc, char** argv) {
         std::string out = ensureVxpcPath(convOutput, std::filesystem::path(convInputs[0]).stem().string());
         logInfo("--convert: enqueueing " + convertOnStart + " -> " + out);
         jobs.enqueue(convInputs[0], out, customOpts, /*loadWhenDone=*/true);
+    }
+
+    int reconShotFrameCount = 0;
+    if (!exportReconScreenshotOnStart.empty()) {
+        recon360Panel.show();
+        recon360Panel.setStep(2); // Step 2 = Quality preset
     }
 
     // --export-video smoke hook: synth a 3-key orbit path over the loaded
@@ -6615,6 +6633,21 @@ int main(int argc, char** argv) {
             }
         } else {
             pendingShot = false;
+        }
+
+        if (!exportReconScreenshotOnStart.empty()) {
+            if (++reconShotFrameCount >= 10) {
+                std::vector<unsigned char> rgba = readFramebufferRGBA(winW, winH);
+                std::vector<unsigned char> png  = encodePNG(winW, winH, rgba.data());
+                if (!png.empty()) {
+                    if (FILE* f = fopen(exportReconScreenshotOnStart.c_str(), "wb")) {
+                        fwrite(png.data(), 1, png.size(), f);
+                        fclose(f);
+                        logInfo("Saved recon screenshot to " + exportReconScreenshotOnStart);
+                    }
+                }
+                running = false;
+            }
         }
 
         SDL_GL_SwapWindow(window);

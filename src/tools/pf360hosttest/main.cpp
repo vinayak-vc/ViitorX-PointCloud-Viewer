@@ -125,6 +125,48 @@ static void testManifest(const fs::path& tmp) {
     CHECK(j["options"]["stopAfter"] == "frame_extraction");
     CHECK(!j["training"].contains("cullAlphaThresh"));                     // unset custom fields omitted
     CHECK(j["processing"]["masking"]["enabled"] == false);                 // masking off by default
+    // Default engine is "nerfstudio" (old manifests stay unchanged)
+    CHECK(j["training"]["engine"] == "nerfstudio");
+    CHECK(!j["training"].contains("lfsStrategy"));  // only written for lichtfeld
+
+    // LichtFeld manifest: engine + strategy + maxGaussians written; NS fields still present
+    sp.jobId = "hosttest_manifest_lfs";
+    sp.trainingEngine = "lichtfeld";
+    sp.lfsStrategy = "mcmc";
+    sp.maxGaussians = 1500000;
+    CHECK(recon360WriteManifest(sp, st, path, err));
+    {
+        std::ifstream flfs(fs::u8path(path));
+        auto jlfs = nlohmann::json::parse(flfs);
+        CHECK(jlfs["training"]["engine"] == "lichtfeld");
+        CHECK(jlfs["training"]["lfsStrategy"] == "mcmc");
+        CHECK(jlfs["training"]["maxGaussians"] == 1500000);
+    }
+
+    // Balanced-preset LichtFeld job: downscaleFactor 2, iterations 30000, strategy mrnf
+    sp.jobId = "hosttest_manifest_balanced_lfs";
+    sp.trainingEngine = "lichtfeld";
+    sp.qualityPreset = "balanced";
+    sp.lfsStrategy = "mrnf";
+    sp.downscaleFactor = 2;
+    sp.iterations = 30000;
+    sp.maxGaussians = 2000000;
+    CHECK(recon360WriteManifest(sp, st, path, err));
+    {
+        std::ifstream fbal(fs::u8path(path));
+        auto jbal = nlohmann::json::parse(fbal);
+        CHECK(jbal["training"]["engine"] == "lichtfeld");
+        CHECK(jbal["training"]["qualityPreset"] == "balanced");
+        CHECK(jbal["training"]["lfsStrategy"] == "mrnf");
+        CHECK(jbal["training"]["downscaleFactor"] == 2);
+        CHECK(jbal["training"]["iterations"] == 30000);
+        CHECK(jbal["training"]["maxGaussians"] == 2000000);
+        std::ofstream fev("C:/lfs/evidence_balanced_lfs_manifest.json");
+        if (fev.is_open()) {
+            fev << jbal.dump(2);
+        }
+    }
+    sp.trainingEngine = "nerfstudio";  // reset for further tests
 
     // Masking fields: groups in a fixed order, dilation clamped, enabled only with >= 1 group.
     sp.jobId = "hosttest_manifest_mask";
