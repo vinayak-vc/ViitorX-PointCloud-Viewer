@@ -330,5 +330,180 @@ class TestLichtfeldEngine(unittest.TestCase):
         self.assertIn("Expected exported PLY splat_30000.ply missing", str(cm.exception))
 
 
+class TestLevelSceneForLfs(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="pf360_level_test_")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _make_tilted_rig(self, proc_dir: Path, tilt_deg: float = 45.0):
+        import math
+        proc_dir.mkdir(parents=True, exist_ok=True)
+        rad = math.radians(tilt_deg)
+        Rx = np.array([
+            [1.0, 0.0, 0.0],
+            [0.0, math.cos(rad), -math.sin(rad)],
+            [0.0, math.sin(rad), math.cos(rad)],
+        ], dtype=np.float64)
+        offset = np.array([10.0, -5.0, 3.0], dtype=np.float64)
+
+        frames = []
+        # 2 panoramas, 4 horizontal views each (yaw 0, 90, 180, 270)
+        for p_idx, cx in enumerate((0.0, 2.0)):
+            center = np.array([cx, 0.0, 0.0], dtype=np.float64)
+            for v_idx in range(4):
+                yaw = math.radians(v_idx * 90.0)
+                cy, sy = math.cos(yaw), math.sin(yaw)
+                # Upright OpenGL c2w: up = (0, 0, 1)
+                R_upright = np.array([
+                    [cy, 0.0, sy],
+                    [sy, 0.0, -cy],
+                    [0.0, 1.0, 0.0],
+                ], dtype=np.float64)
+                # Swap cols 1 and 2 so col 1 = (0,0,1) up
+                R_upright = np.array([
+                    [cy, 0.0, sy],
+                    [sy, 0.0, -cy],
+                    [0.0, 1.0, 0.0],
+                ], dtype=np.float64)
+                # Actually col 1 is up = (0,0,1):
+                R_upright = np.array([
+                    [cy, 0.0, sy],
+                    [sy, 0.0, -cy],
+                    [0.0, 0.0, 0.0],
+                ], dtype=np.float64)
+                R_upright = np.array([
+                    [cy, 0.0, sy],
+                    [-sy, 0.0, cy],
+                    [0.0, 1.0, 0.0],
+                ], dtype=np.float64)
+                # Build orthonormal basis with col1 = (0,0,1)
+                right = np.array([cy, sy, 0.0], dtype=np.float64)
+                up = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+                back = np.cross(right, up)
+                R_upright = np.column_stack([right, up, back])
+
+                mat = np.eye(4, dtype=np.float64)
+                mat[:3, :3] = Rx @ R_upright
+                mat[:3, 3] = (Rx @ center) + offset
+                frames.append({
+                    "file_path": f"images/frame_{p_idx:06d}_view_{v_idx:02d}.jpg",
+                    "transform_matrix": mat.tolist(),
+                })
+
+        # Seed PLY with 2 points along tilted up
+        from pf360 import training_prep
+        pts = [tuple((Rx @ np.array([0.0, 0.0, 1.0]) + offset).tolist()),
+               tuple((Rx @ np.array([2.0, 0.0, 0.0]) + offset).tolist())]
+        cols = [(255, 0, 0), (0, 255, 0)]
+        training_prep.write_ply(proc_dir / "sparse_pc.ply", pts, cols)
+
+        tf = {"camera_model": "OPENCV", "ply_file_path": "sparse_pc.ply", "frames": frames}
+        import json as _json
+        with open(proc_dir / "transforms.json", "w", encoding="utf-8") as f:
+            _json.dump(tf, f)
+
+    def test_synthetic_tilted_rig_is_levelled_and_idempotent(self):
+        import json as _json
+        proc = Path(self.tmp) / "proc"
+        self._make_tilted_rig(proc, tilt_deg=45.0)
+
+        info = lichtfeld_engine.level_scene_for_lfs(proc)
+        self.assertTrue(info["levelled"])
+        self.assertAlmostEqual(info["levelTiltDeg"], 45.0, delta=0.5)
+
+        with open(proc / "transforms.json", "r", encoding="utf-8") as f:
+            tf = _json.load(f)
+        ups = np.array([np.array(fr["transform_matrix"])[:3, 1] for fr in tf["frames"]])
+        mean_up = ups.mean(axis=0)
+        mean_up /= np.linalg.norm(mean_up)
+        err_deg = float(np.degrees(np.arccos(np.clip(mean_up[2], -1.0, 1.0))))
+        self.assertLess(err_deg, 0.5)
+
+        # Centred around origin
+        centers = np.array([np.array(fr["transform_matrix"])[:3, 3] for fr in tf["frames"]])
+        self.assertLess(float(np.linalg.norm(np.median(centers, axis=0))), 1e-6)
+
+        # Seed PLY transformed and updated
+        self.assertEqual(tf["ply_file_path"], "sparse_pc_levelled.ply")
+        from pf360 import training_prep
+        pts, cols = training_prep.read_ply(proc / "sparse_pc_levelled.ply")
+        self.assertEqual(len(pts), 2)
+        self.assertEqual(cols, [(255, 0, 0), (0, 255, 0)])
+
+        # Idempotent second call
+        info2 = lichtfeld_engine.level_scene_for_lfs(proc)
+        self.assertEqual(info2, info)
+
+    def test_processed_dir_byte_identical_when_levelling_to_lfs_input(self):
+        import hashlib
+        proc = Path(self.tmp) / "proc_ro"
+        lfs_in = Path(self.tmp) / "training" / "lfs_input"
+        self._make_tilted_rig(proc, tilt_deg=45.0)
+        (proc / "images").mkdir(exist_ok=True)
+        (proc / "images" / "frame_000000_view_00.jpg").write_bytes(b"jpg")
+
+        before_tf = hashlib.sha256((proc / "transforms.json").read_bytes()).hexdigest()
+        before_ply = hashlib.sha256((proc / "sparse_pc.ply").read_bytes()).hexdigest()
+
+        info = lichtfeld_engine.level_scene_for_lfs(proc, lfs_input_dir=lfs_in)
+        self.assertTrue(info["levelled"])
+        self.assertAlmostEqual(info["levelTiltDeg"], 45.0, delta=0.5)
+
+        # processed/ must be byte-for-byte identical
+        self.assertEqual(hashlib.sha256((proc / "transforms.json").read_bytes()).hexdigest(), before_tf)
+        self.assertEqual(hashlib.sha256((proc / "sparse_pc.ply").read_bytes()).hexdigest(), before_ply)
+        self.assertFalse((proc / "sparse_pc_levelled.ply").exists())
+
+        # training/lfs_input/ must have the levelled transforms + ply, NO images junction/reparse point
+        import json as _json
+        self.assertTrue((lfs_in / "transforms.json").is_file())
+        self.assertTrue((lfs_in / "sparse_pc_levelled.ply").is_file())
+        self.assertFalse((lfs_in / "images").exists())
+        self.assertFalse((lfs_in / "images").is_symlink())
+        with open(lfs_in / "transforms.json", "r", encoding="utf-8") as f:
+            lfs_tf = _json.load(f)
+        for fr in lfs_tf["frames"]:
+            resolved = (lfs_in / fr["file_path"]).resolve()
+            self.assertTrue(resolved.is_relative_to(proc.resolve()))
+
+    def test_already_level_10s_clip_unchanged(self):
+        src_tf = Path(r"C:\Users\ADMIN\Desktop\Video\PointForge360\_preview10s_ab\data\transforms.json")
+        if not src_tf.is_file():
+            self.skipTest("10s preview clip transforms.json not present")
+        proc = Path(self.tmp) / "proc10s"
+        proc.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src_tf, proc / "transforms.json")
+        info = lichtfeld_engine.level_scene_for_lfs(proc)
+        self.assertTrue(info["levelled"])
+        self.assertLess(info["levelTiltDeg"], 0.5)
+
+    def test_nerfstudio_fingerprint_unchanged(self):
+        from pf360.nerfstudio_backend import NerfstudioBackend
+        from pf360.backend import StageContext, Tools, Emitter, CancelToken
+        from pf360.workspace import Workspace
+        ws = Workspace(Path(self.tmp) / "ws_ns", "out.ply")
+        ctx = StageContext(
+            manifest={
+                "training": {
+                    "engine": "nerfstudio", "method": "splatfacto", "iterations": 30000,
+                    "downscaleFactor": 2, "shDegree": 3, "randomSeed": 42,
+                    "useScaleRegularization": False, "cullAlphaThresh": None,
+                    "densifyGradThresh": None, "cullScaleThresh": None,
+                },
+                "processing": {},
+                "output": {"plyFileName": "out.ply", "directory": self.tmp},
+            },
+            tools=Tools(),
+            workspace=ws,
+            emitter=Emitter(),
+            cancel=CancelToken(),
+        )
+        inputs = NerfstudioBackend().stage_inputs("training", ctx)
+        self.assertNotIn("engine", inputs)
+        self.assertEqual(inputs["method"], "splatfacto")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -55,7 +55,7 @@ def box_to_lfs(box: Sequence[float]) -> Tuple[float, float, float, float, float,
     return (lx0, ly0, lz0, lx1, ly1, lz1)
 
 
-AUTO_TILE_VIEW_THRESHOLD = 2500         # camera frames
+AUTO_TILE_VIEW_THRESHOLD = 20000        # camera frames (BT-20: 16,814 views fit in 1 run on 24 GB)
 
 
 def should_auto_tile(walk_extent: float, num_views: int) -> bool:

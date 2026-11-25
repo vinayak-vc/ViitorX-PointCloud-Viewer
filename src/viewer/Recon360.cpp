@@ -1140,10 +1140,9 @@ Recon360CameraPath recon360CameraPath(const std::string& plyPath) {
     std::error_code ec;
     const fs::path ply = fs::path(widen(plyPath));
     const fs::path ws = ply.parent_path().parent_path();
-    const fs::path tfPath = ws / L"processed" / L"transforms.json";
-    if (!fs::exists(tfPath, ec)) return out;
+    fs::path tfPath = ws / L"processed" / L"transforms.json";
 
-    // Check sidecar or report to determine coordinate frame
+    // Check sidecar or report to determine coordinate frame and optional levelled camerasFile
     std::string frameType = "ns_dataparser";
     const fs::path sidecarPath = fs::path(widen(plyPath + ".pf360.json"));
     if (fs::exists(sidecarPath, ec)) {
@@ -1151,6 +1150,12 @@ Recon360CameraPath recon360CameraPath(const std::string& plyPath) {
             std::ifstream sf(sidecarPath);
             json sc = json::parse(sf);
             frameType = sc.value("frame", "ns_dataparser");
+            const std::string camFile = sc.value("camerasFile", std::string{});
+            if (!camFile.empty()) {
+                fs::path cp = fs::path(widen(camFile));
+                if (cp.is_relative()) cp = ws / cp;
+                if (fs::exists(cp, ec)) tfPath = cp;
+            }
         } catch (...) {}
     } else if (fs::exists(ws / L"reconstruction_report.json", ec)) {
         try {
@@ -1161,6 +1166,7 @@ Recon360CameraPath recon360CameraPath(const std::string& plyPath) {
             }
         } catch (...) {}
     }
+    if (!fs::exists(tfPath, ec)) return out;
 
     if (frameType == "transforms") {
         try {

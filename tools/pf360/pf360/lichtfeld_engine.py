@@ -175,6 +175,121 @@ def rotate_ply_zup(src_path: Path, dst_path: Path, chunk_size: int = 100_000) ->
                 rem -= cur
 
 
+def level_scene_for_lfs(processed_dir: Path, lfs_input_dir: Optional[Path] = None,
+                        log: Any = None) -> Dict[str, Any]:
+    """Gravity-aligns transforms.json and its seed PLY so scene up aligns with +Z,
+    and translates the camera-centre median to the origin (no scale change).
+
+    When lfs_input_dir is provided (normal pipeline), writes the levelled
+    transforms.json and sparse_pc_levelled.ply into lfs_input_dir with
+    relative file_path references back to processed_dir (no junctions or
+    reparse points), so processed_dir remains byte-for-byte untouched.
+    """
+    src_tf = processed_dir / "transforms.json"
+    if not src_tf.is_file():
+        return {}
+    out_dir = lfs_input_dir if lfs_input_dir is not None else processed_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_tf = out_dir / "transforms.json"
+
+    with open(src_tf, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if lfs_input_dir is None and isinstance(data.get("pf360Level"), dict) and data["pf360Level"].get("levelled"):
+        return dict(data["pf360Level"])
+
+    frames = data.get("frames") or []
+    if not frames:
+        return {}
+
+    pano_ups: Dict[str, List[np.ndarray]] = {}
+    centers: List[np.ndarray] = []
+    for idx, fr in enumerate(frames):
+        mat = np.asarray(fr["transform_matrix"], dtype=np.float64)
+        up = mat[:3, 1]
+        centers.append(mat[:3, 3])
+        fp = str(fr.get("file_path", ""))
+        m = training_prep._FRAME_RE.search(fp)
+        key = m.group(1) if m else f"_f{idx}"
+        pano_ups.setdefault(key, []).append(up)
+
+    unit_pano_ups: List[np.ndarray] = []
+    for ups in pano_ups.values():
+        mean_u = np.mean(ups, axis=0)
+        n = float(np.linalg.norm(mean_u))
+        if n > 1e-9:
+            unit_pano_ups.append(mean_u / n)
+    if not unit_pano_ups:
+        return {}
+
+    u = np.mean(unit_pano_ups, axis=0)
+    u_norm = float(np.linalg.norm(u))
+    if u_norm <= 1e-9:
+        return {}
+    u = u / u_norm
+
+    z_axis = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    c = float(np.clip(np.dot(u, z_axis), -1.0, 1.0))
+    tilt_deg = float(np.degrees(np.arccos(c)))
+
+    if c > 1.0 - 1e-12:
+        R = np.eye(3, dtype=np.float64)
+    elif c < -1.0 + 1e-12:
+        R = np.diag([1.0, -1.0, -1.0])
+    else:
+        v = np.cross(u, z_axis)
+        K = np.array([[0.0, -v[2], v[1]],
+                      [v[2], 0.0, -v[0]],
+                      [-v[1], v[0], 0.0]], dtype=np.float64)
+        R = np.eye(3, dtype=np.float64) + K + (K @ K) / (1.0 + c)
+
+    med = np.median(np.asarray(centers, dtype=np.float64), axis=0)
+    t = -(R @ med)
+
+    for fr in frames:
+        mat = np.asarray(fr["transform_matrix"], dtype=np.float64)
+        out_mat = np.eye(4, dtype=np.float64)
+        out_mat[:3, :3] = R @ mat[:3, :3]
+        out_mat[:3, 3] = R @ mat[:3, 3] + t
+        fr["transform_matrix"] = out_mat.tolist()
+        if lfs_input_dir is not None and fr.get("file_path"):
+            fp = str(fr["file_path"])
+            if not os.path.isabs(fp):
+                src_img = processed_dir / fp
+                fr["file_path"] = os.path.relpath(src_img, out_dir).replace("\\", "/")
+
+    ply_rel = data.get("ply_file_path")
+    if ply_rel:
+        ply_path = Path(ply_rel) if os.path.isabs(ply_rel) else (processed_dir / ply_rel)
+        if ply_path.is_file():
+            pts, cols = training_prep.read_ply(ply_path)
+            if pts:
+                arr = np.asarray(pts, dtype=np.float64)
+                transformed = (arr @ R.T) + t
+                pts_out = [tuple(row) for row in transformed.tolist()]
+            else:
+                pts_out = []
+            levelled_ply = out_dir / "sparse_pc_levelled.ply"
+            training_prep.write_ply(levelled_ply, pts_out, cols)
+            data["ply_file_path"] = "sparse_pc_levelled.ply"
+
+    level_info: Dict[str, Any] = {
+        "levelled": True,
+        "levelTiltDeg": round(tilt_deg, 2),
+        "levelR": R.tolist(),
+        "levelT": t.tolist(),
+    }
+    data["pf360Level"] = level_info
+
+    tmp_tf = out_tf.with_suffix(".json.tmp")
+    with open(tmp_tf, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    tmp_tf.replace(out_tf)
+
+    if log:
+        log("Levelled LFS scene: tilt %.2f deg -> +Z, centred at camera median." % tilt_deg)
+    return level_info
+
+
 def train_lfs(ctx: StageContext) -> Dict[str, Any]:
     """Runs LichtFeld-Studio training."""
     ws = ctx.workspace
@@ -211,6 +326,17 @@ def train_lfs(ctx: StageContext) -> Dict[str, Any]:
         raise StageFailed("transforms_train.json exists in %s; LichtFeld would prefer it over transforms.json."
                           % ws.processed_dir)
 
+    lfs_input_dir = ws.training_dir / "lfs_input"
+    try:
+        level_info = level_scene_for_lfs(ws.processed_dir, lfs_input_dir=lfs_input_dir,
+                                         log=lambda m: ctx.emitter.log(m, stage="training"))
+    except (OSError, ValueError) as e:
+        ctx.emitter.warning("Scene levelling skipped (%s)." % e, stage="training")
+        level_info = {}
+    if level_info:
+        prep.update(level_info)
+    data_dir = lfs_input_dir if (lfs_input_dir / "transforms.json").is_file() else ws.processed_dir
+
     ignored: List[str] = []
     for k in ("randomSeed", "useScaleRegularization", "cullAlphaThresh", "densifyGradThresh", "cullScaleThresh", "longSchedule"):
         if tr.get(k) is not None and tr.get(k) is not False:
@@ -221,9 +347,9 @@ def train_lfs(ctx: StageContext) -> Dict[str, Any]:
 
     num_tiles = int(tr.get("tiles", 1))
     if num_tiles > 1:
-        return train_lfs_tiles(ctx, num_tiles, prep)
+        return train_lfs_tiles(ctx, num_tiles, prep, data_dir=data_dir)
 
-    args = build_cmd(exe, ws.processed_dir, lfs_out, tr, resume=is_resuming, project_path=project_file)
+    args = build_cmd(exe, data_dir, lfs_out, tr, resume=is_resuming, project_path=project_file)
 
     last = {"pct": -1.0, "step": 0, "splats": 0, "loss": 0.0}
     tail: List[str] = []
@@ -335,15 +461,19 @@ def train_lfs(ctx: StageContext) -> Dict[str, Any]:
     if is_resuming:
         out["resumedFromCheckpoint"] = str(project_file)
     out.update({k: prep[k] for k in ("seedPoints", "seedPointsUsed", "droppedPanoramas", "droppedViews",
-                                     "trainingViews", "viewBudget", "panoramasUsed") if k in prep})
+                                     "trainingViews", "viewBudget", "panoramasUsed",
+                                     "levelled", "levelTiltDeg", "levelR", "levelT") if k in prep})
     return out
 
 
-def train_lfs_tiles(ctx: StageContext, num_tiles: int, prep: Dict[str, Any]) -> Dict[str, Any]:
+def train_lfs_tiles(ctx: StageContext, num_tiles: int, prep: Dict[str, Any],
+                    data_dir: Optional[Path] = None) -> Dict[str, Any]:
     """Runs multi-tile LichtFeld training sequentially for VRAM safety, then merges."""
     from . import tiles
 
     ws = ctx.workspace
+    if data_dir is None:
+        data_dir = ws.processed_dir
     tr = ctx.manifest["training"]
     exe = ctx.tools.lichtfeld
     if not exe or not os.path.isfile(exe):
@@ -358,7 +488,7 @@ def train_lfs_tiles(ctx: StageContext, num_tiles: int, prep: Dict[str, Any]) -> 
     tile_tr = dict(tr)
     tile_tr["lfsStrategy"] = "mcmc"
 
-    tile_specs = tiles.plan_tiles_from_transforms(ws.processed_dir / "transforms.json", num_tiles,
+    tile_specs = tiles.plan_tiles_from_transforms(data_dir / "transforms.json", num_tiles,
                                                   overlap_fraction=overlap_fraction)
     ctx.emitter.log(
         f"Planned {num_tiles} spatial tiles along camera trajectory "
@@ -393,7 +523,7 @@ def train_lfs_tiles(ctx: StageContext, num_tiles: int, prep: Dict[str, Any]) -> 
             ctx.emitter.log(f"resuming Tile {tile_idx + 1}/{num_tiles} from checkpoint {project_file}", stage="training")
 
         tile_tr["maxGaussians"] = cap_per_tile
-        args = build_cmd(exe, ws.processed_dir, tile_out, tile_tr,
+        args = build_cmd(exe, data_dir, tile_out, tile_tr,
                          resume=is_resuming, project_path=project_file,
                          cropbox=spec.crop_box_lfs_str)
 
@@ -513,7 +643,8 @@ def train_lfs_tiles(ctx: StageContext, num_tiles: int, prep: Dict[str, Any]) -> 
         "lfsExe": exe,
     }
     out.update({k: prep[k] for k in ("seedPoints", "seedPointsUsed", "droppedPanoramas", "droppedViews",
-                                     "trainingViews", "viewBudget", "panoramasUsed") if k in prep})
+                                     "trainingViews", "viewBudget", "panoramasUsed",
+                                     "levelled", "levelTiltDeg", "levelR", "levelT") if k in prep})
     return out
 
 
@@ -548,6 +679,23 @@ def export_lfs(ctx: StageContext) -> Dict[str, Any]:
         sidecar["tiles"] = int(tr["tiles"])
         sidecar["tileOverlapFraction"] = float(tr.get("tileOverlap", 0.15))
 
+    lfs_input_tf = ws.training_dir / "lfs_input" / "transforms.json"
+    if lfs_input_tf.is_file():
+        sidecar["camerasFile"] = "training/lfs_input/transforms.json"
+
+    tr_res = ctx.results.get("training", {})
+    if not tr_res.get("levelled"):
+        tf_path = lfs_input_tf if lfs_input_tf.is_file() else (ws.processed_dir / "transforms.json")
+        if tf_path.is_file():
+            try:
+                with open(tf_path, "r", encoding="utf-8") as f:
+                    tr_res = json.load(f).get("pf360Level", {})
+            except (OSError, ValueError):
+                pass
+    for k in ("levelled", "levelTiltDeg", "levelR", "levelT"):
+        if k in tr_res:
+            sidecar[k] = tr_res[k]
+
     sidecar_path = Path(str(dst) + ".pf360.json")
     with open(sidecar_path, "w", encoding="utf-8") as f:
         json.dump(sidecar, f, indent=2)
@@ -566,4 +714,7 @@ def export_lfs(ctx: StageContext) -> Dict[str, Any]:
     }
     if int(tr.get("tiles", 1)) > 1:
         res["tiles"] = int(tr["tiles"])
+    for k in ("levelled", "levelTiltDeg"):
+        if k in tr_res:
+            res[k] = tr_res[k]
     return res

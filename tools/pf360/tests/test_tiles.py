@@ -125,11 +125,11 @@ class TestTiles(unittest.TestCase):
 
     def test_should_auto_tile_view_count(self):
         # Walk extent no longer gates auto-tiling (COLMAP scale is arbitrary).
-        # Only view count matters.
-        self.assertFalse(tiles.should_auto_tile(1000.0, 100))   # large extent, low views -> off
-        self.assertFalse(tiles.should_auto_tile(1000.0, 2499))  # just below threshold
-        self.assertTrue(tiles.should_auto_tile(0.0, 2500))      # exactly at threshold, tiny extent
-        self.assertTrue(tiles.should_auto_tile(0.001, 5000))    # well above threshold
+        # Only view count matters (threshold 20,000 per BT-20/BT-21).
+        self.assertFalse(tiles.should_auto_tile(1000.0, 100))    # large extent, low views -> off
+        self.assertFalse(tiles.should_auto_tile(1000.0, 19999))  # just below threshold
+        self.assertTrue(tiles.should_auto_tile(0.0, 20000))      # exactly at threshold, tiny extent
+        self.assertTrue(tiles.should_auto_tile(0.001, 25000))    # well above threshold
 
     def test_train_tiles_output_name_no_hardcoded_prefix(self):
         """train_tiles() must not embed 'preview10s' in the output file name."""
