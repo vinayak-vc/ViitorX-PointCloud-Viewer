@@ -7,31 +7,52 @@
   - Deliverable: `C:\lfs\LichtFeld-Studio\build-windows-release\LichtFeld-Studio.exe` (197,932,032 bytes / 188.76 MB).
   - Verification: `LichtFeld-Studio.exe --help` executed with exit code 0.
   - Runtime DLLs: All 86 dependencies staged beside executable (`libplacebo-360.dll`, `SDL3.dll`, `python312.dll`, `cudart64_13.dll`, `curand64_10.dll`, `nvimgcodec_0.dll`, `openjph.0.32.dll`, `lfs_*.dll`).
-  - Fixes implemented:
-    - Overlay port `C:\lfs\overlay-ports\libplacebo\portfile.cmake` configured with candidate `clang-cl` discovery.
-    - Isolated `lld-link.exe` into buildtrees tools directory and prepended to PATH to satisfy Meson Windows linker detection without exposing `clang.exe` to CMake.
-    - Updated `build_lfs.cmd` to invoke `vcvars64.bat -vcvars_ver=14.44` (MSVC 19.44.35226) to fulfill C++23 requirements (`_MSVC_LANG >= 202302L`).
-    - Fixed VS18 MSVC STL divergence (`__std_find_*_not_of_trivial_pos_1`) by injecting a lightweight, headerless static compatibility helper into `glslang.lib`, `glslang-default-resource-limits.lib`, and `SPIRV-Tools-opt.lib`.
+  - Accepted and marked `done` by Claude.
 - **BT-2 Completed (LichtFeld-Studio headless CLI contract)**:
   - Deliverable: `C:\lfs\LFS_CLI_CONTRACT.md`.
-  - Documented items 1–9 and addendum items 10–14 with file and line evidence:
-    - Invocation: `LichtFeld-Studio.exe --headless -d <data> -o <out> --export ply --iter 30000 --strategy mrnf --max-cap 1000000`.
+  - Documented items 1–9 and addendum items 10–14 with verified file and line citations:
+    - Invocation: `LichtFeld-Studio.exe --headless -d <data> -o <out> --export ply --iter 30000 --strategy mrnf --max-cap 5000000` (default cap is 5M; 1.66M for matched budget).
     - Accepts Nerfstudio `transforms.json` directly (reads `"ply_file_path"`, converts Blender RDF to COLMAP world space via `diag(1, -1, -1)`).
+    - Signal handling: `HeadlessRunCoordinator` handles `SIGINT`, `SIGTERM`, and `SIGBREAK` (`CTRL_BREAK_EVENT`), saving `project.licht` on interrupt (`.on_stop_or_error = true`).
     - Output PLY adheres to standard 3DGS schema with 45 float SH rest coefficients and quaternion scalar component $w$ at `rot_0`.
     - Confirmed GPL-3.0 isolation requires subprocess execution rather than in-process C++ linking.
+  - Review feedback addressed; card in `review`.
 - **BT-3 Completed (A/B tooling & baseline)**:
-  - Durable tools staged in `C:\lfs\ab_tools\`: `ab_prep.py`, `ab_score.py`, `blocked_files.py`. Verified with `%LOCALAPPDATA%\ViitorX\PointForge\engines\pf360-env\python.exe -I ab_score.py --help`.
-  - Baseline documented in `C:\lfs\ab_tools\BASELINE_NS.md`: 182 eval views, PSNR 21.889 dB, SSIM 0.7567, LPIPS 0.2699, 1,658,375 Gaussians, 392.2 MB PLY, explicitly noting contended training time during vcpkg build.
+  - Durable tools staged in `C:\lfs\ab_tools\`: `ab_prep.py`, `ab_score.py`, `blocked_files.py`, `README.md`.
+  - Results table initialized in `C:\lfs\ab_results.md`.
+  - Baseline documented in `C:\lfs\ab_tools\BASELINE_NS.md`: 182 eval views, PSNR 21.889 dB, SSIM 0.7567, LPIPS 0.2699, 1,658,375 Gaussians, 392.2 MB PLY, explicitly noting contended training time during vcpkg build (~14m22s).
+  - Review feedback addressed; card in `review`.
+- **BT-4 Completed (LichtFeld Run #1 - MRNF Matched Budget 1.66M)**:
+  - Executed on quiet RTX 4090: 30,000 iterations in **259.8s** (~4m 20s, avg **115.5 iter/s**). Export time **0.55s** (`splat_30000.ply`, 392.6 MB, 1.66M Gaussians).
+  - Peak VRAM: **3,119 MiB** (~3.05 GB).
+  - Holdout evaluation (182 views): auto probe selected `colmap` frame (`diag(1,-1,-1)` world reflection).
+    - PSNR: **23.093 dB** (+1.20 dB vs Nerfstudio 21.889 dB).
+    - SSIM: **0.7783** (+0.0216 vs Nerfstudio 0.7567).
+    - LPIPS: **0.2168** (vs Nerfstudio 0.2699).
+  - Appended to `C:\lfs\ab_results.md`; card in `review`.
 - **BT-8 Completed (GLOMAP log bugfix)**:
-  - Modified `tools/pf360/pf360/nerfstudio_backend.py` lines 712–722: suppresses `mapper.summary()` when `use_glomap` succeeded (as `_glomap` already reports model counts), and resets `use_glomap = False` on fallback so COLMAP mapper summary is logged if incremental mapping runs.
+  - Modified `tools/pf360/pf360/nerfstudio_backend.py` lines 712–722: suppresses `mapper.summary()` when `use_glomap` succeeded, and resets `use_glomap = False` on fallback so COLMAP mapper summary is logged if incremental mapping runs.
   - Added unit test assertions to `tools/pf360/tests/test_camera_solver.py`.
   - Verified: `test_camera_solver.py` passes 9/9; full test suite passes 145/145 (1 skip).
+  - Committed and pushed to `splat-generator` (`0bc4519`); marked `done` by Claude.
+- **BT-17 Completed (Reproducible build notes & patch record)**:
+  - Deliverable: `C:\lfs\BUILD_NOTES.md`.
+  - Documents upstream commit `8c366f5`, private vcpkg commit `7281d8d...`, libplacebo overlay diff, `lld-link` isolation, `compat_msvc_stl.c` injection into `glslang.lib` / `SPIRV-Tools-opt.lib`, toolchain specifications, exe SHA256 (`caa410e...`), and 86 DLL inventory. Card in `review`.
+- **BT-5 Completed (LichtFeld Run #2 - MCMC Matched Budget 1.66M)**:
+  - Executed on quiet RTX 4090: 30,000 iterations in **182.7s** (~3m 03s, avg **164.2 iter/s**), ~42% faster than MRNF and >4.5x faster than Nerfstudio. Export time **0.35s** (`splat_30000.ply`, 392.6 MB, 1.66M Gaussians).
+  - Peak VRAM: **2,529 MiB** (~2.47 GB).
+  - Holdout evaluation (182 views): auto probe selected `colmap` frame.
+    - PSNR: **23.419 dB** (highest quality: +1.53 dB vs Nerfstudio 21.889 dB, +0.326 dB vs MRNF 23.093 dB).
+    - SSIM: **0.7765** (+0.0198 vs Nerfstudio 0.7567).
+    - LPIPS: **0.2462** (vs Nerfstudio 0.2699).
+  - Appended to `C:\lfs\ab_results.md`; card in `review`.
 - **Kanban Board State**:
-  - Cards BT-1, BT-2, BT-3, and BT-8 are all moved to `review` with detailed evidence comments.
-  - Backlog cards (BT-4 through BT-16) remain untouched pending Claude's review and sign-off.
+  - `done`: BT-1, BT-8
+  - `review`: BT-2, BT-3, BT-4, BT-5, BT-17
+  - `backlog`: BT-6, BT-7, BT-9 through BT-16
 - **Next Recommended Task**:
-  - Await Claude's review and sign-off on the four cards in `review`.
-  - Once Claude moves BT-4 to `todo`, proceed with LichtFeld A/B run #1 on the 10-second preview clip.
+  - Await Claude's review and sign-off on the 5 review cards (BT-2, BT-3, BT-4, BT-5, BT-17).
+  - Proceed to BT-6 (conditional quiet Nerfstudio rerun) or BT-7 (A/B gate decision) upon Claude's direction.
 
 ## Session (2026-11-23) - real re-run on the user machine; mapper progress in the UI
 

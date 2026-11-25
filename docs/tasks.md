@@ -1,8 +1,11 @@
 # Tasks
 
 ## Completed
+- `[x]` BT-5: Execute LichtFeld-Studio A/B run #2 with MCMC strategy at matched Gaussian budget (1.66M, 30k iters); 182.7s training time, 2,529 MiB peak VRAM, 23.419 dB holdout PSNR.
+- `[x]` BT-4: Execute LichtFeld-Studio A/B run #1 with MRNF strategy at matched Gaussian budget (1.66M, 30k iters); 259.8s training time, 3,119 MiB peak VRAM, 23.093 dB holdout PSNR.
+- `[x]` BT-17: Document reproducible build notes, patch record, and toolchain configurations for LichtFeld-Studio in `C:\lfs\BUILD_NOTES.md`.
 - `[x]` BT-8: Fix misleading `COLMAP mapper finished: 0 model(s)` when GLOMAP camera solver succeeds in `tools/pf360/pf360/nerfstudio_backend.py`; unit tests verified in `tools/pf360/tests/test_camera_solver.py`.
-- `[x]` BT-3: Persist A/B testing evaluation tools (`ab_prep.py`, `ab_score.py`, `blocked_files.py`) in `C:\lfs\ab_tools\` and establish ground truth Nerfstudio baseline report in `C:\lfs\ab_tools\BASELINE_NS.md`.
+- `[x]` BT-3: Persist A/B testing evaluation tools (`ab_prep.py`, `ab_score.py`, `blocked_files.py`, `README.md`) in `C:\lfs\ab_tools\`, results table in `C:\lfs\ab_results.md`, and Nerfstudio baseline report in `C:\lfs\ab_tools\BASELINE_NS.md`.
 - `[x]` BT-2: Document complete headless CLI contract, transforms format, PLY schema, coordinate conversion, and runtime dependencies in `C:\lfs\LFS_CLI_CONTRACT.md`.
 - `[x]` BT-1: Unblock `libplacebo` build using clang-cl overlay port and upgrade toolchain to MSVC 14.44 for full C++23 conformance; build LichtFeld-Studio release.
 - `[x]` 360 Reconstruction Studio (360 video -> 3DGS PLY), milestones 0-4 + most of 5: standalone stdlib-only Python worker `tools/pf360` (doctor/probe/frame/estimate/presets/validate-ply/run; JSONL protocol v1; manifest schema v1 + presets.json; Nerfstudio backend behind `ReconstructionBackend`; stage cache with SHA-256 fingerprint chain; report json/txt; PLY validation mirroring SplatReader rules) + host bridge `src/viewer/Recon360.{h,cpp}` (CreateProcessW + Job Object, stdin cancel, JSONL parsing) + `Recon360Panel` 6-step wizard + `ConvertJob::Kind::Recon360` + menus/Ctrl+R/drag-drop/palette/Prefs tab + Z-up load of pf360 outputs. Tests: 62 Python + `pf360hosttest` 46/46; static build + pftest PASS. See docs/360-reconstruction.md.
