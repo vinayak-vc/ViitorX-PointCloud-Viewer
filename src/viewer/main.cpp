@@ -2758,24 +2758,42 @@ int main(int argc, char** argv) {
         } else {
             CamPath& cp = allCamPaths[loadedDir];
             cp.keys.clear();
-            const double cs = activeCloudSize();
-            const float dist = (float)(cs * 0.5 / std::tan(glm::radians(cam.fovY * 0.5f)) * 1.4);
             const Camera savedCam = cam;
-            for (int i = 0; i < 3; ++i) {
-                const float ang = glm::radians(-90.0f + 60.0f * i);   // 120° sweep
-                cam.position = glm::vec3(std::cos(ang) * dist, std::sin(ang) * dist, dist * 0.3f);
-                cam.lookAt(glm::vec3(0.0f));
-                CamKey k;
-                k.t = i * 2.0;
-                k.px = cam.position.x; k.py = cam.position.y; k.pz = cam.position.z;
-                k.yaw = cam.yaw; k.pitch = cam.pitch;
-                k.ortho = 0; k.orthoSize = cam.orthoSize;
-                cp.keys.push_back(k);
+            const bool hasInterior = activeCloudIndex >= 0 && activeCloud().hasSpawn;
+            if (hasInterior) {
+                // Inside view for 360 reconstruction: pan horizontally from inside the spawn pose
+                for (int i = 0; i < 3; ++i) {
+                    cam = savedCam;
+                    cam.yaw += -30.0f + 30.0f * (float)i;
+                    cam.levelHorizon();
+                    CamKey k;
+                    k.t = i * 2.0;
+                    k.px = cam.position.x; k.py = cam.position.y; k.pz = cam.position.z;
+                    k.yaw = cam.yaw; k.pitch = cam.pitch;
+                    k.ortho = 0; k.orthoSize = cam.orthoSize;
+                    cp.keys.push_back(k);
+                }
+                cam = savedCam;
+                logInfo("--export-video: inside-view horizontal pan path (4 s) -> " + exportVideoOnStart);
+            } else {
+                const double cs = activeCloudSize();
+                const float dist = (float)(cs * 0.5 / std::tan(glm::radians(cam.fovY * 0.5f)) * 1.4);
+                for (int i = 0; i < 3; ++i) {
+                    const float ang = glm::radians(-90.0f + 60.0f * i);   // 120° sweep
+                    cam.position = glm::vec3(std::cos(ang) * dist, std::sin(ang) * dist, dist * 0.3f);
+                    cam.lookAt(glm::vec3(0.0f));
+                    CamKey k;
+                    k.t = i * 2.0;
+                    k.px = cam.position.x; k.py = cam.position.y; k.pz = cam.position.z;
+                    k.yaw = cam.yaw; k.pitch = cam.pitch;
+                    k.ortho = 0; k.orthoSize = cam.orthoSize;
+                    cp.keys.push_back(k);
+                }
+                cam = savedCam;
+                logInfo("--export-video: 3-key orbit path (4 s) -> " + exportVideoOnStart);
             }
-            cam = savedCam;
             snprintf(exportPathBuf, sizeof(exportPathBuf), "%s", exportVideoOnStart.c_str());
             exportResIdx = 1; exportFpsIdx = 1; exportBitrate = 20;   // 1080p30
-            logInfo("--export-video: 3-key orbit path (4 s) -> " + exportVideoOnStart);
             exportHookArmed = startVideoExport();
             if (!exportHookArmed) logError("--export-video: export failed to start");
         }
@@ -6207,7 +6225,7 @@ int main(int argc, char** argv) {
             }
 
             // ---- welcome / empty state ------------------------------------------
-            if ((!octreeLoaded || showWelcomeOverride) && !showConvertDialog) {
+            if ((!octreeLoaded || showWelcomeOverride) && !showConvertDialog && !recon360Panel.open) {
                 ImGui::SetNextWindowPos(ImVec2(hostPos.x + hostSize.x * 0.5f,
                                                hostPos.y + hostSize.y * 0.45f),
                                         ImGuiCond_Always, ImVec2(0.5f, 0.5f));

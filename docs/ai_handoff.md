@@ -3,6 +3,42 @@
 ## Session (2026-11-25) - LichtFeld-Studio integration & A/B tooling (cards BT-1, BT-2, BT-3, BT-8)
 
 - **Role**: Antigravity (Senior C++ Implementer); Claude (Tech Lead / Architect / Reviewer).
+- **BT-15 Completed (End-to-end verification: 10s preview clip through pf360 with LichtFeld on Balanced preset)**:
+  - **Balanced Run Pipeline**:
+    - Ran `python -m pf360 run` with Balanced preset: `downscaleFactor=2` (`-r 2`), `iterations=30000`, `engine="lichtfeld"`, `lfsStrategy="mrnf"`, `maxGaussians=2000000`.
+    - Upstream stages (`frame_extraction`, `panorama_projection`, `camera_reconstruction`) matched cached fingerprints and reused cleanly in `_preview10s_lfs_balanced`.
+    - Total worker time **330.3s** (~5m 30s), training wall-clock **297.3s** on quiet RTX 4090.
+    - Exported PLY: `preview10s_lfs_balanced.ply` (496,001,761 bytes, 2,000,000 Gaussians).
+  - **Evaluation & Scoring Details**:
+    - End-to-end run scored on all 1428 views (which included the 182 eval views during training): 24.603 dB; correctly labeled as training-view score (not a holdout benchmark; earlier +2.71 dB holdout claim withdrawn).
+    - **Fair MRNF -r 2 Holdout Benchmark** on `_preview10s_ab\data` (train split only: 1246 views, 1.66M cap, 30k iters):
+      - Training time: **240.7s** (~4m 00s).
+      - Holdout evaluation (`ab_score.py --frame colmap` on 182 holdout views):
+        - **PSNR**: **22.631 dB** (+0.742 dB vs Nerfstudio baseline 21.889 dB; vs MRNF -r 1 23.093 dB: -0.46 dB).
+        - **SSIM**: **0.7570** (vs Nerfstudio 0.7567; vs MRNF -r 1 0.7783).
+        - **LPIPS**: **0.2357** (vs Nerfstudio 0.2699; vs MRNF -r 1 0.2168).
+      - Output: `C:\lfs\test_ops\mrnf_r2_fair_score.txt`.
+  - **Inside-View Render & Mesh Verification**:
+    - Enhanced `--export-video` hook in `src/viewer/main.cpp` (`ViitorXPCViewer_v10151.exe`) to detect interior 360 reconstructions (`activeCloud().hasSpawn`) and generate a horizontal pan path from inside the room spawn position.
+    - Rendered `C:\lfs\test_ops\bt15_balanced_inside.mp4` (4.03s, 1080p30, 21.2 Mbps).
+    - Extracted 2 inside frames: `C:\lfs\test_ops\bt15_inside_frame_01.png` and `C:\lfs\test_ops\bt15_inside_frame_02.png`, confirming upright interior perspective.
+    - GLB export (`bt15_balanced.glb`, 112 MB): all 5 accessors verified at count = 2,000,000.
+    - FBX export (`bt15_balanced.fbx`, 134 MB): parsed vertices = 2,000,000, colors = 2,000,000, UpAxis = 1.
+  - **Workspace Containment**:
+    - Verified 0 files modified in `_preview10s\baseline` (pf360 strictly confined to its workspace; `sparsePointCloud` path in report was simply read from cached `state.json`).
+  - **Viewer Cancel + Resume Verification (`test_viewer_cancel_resume.py`)**:
+    - Launched worker with `CREATE_NO_WINDOW` parent process group and stdin control.
+    - Cancel sent via stdin at step 300: LFS caught `CTRL_BREAK_EVENT`, saved `project.licht` (64.6 MB) at step 500, worker exited with code 3 (`EXIT_CANCELLED`).
+    - Verified 0 leaked processes (`tasklist`) and 0 lingering GPU allocations (`nvidia-smi`).
+    - Resumed worker on same workspace with `CREATE_NO_WINDOW`: detected restore point, resumed from step 600, trained to step 2000, exported `cancel_resume_test.ply` (89.8 MB), exited code 0 (`EXIT_OK`).
+  - **Nerfstudio Regression**:
+    - Full Python test suite: 152 passed, 1 skipped.
+    - C++ `pf360hosttest`: 141 passed, 0 failed.
+  - **Carried Nits from BT-11**:
+    - Preset description dynamically replaces "Splatfacto" with "LichtFeld (MRNF/MCMC)" when engine is LichtFeld (`Recon360Panel.cpp`).
+    - Welcome overlay suppressed when wizard panel is open (`main.cpp`).
+    - Re-captured evidence screenshot `C:\lfs\evidence_bt11_panel.png` via native framebuffer hook with `ViitorXPCViewer_v10149.exe`.
+  - Card moved to `review`.
 - **BT-1 Completed (LichtFeld-Studio build unblocked & verified)**:
   - Deliverable: `C:\lfs\LichtFeld-Studio\build-windows-release\LichtFeld-Studio.exe` (197,932,032 bytes / 188.76 MB).
   - Verification: `LichtFeld-Studio.exe --help` executed with exit code 0.

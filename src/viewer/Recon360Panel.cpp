@@ -1634,7 +1634,17 @@ void Recon360Panel::drawStepQuality(Recon360PanelHost& host) {
     }
     if (presetIdx < (int)presets.size()) {
         const Recon360Preset& p = presets[(size_t)presetIdx];
-        ImGui::TextWrapped("%s", p.description.c_str());
+        std::string desc = p.description;
+        if (engineIdx == 0) {
+            size_t pos;
+            while ((pos = desc.find("Standard Splatfacto")) != std::string::npos)
+                desc.replace(pos, 19, "LichtFeld (" + std::string(lfsStrategyIdx == 0 ? "MRNF" : "MCMC") + ")");
+            while ((pos = desc.find("Splatfacto-Big")) != std::string::npos)
+                desc.replace(pos, 14, "LichtFeld (" + std::string(lfsStrategyIdx == 0 ? "MRNF" : "MCMC") + ")");
+            while ((pos = desc.find("Splatfacto")) != std::string::npos)
+                desc.replace(pos, 10, "LichtFeld (" + std::string(lfsStrategyIdx == 0 ? "MRNF" : "MCMC") + ")");
+        }
+        ImGui::TextWrapped("%s", desc.c_str());
         if (engineIdx == 1) {
             ImGui::BulletText("Model: %s%s", p.method.c_str(),
                               p.fallbackMethod.empty() ? "" : (" (falls back to " + p.fallbackMethod + " if not installed)").c_str());
