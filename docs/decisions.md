@@ -2,6 +2,16 @@
 
 This document records major design decisions.
 
+## LichtFeld-Studio Subprocess Isolation (GPL-3.0 Compliance)
+- **Status**: PROPOSED (pending A/B gate and Owner approval)
+- **Decision**: LichtFeld-Studio is integrated into PointForge as an external, isolated standalone subprocess communicating via CLI parameters, stdout progress telemetry, and standard 3DGS PLY files, rather than linking in-process as a dynamic/static library.
+- **Reason**: LichtFeld-Studio is licensed under GPL-3.0-or-later. Linking in-process would create a derivative work subject to copyleft GPL licensing, compromising PointForge's proprietary licensing model. Subprocess execution via Python subprocess (`tools/pf360`) provides strict process and licensing isolation while maintaining high throughput.
+
+## GLOMAP Camera Solver Progress Reporting
+- **Status**: ACCEPTED
+- **Decision**: Suppress `COLMAP mapper finished: 0 model(s)` summary output when the GLOMAP global solver produces a camera reconstruction model.
+- **Reason**: GLOMAP bypasses COLMAP's incremental mapper; invoking the unused COLMAP mapper progress tracker logged misleading 0-model errors immediately after GLOMAP reported successful multi-view reconstruction.
+
 ## Out-of-Core Processing
 - **Decision**: The importer uses a Three-Phase algorithm (Count, Chunk, Index).
 - **Reason**: Processing datasets exceeding RAM capacity requires bounded memory streaming. The "Chunk" phase acts as a spatial scatter, meaning Phase C (Index) can operate completely independently in parallel on separate chunks with no locking.

@@ -713,11 +713,13 @@ class NerfstudioBackend(ReconstructionBackend):
                                      cwd=str(ws.root))
                     if rc != 0:
                         raise StageFailed("COLMAP mapper failed (exit %d) - see logs/colmap.log" % rc)
+                    use_glomap = False
             models = _colmap_models(sparse_dir)
             if reuse_mapper:
                 log.write("pf360: reusing the finished mapper output (%d models)\n" % len(models))
             else:
-                ctx.emitter.log(mapper.summary(), stage="camera_reconstruction")
+                if not use_glomap:
+                    ctx.emitter.log(mapper.summary(), stage="camera_reconstruction")
                 if models:
                     with open(sparse_dir / MAPPER_DONE, "w", encoding="utf-8") as f:
                         json.dump({"models": len(models), "views": sum(n for _, n in models)}, f)

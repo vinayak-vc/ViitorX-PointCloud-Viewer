@@ -1,5 +1,38 @@
 # AI Handoff - PointForge (C++ repo)
 
+## Session (2026-11-25) - LichtFeld-Studio integration & A/B tooling (cards BT-1, BT-2, BT-3, BT-8)
+
+- **Role**: Antigravity (Senior C++ Implementer); Claude (Tech Lead / Architect / Reviewer).
+- **BT-1 Completed (LichtFeld-Studio build unblocked & verified)**:
+  - Deliverable: `C:\lfs\LichtFeld-Studio\build-windows-release\LichtFeld-Studio.exe` (197,932,032 bytes / 188.76 MB).
+  - Verification: `LichtFeld-Studio.exe --help` executed with exit code 0.
+  - Runtime DLLs: All 86 dependencies staged beside executable (`libplacebo-360.dll`, `SDL3.dll`, `python312.dll`, `cudart64_13.dll`, `curand64_10.dll`, `nvimgcodec_0.dll`, `openjph.0.32.dll`, `lfs_*.dll`).
+  - Fixes implemented:
+    - Overlay port `C:\lfs\overlay-ports\libplacebo\portfile.cmake` configured with candidate `clang-cl` discovery.
+    - Isolated `lld-link.exe` into buildtrees tools directory and prepended to PATH to satisfy Meson Windows linker detection without exposing `clang.exe` to CMake.
+    - Updated `build_lfs.cmd` to invoke `vcvars64.bat -vcvars_ver=14.44` (MSVC 19.44.35226) to fulfill C++23 requirements (`_MSVC_LANG >= 202302L`).
+    - Fixed VS18 MSVC STL divergence (`__std_find_*_not_of_trivial_pos_1`) by injecting a lightweight, headerless static compatibility helper into `glslang.lib`, `glslang-default-resource-limits.lib`, and `SPIRV-Tools-opt.lib`.
+- **BT-2 Completed (LichtFeld-Studio headless CLI contract)**:
+  - Deliverable: `C:\lfs\LFS_CLI_CONTRACT.md`.
+  - Documented items 1–9 and addendum items 10–14 with file and line evidence:
+    - Invocation: `LichtFeld-Studio.exe --headless -d <data> -o <out> --export ply --iter 30000 --strategy mrnf --max-cap 1000000`.
+    - Accepts Nerfstudio `transforms.json` directly (reads `"ply_file_path"`, converts Blender RDF to COLMAP world space via `diag(1, -1, -1)`).
+    - Output PLY adheres to standard 3DGS schema with 45 float SH rest coefficients and quaternion scalar component $w$ at `rot_0`.
+    - Confirmed GPL-3.0 isolation requires subprocess execution rather than in-process C++ linking.
+- **BT-3 Completed (A/B tooling & baseline)**:
+  - Durable tools staged in `C:\lfs\ab_tools\`: `ab_prep.py`, `ab_score.py`, `blocked_files.py`. Verified with `%LOCALAPPDATA%\ViitorX\PointForge\engines\pf360-env\python.exe -I ab_score.py --help`.
+  - Baseline documented in `C:\lfs\ab_tools\BASELINE_NS.md`: 182 eval views, PSNR 21.889 dB, SSIM 0.7567, LPIPS 0.2699, 1,658,375 Gaussians, 392.2 MB PLY, explicitly noting contended training time during vcpkg build.
+- **BT-8 Completed (GLOMAP log bugfix)**:
+  - Modified `tools/pf360/pf360/nerfstudio_backend.py` lines 712–722: suppresses `mapper.summary()` when `use_glomap` succeeded (as `_glomap` already reports model counts), and resets `use_glomap = False` on fallback so COLMAP mapper summary is logged if incremental mapping runs.
+  - Added unit test assertions to `tools/pf360/tests/test_camera_solver.py`.
+  - Verified: `test_camera_solver.py` passes 9/9; full test suite passes 145/145 (1 skip).
+- **Kanban Board State**:
+  - Cards BT-1, BT-2, BT-3, and BT-8 are all moved to `review` with detailed evidence comments.
+  - Backlog cards (BT-4 through BT-16) remain untouched pending Claude's review and sign-off.
+- **Next Recommended Task**:
+  - Await Claude's review and sign-off on the four cards in `review`.
+  - Once Claude moves BT-4 to `todo`, proceed with LichtFeld A/B run #1 on the 10-second preview clip.
+
 ## Session (2026-11-23) - real re-run on the user machine; mapper progress in the UI
 
 - **Re-run** `083443_001-004` with the `_extend` build (2000 panoramas = 28,000 views this time, High/custom): GPU extraction + matching took ~1.5 h; COLMAP's mapper is CPU-only (incremental registration + Ceres BA, 1-15 cores) and goes silent for 7-12 min per global BA. Mid-run diagnostic of the sparse models: 24 models from 89 init attempts; one large piece (model 5: panoramas 145-738, mostly back/up views 0/1/6/10), the rest small, mostly ground side-views (11/13) that share 0 panoramas with it. Model 3 (27 shared panoramas) was rejected for "centres" correctly - its ground-only camera path zig-zags (steps 0.4-2.7 vs a smooth 0.018 line). Model 6 holds only odd-numbered panoramas (unexplained so far). Extension results: pending.

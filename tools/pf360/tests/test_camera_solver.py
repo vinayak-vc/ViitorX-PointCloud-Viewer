@@ -148,6 +148,7 @@ class CameraStageTests(unittest.TestCase):
         self.assertEqual(_arg(g, "--BundleAdjustment.optimize_intrinsics"), "0")
         self.assertEqual(_arg(g, "--skip_retriangulation"), "1")
         self.assertIn("GLOMAP finished", out)
+        self.assertNotIn("COLMAP mapper finished", out)
         self.assertTrue((self.sparse / "mapper_done.json").is_file())
 
     def test_failed_glomap_falls_back_to_colmap(self):
@@ -165,6 +166,7 @@ class CameraStageTests(unittest.TestCase):
         calls, out = self.run_stage({"glomap": glomap}, fake, cameraSolver="glomap")
         self.assertIn("mapper", calls[3])
         self.assertIn("falling back to COLMAP", out)
+        self.assertIn("COLMAP mapper finished", out)
 
     def test_missing_glomap_uses_colmap_with_a_warning(self):
         def fake(args):
