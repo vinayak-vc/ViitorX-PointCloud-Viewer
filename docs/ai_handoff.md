@@ -46,13 +46,20 @@
     - SSIM: **0.7765** (+0.0198 vs Nerfstudio 0.7567).
     - LPIPS: **0.2462** (vs Nerfstudio 0.2699).
   - Appended to `C:\lfs\ab_results.md`; card in `review`.
+- **BT-18 Completed (Gate operational checks on 10s preview clip)**:
+  - Deliverables: Test harness `C:\lfs\test_ops\run_gate_ops.py` and comprehensive report `C:\lfs\test_ops\gate_ops_report.md`.
+  - Check (a) Exit Code: 100-iter full run completed with returncode 0 in 2.04s, exported valid `splat_100.ply` (38,740,598 bytes).
+  - Check (b) Cancel & Resume: `CTRL_BREAK_EVENT` delivered at step 400 caused graceful stop with exit code 0 in 4.98s, saved `project.licht` (730,450,304 bytes); confirmed 0 GPU memory allocations (`nvidia-smi`) and 0 orphan processes (`tasklist`); `--resume` from `project.licht` reached 3000 steps in 15.01s with exit code 0, exporting `splat_3000.ply` (266,523,392 bytes).
+  - Check (c) Regex Parsing: Tested against real logs; matched 100% of progress lines in `lfs_mrnf.log` (299/299) and `lfs_mcmc.log` (299/299).
+  - Check (d) Viewer Load & Export: Loaded `splat_30000.ply` in `ViitorXPCViewer_v10138.exe` headlessly; verified default `splatUpAxis=0` (`YDown`) reoriented to Z-up, `findSplatSpawn` camera placement, and near-clip sizing; `--export-glb` produced valid binary GLB (92,961,556 bytes, 2.41s), `--export-fbx` produced valid ASCII FBX (107,883,588 bytes, 5.41s), both exiting cleanly with code 0.
+  - Card moved to `review`.
 - **Kanban Board State**:
-  - `done`: BT-1, BT-8
-  - `review`: BT-2, BT-3, BT-4, BT-5, BT-17
-  - `backlog`: BT-6, BT-7, BT-9 through BT-16
+  - `done`: BT-1, BT-8 (and BT-4, BT-5, BT-17 accepted by Lead in C-4)
+  - `review`: BT-2, BT-3, BT-18
+  - `backlog`: BT-6 (skipped), BT-7, BT-9 through BT-16
 - **Next Recommended Task**:
-  - Await Claude's review and sign-off on the 5 review cards (BT-2, BT-3, BT-4, BT-5, BT-17).
-  - Proceed to BT-6 (conditional quiet Nerfstudio rerun) or BT-7 (A/B gate decision) upon Claude's direction.
+  - Await Claude's sign-off on BT-18, BT-2, and BT-3.
+  - Upon Lead promotion of Phase 1 cards, proceed to BT-9 (manifest schema) / BT-10 (backend subprocess wrapper).
 
 ## Session (2026-11-23) - real re-run on the user machine; mapper progress in the UI
 
