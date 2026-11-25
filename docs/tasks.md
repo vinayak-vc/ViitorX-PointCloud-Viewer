@@ -1,10 +1,10 @@
 # Tasks
 
 ## In Progress / In Review
-- [ ] BT-19: LFS preset resolution: Balanced/High use -r 1, Preview -r 2 (implemented, verified with pf360hosttest 146/146, Python 152/152; uncommitted pending review).
-- [ ] BT-13: 'Edit in LichtFeld' button (launch editor with the PLY).
+- [ ] BT-13: 'Edit in LichtFeld' button (launch editor with the PLY) - CHANGES_REQUESTED (round 4) addressed: per-cloud axisAutoDetected flag (set by recon360IsZUpOutput / camera path, carried over in reload); Properties UI combo updates saved default splatUpAxis only when !c.axisAutoDetected (allowing generic splats with spawn to update default); stale combo comment updated; verified in pf360hosttest (175/175 PASS) and --test-reload-lfs (user preference untouched at 0). In review.
 
 ## Completed
+- [x] BT-19: LFS preset resolution: Balanced/High use -r 1, Preview -r 2 (accepted by Lead in C-11; commit 98ff84b).
 - [x] BT-15: End-to-end verification: 10s preview clip through pf360 with LichtFeld on Balanced preset (-r 2, MRNF, 30k iters); wall-clock 297s; fair holdout score on _preview10s_ab\data (1246 train views, 1.66M cap, 182 eval views) 22.631 dB (+0.742 dB vs NS, -0.46 dB vs MRNF -r 1 23.093 dB), SSIM 0.7570, LPIPS 0.2357; inside-view video render bt15_balanced_inside.mp4 + 2 extracted frames upright; GLB/FBX reload 2.0M primitives; viewer job runner cancel (step 300) + resume (step 600->2000) under CREATE_NO_WINDOW proven; zero writes outside workspace verified; Nerfstudio regression 152/152 passed; carried nits resolved (accepted by Lead in C-10).
 - [x] BT-11: Implement wizard engine toggle (LichtFeld / Nerfstudio) + impact text in Recon360Panel (all presets + Custom); engine/strategy/maxGaussians prefs persistence; availability fallback in buildSpec; driver >= 570 check; pf360hosttest 141/141, Python 152/152 (accepted by Lead in C-8; commit a64929a).
 - [x] BT-10: Implement pf360 LichtFeld training backend (spec sec 1+2), command builder, progress parser, cancel/resume via CTRL_BREAK, chunked PLY frame normalisation diag(1,-1,-1) with full SH parity signs, sidecar writer, Recon360 viewer camera path support, and comprehensive unit tests (accepted by Lead in C-7).

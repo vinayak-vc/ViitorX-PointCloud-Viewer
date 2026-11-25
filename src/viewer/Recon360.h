@@ -48,6 +48,25 @@ std::string recon360FindPython(const Recon360Settings& s);
 // Path to LichtFeld-Studio executable ("" if none found).
 std::string recon360FindLichtfeld(const Recon360Settings& s);
 
+// Windows argument quoting conforming to CommandLineToArgvW rules.
+std::wstring recon360QuoteArg(const std::wstring& arg);
+std::string recon360QuoteArgUtf8(const std::string& arg);
+
+// Check if a process with executable name is running; returns PID (0 if none).
+unsigned long recon360FindProcessByName(const std::wstring& exeName);
+// Bring top-level window of process to foreground.
+bool recon360BringProcessWindowToFront(unsigned long pid);
+
+struct LichtfeldEditorLaunchResult {
+    bool ok = false;
+    unsigned long pid = 0;
+    std::string exePath;
+    std::string error;
+};
+
+// Launches LichtFeld-Studio detached with -v <plyPath>.
+LichtfeldEditorLaunchResult recon360LaunchLichtfeldEditor(const std::string& plyPath, const Recon360Settings& s);
+
 // ---- presets ------------------------------------------------------------------
 struct Recon360Preset {
     std::string key, label, description, method, fallbackMethod, matchingMethod, costNote;

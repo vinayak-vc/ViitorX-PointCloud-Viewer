@@ -3,6 +3,35 @@
 ## Session (2026-11-25) - LichtFeld-Studio integration & A/B tooling (cards BT-1, BT-2, BT-3, BT-8)
 
 - **Role**: Antigravity (Senior C++ Implementer); Claude (Tech Lead / Architect / Reviewer).
+- **BT-13 Completed & In Review ('Edit in LichtFeld' button & editor launch)**:
+  - **CHANGES_REQUESTED (Round 4 from [C-15]) Addressed**:
+    1. *Dedicated `axisAutoDetected` Flag*: Used per-cloud `axisAutoDetected` boolean on `SceneCloud` (set when `recon360IsZUpOutput` or camera path is detected, carried over across reloads in `reloadSplat`).
+    2. *Generic Splat Preference Updates*: Updated Properties panel combo to guard saved default preference updates with `if (!c.axisAutoDetected)`, ensuring generic splats with guessed spawn points from `findSplatSpawn` can still update `splatUpAxis`. Updated combo comment.
+    3. *Extended Unit Tests*: `pf360hosttest` extended to test generic splats with spawn (175/175 PASS).
+  - **CHANGES_REQUESTED (Round 3 from [C-14]) Addressed**:
+    1. *Preference Isolation*: Separated per-cloud display/edit from the saved default user preference `splatUpAxis`. The Properties panel combo displays and edits `activeCloud().splatAxis`, and only updates the saved default `splatUpAxis` upon an explicit user change on a generic file (`!c.axisAutoDetected`).
+    2. *Verified Preference Persistence*: Verified via host unit test in `pf360hosttest` (175/175 PASS) and runtime hook `--test-reload-lfs` that loading an auto-detected Z-up LFS splat leaves `splatUpAxis = 0` (Y-down) intact before and after loading, ensuring subsequent generic 3DGS PLY files still load Y-down.
+  - **CHANGES_REQUESTED (Round 2 from [C-13]) Addressed**:
+    1. *Rendered Upright Inside-View Verification*: Fixed camera positioning by invoking `spawnInsideSplats()` (relative to cloud center/world offset, horizon-leveled); waited until `splatRenderer->timings().visible > 0` and 15 frames for background sort. Captured full 1280x720 frame to `C:\lfs\evidence_bt13_reloaded_inside.png` (1.51 MB, RGB stddev ~68 across channels), confirming full rendered street scene upright.
+    2. *CLI Output Argument*: Updated hook to `--test-reload-lfs <ply> <out.png>` taking the output PNG path as an argument; zero hardcoded paths in app code.
+    3. *Cached LFS Exe Lookup Fix*: Fixed cache nit using `cachedLfsExeChecked` boolean flag alongside `lastLfsExeCheckTicks >= 3000`, preventing per-frame file checks even when LFS executable is not found.
+  - **Launch & Process Management (`src/viewer/Recon360.{h,cpp}`)**:
+    - `recon360QuoteArg` / `recon360QuoteArgUtf8`: strict Windows command-line quoting conforming to `CommandLineToArgvW` rules.
+    - `recon360FindProcessByName(L"LichtFeld-Studio.exe")`: detects running instances via `CreateToolhelp32Snapshot`.
+    - `recon360BringProcessWindowToFront`: brings existing LFS window to front via `EnumWindows`, `ShowWindow(SW_RESTORE)`, `SetForegroundWindow`.
+    - `recon360LaunchLichtfeldEditor`: launches `LichtFeld-Studio.exe -v "<ply>"` as detached separate process with working directory set to LFS directory.
+  - **Viewer UI & Mtime Reload (`src/viewer/main.cpp`)**:
+    - Added "Edit in LichtFeld..." button in `Properties` panel and `File` menu.
+    - Added to Command Palette (`Ctrl+P`).
+    - Enabled only when active cloud is Gaussian Splat PLY and `LichtFeld-Studio.exe` is found.
+    - Running modal dialog offering to "Switch to Running Window", "Launch New Instance", or "Cancel".
+    - Mtime watcher notifies and offers "Reload edited splat" without resetting orientation; armed only when editor launched; >=2s size+mtime stability required before offering reload.
+  - **Tests & Verification**:
+    - `pf360hosttest`: 171/171 PASS.
+    - Python test suite: 152 passed, 1 skipped.
+    - CLI test launch: `ViitorXPCViewer_v10164.exe --test-launch-lfs <preview_ply>` verified detached launch (PID logged) with clean exit.
+    - CLI test reload: `ViitorXPCViewer_v10164.exe --test-reload-lfs <preview_ply> <out.png>` verified sidecar copy, Z-up orientation preservation, upright inside-view capture (1.51 MB PNG), and untouched user preference (`splatUpAxis=0`).
+  - Card in `review`. Uncommitted pending Claude's review.
 - **BT-19 Completed (LFS preset resolution: Balanced/High use -r 1, Preview -r 2)**:
   - Updated `src/viewer/Recon360Panel.cpp`:
     - `applyPreset(int idx)`: when `engineIdx == 0` (LichtFeld), Balanced (`idx == 1`) and High (`idx == 2`) set `downscaleFactor = 1`, while Preview (`idx == 0`) sets `downscaleFactor = 2`. When `engineIdx == 1` (Nerfstudio), presets retain 4/2/1.

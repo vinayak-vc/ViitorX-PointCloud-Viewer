@@ -83,6 +83,7 @@
 #include <vector>
 
 using namespace pf;
+namespace fs = std::filesystem;
 
 // ---- frustum culling -------------------------------------------------------
 struct Frustum { std::array<glm::vec4, 6> planes; };
@@ -664,6 +665,9 @@ int main(int argc, char** argv) {
     std::string exportFbxOnStart;
     // --screenshot-recon <out.png>: opens Recon360 wizard at Quality step, captures after layout settles, quits.
     std::string exportReconScreenshotOnStart;
+    std::string testLaunchLfsOnStart;
+    std::string testReloadLfsOnStart;
+    std::string testReloadLfsOutPng;
     // Simple argument parsing
     for (int i = 1; i < argc; ++i) {
         const char* a = argv[i];
@@ -681,6 +685,11 @@ int main(int argc, char** argv) {
             exportFbxOnStart = argv[++i];
         } else if (strcmp(a, "--screenshot-recon") == 0 && i + 1 < argc) {
             exportReconScreenshotOnStart = argv[++i];
+        } else if (strcmp(a, "--test-launch-lfs") == 0 && i + 1 < argc) {
+            testLaunchLfsOnStart = argv[++i];
+        } else if (strcmp(a, "--test-reload-lfs") == 0 && i + 2 < argc) {
+            testReloadLfsOnStart = argv[++i];
+            testReloadLfsOutPng = argv[++i];
         } else if (i == 1) {
             // First positional argument interpreted as initial directory
             initialDir = a;
@@ -781,6 +790,7 @@ int main(int argc, char** argv) {
         glm::dvec3 spawnPos{0.0};
         glm::dvec3 spawnFwd{0.0, 1.0, 0.0};
         double     sceneExtent = 1.0;   // size of the walk / robust box (scene units)
+        bool       axisAutoDetected = false; // true when orientation was auto-detected from report/sidecar/cameras
     };
     std::vector<SceneCloud> scene;
     int activeCloudIndex = -1;
@@ -1715,6 +1725,21 @@ int main(int argc, char** argv) {
         SDL_SetWindowTitle(window, (baseName(loadedDir) + " - ViitorX PointCloud Viewer").c_str());
     };
 
+    // Mtime watcher and LFS editor state
+    std::string watchedSplatPath;
+    std::filesystem::file_time_type watchedSplatMtime{};
+    uint64_t watchedSplatSize = 0;
+    bool watcherArmed = false;
+    bool watchedSplatChanged = false;
+    std::string offeredReloadPath;
+    std::unordered_set<std::string> armedKnownPlyFiles;
+
+    // Stability tracking (size + mtime stable >= 2s)
+    std::string candidateReloadPath;
+    uint64_t candidateObservedSize = 0;
+    std::filesystem::file_time_type candidateObservedMtime{};
+    uint32_t candidateLastChangeTicks = 0;
+
     // Load an octree directory, reset view, record it as recent.
     auto loadOctree = [&](const std::string& dir) -> bool {
         cancelActiveSliceExports();
@@ -1771,17 +1796,34 @@ int main(int argc, char** argv) {
                     pf::logError("Could not load Gaussian Splat from " + d);
                     return false;
                 }
+                watchedSplatPath = d;
+                {
+                    std::error_code ec;
+                    watchedSplatMtime = std::filesystem::last_write_time(fs::u8path(d), ec);
+                    watchedSplatSize = std::filesystem::file_size(fs::u8path(d), ec);
+                }
+                watcherArmed = false;
+                watchedSplatChanged = false;
+                offeredReloadPath = "";
+                candidateReloadPath.clear();
+                candidateObservedSize = 0;
+                candidateLastChangeTicks = 0;
                 // Loaders return the file as stored; turn it upright for the Z-up world.
                 // A PointForge 360 reconstruction (pf360 workspace report next to it)
                 // is Z-up already (Nerfstudio orientation_method="up"); every other
                 // file follows the user's "splat up axis" preference.
-                pf::SplatUpAxis fileAxis = pf::recon360IsZUpOutput(d) ? pf::SplatUpAxis::ZUp
-                                                                      : (pf::SplatUpAxis)splatUpAxis;
+                bool autoDetected = false;
+                pf::SplatUpAxis fileAxis = (pf::SplatUpAxis)splatUpAxis;
+                if (pf::recon360IsZUpOutput(d)) {
+                    fileAxis = pf::SplatUpAxis::ZUp;
+                    autoDetected = true;
+                }
                 // A 360 reconstruction carries its capture cameras: their mean up
                 // vector is the walk's true up (the report's "z_up" is not always
                 // right), and a capture position is the ideal place to start.
                 const pf::Recon360CameraPath path = pf::recon360CameraPath(d);
                 if (path.ok) {
+                    autoDetected = true;
                     const double ax = std::fabs(path.up[0]), ay = std::fabs(path.up[1]), az = std::fabs(path.up[2]);
                     if (ay > ax && ay > az) fileAxis = path.up[1] > 0 ? pf::SplatUpAxis::YUp : pf::SplatUpAxis::YDown;
                     else if (az > ax && path.up[2] > 0) fileAxis = pf::SplatUpAxis::ZUp;
@@ -1812,6 +1854,7 @@ int main(int argc, char** argv) {
                     pf::logInfo("360 reconstruction output detected: loading with its own up axis");
                 pf::reorientSplats(cloud.splatData, pf::SplatUpAxis::ZUp, fileAxis);
                 cloud.splatAxis = fileAxis;
+                cloud.axisAutoDetected = autoDetected;
                 if (!cloud.hasSpawn) {
                     // No capture cameras: guess a standing spot in the upright (Z-up)
                     // cloud, then store it back in the file frame like the cameras.
@@ -1946,6 +1989,20 @@ int main(int argc, char** argv) {
     // Initial cloud: CLI arg wins, else auto-load the most recent if enabled.
     if (!initialDir.empty()) loadOctree(initialDir);
     else if (autoLoadLast && !recentDirs.empty()) loadOctree(recentDirs.front());
+
+    if (!testLaunchLfsOnStart.empty()) {
+        auto res = pf::recon360LaunchLichtfeldEditor(testLaunchLfsOnStart, recon360Settings);
+        if (!res.ok) {
+            logError("[TEST] Launch test failed: " + res.error);
+            return 1;
+        }
+        logInfo("[TEST] Launch test succeeded: PID " + std::to_string(res.pid));
+#ifdef _WIN32
+        HANDLE h = OpenProcess(PROCESS_TERMINATE, FALSE, res.pid);
+        if (h) { TerminateProcess(h, 0); CloseHandle(h); }
+#endif
+        return 0;
+    }
 
     // Fit the whole cloud in view (keeps current orientation, centres on pivot).
     auto frameAll = [&]() {
@@ -2097,6 +2154,10 @@ int main(int argc, char** argv) {
     bool resetDockLayout = false;      // Window > Reset Layout
     bool aboutOpenReq = false;
     std::vector<Toast> toasts;
+    uint32_t lastMtimeCheckTicks = 0;
+    bool showLfsRunningModal = false;
+    unsigned long lfsRunningPid = 0;
+    std::string lfsLaunchPendingPath;
     char paletteBuf[96] = "";
     char shortcutFilter[64] = "";
     bool logShowDebug = false, logShowInfo = true, logShowWarn = true, logShowError = true;
@@ -2113,6 +2174,191 @@ int main(int argc, char** argv) {
         toasts.push_back(std::move(t));
         if (toasts.size() > 5) toasts.erase(toasts.begin());
     };
+
+    bool cachedLfsExeChecked = false;
+    std::string cachedLfsExe;
+    uint32_t lastLfsExeCheckTicks = 0;
+    auto getCachedLfsExe = [&]() -> const std::string& {
+        const uint32_t now = SDL_GetTicks();
+        if (!cachedLfsExeChecked || (now - lastLfsExeCheckTicks >= 3000)) {
+            cachedLfsExe = pf::recon360FindLichtfeld(recon360Settings);
+            lastLfsExeCheckTicks = now;
+            cachedLfsExeChecked = true;
+        }
+        return cachedLfsExe;
+    };
+
+    auto canEditInLichtfeld = [&](std::string* outTip = nullptr) -> bool {
+        if (!splatActive) {
+            if (outTip) *outTip = "Open a Gaussian Splat (.ply) to edit in LichtFeld-Studio";
+            return false;
+        }
+        const SceneCloud& c = activeCloud();
+        if (c.dir.empty() || pf::SplatReader::detectFormat(c.dir) != pf::SplatFileFormat::PlyGaussians) {
+            if (outTip) *outTip = "Only Gaussian Splat PLY files can be edited in LichtFeld-Studio";
+            return false;
+        }
+        const std::string& exe = getCachedLfsExe();
+        if (exe.empty()) {
+            if (outTip) *outTip = "LichtFeld-Studio.exe not found (set in Preferences > 360 Reconstruction)";
+            return false;
+        }
+        if (outTip) *outTip = "Open loaded splat in LichtFeld-Studio editor (detached)";
+        return true;
+    };
+
+    auto doLaunchLichtfeld = [&](const std::string& path) {
+        auto res = pf::recon360LaunchLichtfeldEditor(path, recon360Settings);
+        if (res.ok) {
+            addToast("Launched LichtFeld-Studio (PID " + std::to_string(res.pid) + ") for " + baseName(path));
+            watchedSplatPath = path;
+            std::error_code ec;
+            watchedSplatMtime = std::filesystem::last_write_time(fs::u8path(path), ec);
+            watchedSplatSize = std::filesystem::file_size(fs::u8path(path), ec);
+            watcherArmed = true;
+            watchedSplatChanged = false;
+            offeredReloadPath = "";
+            candidateReloadPath.clear();
+            candidateObservedSize = 0;
+            candidateObservedMtime = {};
+            candidateLastChangeTicks = 0;
+            // Snapshot existing .ply files in parent folder
+            armedKnownPlyFiles.clear();
+            fs::path parent = fs::u8path(path).parent_path();
+            if (fs::is_directory(parent, ec)) {
+                for (const auto& entry : fs::directory_iterator(parent, ec)) {
+                    if (entry.is_regular_file(ec) && entry.path().extension() == ".ply") {
+                        armedKnownPlyFiles.insert(entry.path().u8string());
+                    }
+                }
+            }
+        } else {
+            addToast("Failed to launch LichtFeld-Studio: " + res.error, "", true);
+        }
+    };
+
+    auto launchEditInLichtfeld = [&]() {
+        std::string tip;
+        if (!canEditInLichtfeld(&tip)) {
+            addToast(tip, "", true);
+            return;
+        }
+        const std::string plyPath = activeCloud().dir;
+        unsigned long runningPid = pf::recon360FindProcessByName(L"LichtFeld-Studio.exe");
+        if (runningPid) {
+            lfsRunningPid = runningPid;
+            lfsLaunchPendingPath = plyPath;
+            showLfsRunningModal = true;
+            return;
+        }
+        doLaunchLichtfeld(plyPath);
+    };
+
+    auto reloadSplat = [&](const std::string& path) {
+        const glm::vec3 sp = cam.position; const float sy = cam.yaw, spi = cam.pitch;
+        const bool so = cam.isOrtho; const float ss = cam.orthoSize;
+        const SplatUpAxis carriedAxis = (!scene.empty() && activeCloud().type == CloudType::GaussianSplat)
+                                            ? activeCloud().splatAxis : SplatUpAxis::ZUp;
+        const bool carriedAxisAuto = (!scene.empty() && activeCloud().type == CloudType::GaussianSplat)
+                                         ? activeCloud().axisAutoDetected : false;
+        const bool carriedSpawn = (!scene.empty() && activeCloud().type == CloudType::GaussianSplat)
+                                      ? activeCloud().hasSpawn : false;
+        const glm::dvec3 carriedSpawnPos = carriedSpawn ? activeCloud().spawnPos : glm::dvec3(0.0);
+        const glm::dvec3 carriedSpawnFwd = carriedSpawn ? activeCloud().spawnFwd : glm::dvec3(0.0, 1.0, 0.0);
+        const double carriedExtent = carriedSpawn ? activeCloud().sceneExtent : 1.0;
+
+        // If path != watchedSplatPath and path has no sidecar, copy sidecar from watchedSplatPath
+        std::error_code ec;
+        const fs::path pOrigSidecar = fs::u8path(watchedSplatPath + ".pf360.json");
+        const fs::path pNewSidecar = fs::u8path(path + ".pf360.json");
+        if (fs::exists(pOrigSidecar, ec) && !fs::exists(pNewSidecar, ec)) {
+            fs::copy_file(pOrigSidecar, pNewSidecar, fs::copy_options::skip_existing, ec);
+            logInfo("Copied pf360 sidecar to edited splat: " + pNewSidecar.u8string());
+        }
+
+        closeCloud(activeCloudIndex);
+        loadOctree(path);
+
+        if (!scene.empty() && activeCloud().type == CloudType::GaussianSplat) {
+            SceneCloud& nc = activeCloud();
+            if (!nc.hasSpawn && carriedSpawn) {
+                nc.hasSpawn = true;
+                nc.spawnPos = carriedSpawnPos;
+                nc.spawnFwd = carriedSpawnFwd;
+                nc.sceneExtent = carriedExtent;
+            }
+            if (nc.splatAxis != carriedAxis && carriedAxis == SplatUpAxis::ZUp) {
+                nc.splatAxis = carriedAxis;
+            }
+            if (carriedAxisAuto || pf::recon360IsZUpOutput(path)) {
+                nc.axisAutoDetected = true;
+            }
+        }
+
+        cam.position = sp; cam.yaw = sy; cam.pitch = spi; cam.isOrtho = so; cam.orthoSize = ss;
+        watchedSplatPath = path;
+        watchedSplatMtime = std::filesystem::last_write_time(fs::u8path(path), ec);
+        watchedSplatSize = std::filesystem::file_size(fs::u8path(path), ec);
+        watchedSplatChanged = false;
+        offeredReloadPath = "";
+        watcherArmed = false;
+        candidateReloadPath.clear();
+        addToast("Reloaded " + baseName(path));
+    };
+
+    if (!testReloadLfsOnStart.empty()) {
+        std::error_code ec;
+        fs::path origPath = fs::u8path(testReloadLfsOnStart);
+        if (!fs::exists(origPath, ec)) {
+            logError("[TEST-RELOAD] Original PLY not found: " + testReloadLfsOnStart);
+            return 1;
+        }
+
+        const int initialUserPref = splatUpAxis;
+        logInfo("[TEST-RELOAD] Initial user preference splatUpAxis = " + std::to_string(initialUserPref));
+
+        loadOctree(testReloadLfsOnStart);
+        if (scene.empty() || activeCloud().type != CloudType::GaussianSplat) {
+            logError("[TEST-RELOAD] Failed to load splat from " + testReloadLfsOnStart);
+            return 1;
+        }
+        if (activeCloud().splatAxis != pf::SplatUpAxis::ZUp) {
+            logError("[TEST-RELOAD] Failed: LFS splat axis is not ZUp!");
+            return 1;
+        }
+        if (splatUpAxis != initialUserPref) {
+            logError("[TEST-RELOAD] Regression: splatUpAxis preference was overwritten on load!");
+            return 1;
+        }
+
+        watchedSplatPath = testReloadLfsOnStart;
+        watcherArmed = true;
+
+        fs::path reloadedPath = origPath.parent_path() / (origPath.stem().u8string() + "_reloaded.ply");
+        fs::remove(reloadedPath, ec);
+        fs::remove(fs::u8path(reloadedPath.u8string() + ".pf360.json"), ec);
+        fs::copy_file(origPath, reloadedPath, fs::copy_options::overwrite_existing, ec);
+        logInfo("[TEST-RELOAD] Copied to " + reloadedPath.u8string() + " (no sidecar)");
+
+        reloadSplat(reloadedPath.u8string());
+
+        if (activeCloud().splatAxis != pf::SplatUpAxis::ZUp) {
+            logError("[TEST-RELOAD] Failed: splatAxis is not ZUp after reload!");
+            return 1;
+        }
+        if (!activeCloud().hasSpawn) {
+            logError("[TEST-RELOAD] Failed: hasSpawn is false after reload!");
+            return 1;
+        }
+        if (splatUpAxis != initialUserPref) {
+            logError("[TEST-RELOAD] Regression: splatUpAxis preference was overwritten on reload!");
+            return 1;
+        }
+
+        spawnInsideSplats();
+        logInfo("[TEST-RELOAD] Reload verified: Z-up preserved, user preference untouched (" +
+                std::to_string(splatUpAxis) + "). Spawned inside splats.");
+    }
 
     // Premium brand watermark: original-colour logo at ~70% of the area height,
     // centred, ~6% opacity, pre-blurred, with a very subtle dark edge vignette
@@ -4262,6 +4508,14 @@ int main(int argc, char** argv) {
                     ImGui::Separator();
                     if (ImGui::MenuItem("Convert a Scan...", "Ctrl+I")) openConvertDialog("");
                     if (ImGui::MenuItem("Gaussian Splat from 360 Video...", "Ctrl+R")) recon360Panel.show();
+                    {
+                        std::string editLfsTip;
+                        const bool canEditLfs = canEditInLichtfeld(&editLfsTip);
+                        if (ImGui::MenuItem("Edit in LichtFeld...", nullptr, false, canEditLfs)) {
+                            launchEditInLichtfeld();
+                        }
+                        if (!editLfsTip.empty()) ImGui::SetItemTooltip("%s", editLfsTip.c_str());
+                    }
                     ImGui::Separator();
                     if (ImGui::BeginMenu("Export", octreeLoaded)) {
                         auto openMeshExport = [&](int fmt, const char* ext) {
@@ -4543,6 +4797,26 @@ int main(int argc, char** argv) {
                             ImGui::Text("%s Gaussian splats", prettyCount(c.splatData.count()).c_str());
                             const Vec3d d = c.splatData.boxMax - c.splatData.boxMin;
                             ImGui::Text("Extent: %.1f x %.1f x %.1f m", d.x, d.y, d.z);
+
+                            std::string editLfsTip;
+                            const bool canEditLfs = canEditInLichtfeld(&editLfsTip);
+                            ImGui::Spacing();
+                            ImGui::BeginDisabled(!canEditLfs);
+                            if (ImGui::Button("Edit in LichtFeld...")) {
+                                launchEditInLichtfeld();
+                            }
+                            ImGui::EndDisabled();
+                            if (!editLfsTip.empty()) ImGui::SetItemTooltip("%s", editLfsTip.c_str());
+
+                            if (watchedSplatChanged && !offeredReloadPath.empty()) {
+                                ImGui::Spacing();
+                                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.85f, 0.2f, 1.0f));
+                                ImGui::TextWrapped("Edited splat on disk: %s", baseName(offeredReloadPath).c_str());
+                                ImGui::PopStyleColor();
+                                if (ImGui::Button("Reload edited splat")) {
+                                    reloadSplat(offeredReloadPath);
+                                }
+                            }
                         } else {
                             ImGui::TextDisabled("No cloud loaded.");
                             ImGui::TextWrapped("Open a converted octree or convert a scan to begin.");
@@ -4561,23 +4835,27 @@ int main(int argc, char** argv) {
                                         prettyCount(sr.splatCount()).c_str());
                             ImGui::SetItemTooltip("Splats sent to the GPU. Off-screen and (with LOD) sub-pixel\n"
                                                   "splats are then culled per frame on the GPU.");
-                            // Up axis of splat files. Applies to every splat cloud and is
-                            // remembered for the next file.
+                            // Up axis of the active splat cloud. For generic splats, user changes update the saved
+                            // default for future files; for 360 reconstructions with auto-detected orientation,
+                            // changes apply only to the active cloud.
                             const char* upAxes[] = { "Y down (3DGS / COLMAP)", "Y up (glTF / OpenGL)", "Z up (as stored)" };
-                            if (ImGui::Combo("Up axis", &splatUpAxis, upAxes, IM_ARRAYSIZE(upAxes))) {
-                                const auto newAxis = (pf::SplatUpAxis)splatUpAxis;
-                                for (SceneCloud& c : scene) {
-                                    if (c.type != CloudType::GaussianSplat || !c.splatRenderer || !c.splatData.ok) continue;
+                            int cloudAxis = (int)activeCloud().splatAxis;
+                            if (ImGui::Combo("Up axis", &cloudAxis, upAxes, IM_ARRAYSIZE(upAxes))) {
+                                const auto newAxis = (pf::SplatUpAxis)cloudAxis;
+                                SceneCloud& c = activeCloud();
+                                if (c.splatRenderer && c.splatData.ok) {
                                     pf::reorientSplats(c.splatData, c.splatAxis, newAxis);
                                     c.splatAxis = newAxis;
                                     c.splatRenderer->upload(c.splatData);
-                                    // The centre moved with the rotation; keep the cloud placed by it.
                                     const glm::dvec3 ctr(c.splatData.center.x, c.splatData.center.y, c.splatData.center.z);
                                     if (scene.size() == 1) sceneOrigin = ctr;
                                     c.worldOffset = ctr - sceneOrigin;
+                                    frameAll();
                                 }
-                                frameAll();
-                                settingsChanged = true;
+                                if (!c.axisAutoDetected) {
+                                    splatUpAxis = cloudAxis;
+                                    settingsChanged = true;
+                                }
                             }
                             ImGui::SetItemTooltip("Which way is up in the splat file.\n"
                                                   "Y down: 3DGS training output (most .ply / .splat files).\n"
@@ -6316,6 +6594,7 @@ int main(int argc, char** argv) {
                 cmds.push_back({"Open Octree Folder...", "", [&] { browseFolderAndLoad(); }});
                 cmds.push_back({"Convert a Scan...", "Ctrl+I", [&] { openConvertDialog(""); }});
                 cmds.push_back({"Gaussian Splat from 360 Video...", "Ctrl+R", [&] { recon360Panel.show(); }});
+                cmds.push_back({"Edit in LichtFeld...", "", [&] { launchEditInLichtfeld(); }});
                 auto paletteMeshExport = [&](int fmt, const char* ext) {
                     if (!octreeLoaded) return;
                     glbFormatIdx = fmt;
@@ -6570,7 +6849,36 @@ int main(int argc, char** argv) {
                 ImGui::EndPopup();
             }
 
-            if (settingsChanged) saveSettings();
+            if (showLfsRunningModal) {
+                ImGui::OpenPopup("LichtFeld-Studio Already Running");
+            }
+            ImGui::SetNextWindowPos(ImVec2(winW * 0.5f, winH * 0.5f), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+            if (ImGui::BeginPopupModal("LichtFeld-Studio Already Running", &showLfsRunningModal, ImGuiWindowFlags_AlwaysAutoResize)) {
+                ImGui::Text("An instance of LichtFeld-Studio is already running (PID %lu).", lfsRunningPid);
+                ImGui::Spacing();
+                if (ImGui::Button("Switch to Running Window")) {
+                    pf::recon360BringProcessWindowToFront(lfsRunningPid);
+                    showLfsRunningModal = false;
+                    ImGui::CloseCurrentPopup();
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Launch New Instance")) {
+                    doLaunchLichtfeld(lfsLaunchPendingPath);
+                    showLfsRunningModal = false;
+                    ImGui::CloseCurrentPopup();
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Cancel")) {
+                    showLfsRunningModal = false;
+                    ImGui::CloseCurrentPopup();
+                }
+                ImGui::EndPopup();
+            }
+
+            if (settingsChanged) {
+                cachedLfsExe.clear();
+                saveSettings();
+            }
 
             // ---- fly-speed overlay (wheel while flying) ---------------------------
             if (speedHintT > 0.0f) {
@@ -6665,6 +6973,85 @@ int main(int argc, char** argv) {
                     }
                 }
                 running = false;
+            }
+        }
+
+        if (!testReloadLfsOutPng.empty()) {
+            static int reloadShotFrameCount = 0;
+            const bool hasVisibleSplats = splatActive && activeCloud().splatRenderer &&
+                                          activeCloud().splatRenderer->timings().visible > 0;
+            if (hasVisibleSplats && ++reloadShotFrameCount >= 15) {
+                std::vector<unsigned char> rgba = readFramebufferRGBA(winW, winH);
+                std::vector<unsigned char> png  = encodePNG(winW, winH, rgba.data());
+                if (!png.empty()) {
+                    if (FILE* f = fopen(testReloadLfsOutPng.c_str(), "wb")) {
+                        fwrite(png.data(), 1, png.size(), f);
+                        fclose(f);
+                        logInfo("[TEST-RELOAD] Saved reloaded inside screenshot to " + testReloadLfsOutPng);
+                    }
+                }
+                running = false;
+            }
+        }
+
+        const uint32_t nowTicks = SDL_GetTicks();
+        if (watcherArmed && splatActive && !watchedSplatPath.empty() && !watchedSplatChanged && (nowTicks - lastMtimeCheckTicks >= 500)) {
+            lastMtimeCheckTicks = nowTicks;
+            std::error_code ec;
+            fs::path wp = fs::u8path(watchedSplatPath);
+            bool hasChange = false;
+            std::string activeCand;
+
+            // 1. Check if watched file itself was modified
+            if (fs::exists(wp, ec)) {
+                auto curMtime = std::filesystem::last_write_time(wp, ec);
+                auto curSize = std::filesystem::file_size(wp, ec);
+                if (!ec && (curMtime != watchedSplatMtime || curSize != watchedSplatSize)) {
+                    activeCand = watchedSplatPath;
+                    hasChange = true;
+                }
+            }
+
+            // 2. If watched file unchanged, check if a new .ply was created in parent dir
+            if (!hasChange) {
+                fs::path parent = wp.parent_path();
+                if (fs::is_directory(parent, ec)) {
+                    for (const auto& entry : fs::directory_iterator(parent, ec)) {
+                        if (entry.is_regular_file(ec) && entry.path().extension() == ".ply" && entry.path() != wp) {
+                            const std::string cand = entry.path().u8string();
+                            if (armedKnownPlyFiles.find(cand) == armedKnownPlyFiles.end()) {
+                                activeCand = cand;
+                                hasChange = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 3. Track stability (size + mtime stable >= 2s)
+            if (hasChange && !activeCand.empty()) {
+                fs::path cp = fs::u8path(activeCand);
+                auto curMtime = std::filesystem::last_write_time(cp, ec);
+                auto curSize = std::filesystem::file_size(cp, ec);
+                if (activeCand != candidateReloadPath || curSize != candidateObservedSize || curMtime != candidateObservedMtime) {
+                    candidateReloadPath = activeCand;
+                    candidateObservedSize = curSize;
+                    candidateObservedMtime = curMtime;
+                    candidateLastChangeTicks = nowTicks;
+                } else if (nowTicks - candidateLastChangeTicks >= 2000) {
+                    watchedSplatChanged = true;
+                    offeredReloadPath = candidateReloadPath;
+                    if (offeredReloadPath == watchedSplatPath) {
+                        addToast("Splat file modified on disk: " + baseName(offeredReloadPath), "", false);
+                    } else {
+                        addToast("New edited splat detected: " + baseName(offeredReloadPath), "", false);
+                    }
+                }
+            } else {
+                candidateReloadPath.clear();
+                candidateObservedSize = 0;
+                candidateLastChangeTicks = 0;
             }
         }
 

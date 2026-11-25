@@ -27,6 +27,7 @@
 #endif
 #include <windows.h>
 #include <shellapi.h>
+#include <tlhelp32.h>
 #endif
 
 namespace fs = std::filesystem;
@@ -202,17 +203,7 @@ std::string narrow(const std::wstring& w) {
 }
 
 std::wstring quoteArg(const std::wstring& a) {
-    if (!a.empty() && a.find_first_of(L" \t\n\v\"") == std::wstring::npos) return a;
-    std::wstring out = L"\"";
-    for (auto it = a.begin();; ++it) {
-        size_t backslashes = 0;
-        while (it != a.end() && *it == L'\\') { ++it; ++backslashes; }
-        if (it == a.end()) { out.append(backslashes * 2, L'\\'); break; }
-        if (*it == L'"') { out.append(backslashes * 2 + 1, L'\\'); out.push_back(L'"'); }
-        else { out.append(backslashes, L'\\'); out.push_back(*it); }
-    }
-    out.push_back(L'"');
-    return out;
+    return recon360QuoteArg(a);
 }
 
 fs::path exeDir() {
@@ -492,18 +483,134 @@ std::string recon360FindPython(const Recon360Settings& s) {
     return v.empty() ? std::string() : narrow(v[0]) + (v.size() > 1 ? " " + narrow(v[1]) : "");
 }
 
+std::wstring recon360QuoteArg(const std::wstring& a) {
+    if (!a.empty() && a.find_first_of(L" \t\n\v\"") == std::wstring::npos) return a;
+    std::wstring out = L"\"";
+    for (auto it = a.begin();; ++it) {
+        size_t backslashes = 0;
+        while (it != a.end() && *it == L'\\') { ++it; ++backslashes; }
+        if (it == a.end()) { out.append(backslashes * 2, L'\\'); break; }
+        if (*it == L'"') { out.append(backslashes * 2 + 1, L'\\'); out.push_back(L'"'); }
+        else { out.append(backslashes, L'\\'); out.push_back(*it); }
+    }
+    out.push_back(L'"');
+    return out;
+}
+
+std::string recon360QuoteArgUtf8(const std::string& a) {
+    return narrow(recon360QuoteArg(widen(a)));
+}
+
 std::string recon360FindLichtfeld(const Recon360Settings& s) {
     if (!s.lichtfeldExe.empty() && isFile(widen(s.lichtfeldExe)))
         return s.lichtfeldExe;
     if (const wchar_t* env = _wgetenv(L"PF360_LICHTFELD")) {
         if (*env && isFile(env)) return narrow(env);
     }
+    // Check beside our executable or in engines/lichtfeld beside exe
+    const fs::path ed = exeDir();
+    const fs::path beside = ed / L"LichtFeld-Studio.exe";
+    if (isFile(beside.wstring())) return narrow(beside.wstring());
+    const fs::path besideEngines = ed / L"engines" / L"lichtfeld" / L"LichtFeld-Studio.exe";
+    if (isFile(besideEngines.wstring())) return narrow(besideEngines.wstring());
+
+    // LocalAppData engine pack
     const fs::path enginePath = localAppData() / L"ViitorX" / L"PointForge" / L"engines" / L"lichtfeld" / L"LichtFeld-Studio.exe";
     if (isFile(enginePath.wstring())) return narrow(enginePath.wstring());
     wchar_t buf[MAX_PATH];
     if (SearchPathW(nullptr, L"LichtFeld-Studio.exe", nullptr, MAX_PATH, buf, nullptr))
         return narrow(buf);
+
     return {};
+}
+
+unsigned long recon360FindProcessByName(const std::wstring& exeName) {
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return 0;
+    PROCESSENTRY32W pe{};
+    pe.dwSize = sizeof(pe);
+    unsigned long foundPid = 0;
+    if (Process32FirstW(snap, &pe)) {
+        do {
+            if (_wcsicmp(pe.szExeFile, exeName.c_str()) == 0) {
+                foundPid = pe.th32ProcessID;
+                break;
+            }
+        } while (Process32NextW(snap, &pe));
+    }
+    CloseHandle(snap);
+    return foundPid;
+}
+
+bool recon360BringProcessWindowToFront(unsigned long pid) {
+    if (!pid) return false;
+    struct WndData { DWORD targetPid; HWND targetHwnd; } data{pid, nullptr};
+    EnumWindows([](HWND hwnd, LPARAM lp) -> BOOL {
+        auto* d = reinterpret_cast<WndData*>(lp);
+        DWORD p = 0;
+        GetWindowThreadProcessId(hwnd, &p);
+        if (p == d->targetPid && IsWindowVisible(hwnd) && GetWindow(hwnd, GW_OWNER) == nullptr) {
+            d->targetHwnd = hwnd;
+            return FALSE;
+        }
+        return TRUE;
+    }, reinterpret_cast<LPARAM>(&data));
+    if (data.targetHwnd) {
+        ShowWindow(data.targetHwnd, SW_RESTORE);
+        SetForegroundWindow(data.targetHwnd);
+        return true;
+    }
+    return false;
+}
+
+LichtfeldEditorLaunchResult recon360LaunchLichtfeldEditor(const std::string& plyPath, const Recon360Settings& s) {
+    LichtfeldEditorLaunchResult res;
+    if (plyPath.empty()) {
+        res.error = "No PLY file specified.";
+        return res;
+    }
+    std::string exe = recon360FindLichtfeld(s);
+    if (exe.empty()) {
+        res.error = "LichtFeld-Studio.exe not found.";
+        return res;
+    }
+    res.exePath = exe;
+
+    fs::path exeFs = fs::u8path(exe);
+    fs::path plyFs = fs::u8path(plyPath);
+    if (!fs::exists(plyFs)) {
+        res.error = "PLY file does not exist: " + plyPath;
+        return res;
+    }
+
+    std::wstring wExe = exeFs.wstring();
+    std::wstring wPly = plyFs.wstring();
+    fs::path workDir = exeFs.parent_path();
+
+    // Command line: "<exe>" -v "<ply>"
+    std::wstring cmd = recon360QuoteArg(wExe) + L" -v " + recon360QuoteArg(wPly);
+    std::vector<wchar_t> cmdBuf(cmd.begin(), cmd.end());
+    cmdBuf.push_back(L'\0');
+
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+
+    // Launch detached without inheriting handles or sharing console
+    const BOOL ok = CreateProcessW(wExe.c_str(), cmdBuf.data(), nullptr, nullptr, FALSE,
+                                   DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_UNICODE_ENVIRONMENT,
+                                   nullptr, workDir.wstring().c_str(), &si, &pi);
+    if (!ok) {
+        res.error = "CreateProcessW failed (error " + std::to_string(GetLastError()) + ")";
+        return res;
+    }
+
+    res.ok = true;
+    res.pid = pi.dwProcessId;
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    logInfo("[LFS] Launched LichtFeld-Studio (PID " + std::to_string(res.pid) + ") for: " + plyPath);
+    return res;
 }
 
 std::vector<Recon360Preset> recon360LoadPresets(std::string& err) {
@@ -1184,6 +1291,13 @@ Recon360CameraPath recon360CameraPath(const std::string&) { return {}; }
 void recon360Reveal(const std::string&, bool) {}
 std::vector<Recon360Unfinished> recon360ListUnfinished() { return {}; }
 bool recon360SpecFromManifest(const std::string&, Recon360JobSpec&, std::string& err) { err = "Windows only"; return false; }
+std::wstring recon360QuoteArg(const std::wstring& a) { return a; }
+std::string recon360QuoteArgUtf8(const std::string& a) { return a; }
+unsigned long recon360FindProcessByName(const std::wstring&) { return 0; }
+bool recon360BringProcessWindowToFront(unsigned long) { return false; }
+LichtfeldEditorLaunchResult recon360LaunchLichtfeldEditor(const std::string&, const Recon360Settings&) {
+    LichtfeldEditorLaunchResult r; r.error = "Windows only"; return r;
+}
 #endif
 
 } // namespace pf

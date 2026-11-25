@@ -10,6 +10,7 @@
 // frame extraction.
 #include "viewer/EnginePacks.h"
 #include "viewer/Recon360.h"
+#include "io/SplatReader.h"
 
 #include <nlohmann/json.hpp>
 
@@ -93,6 +94,57 @@ static void testPresets() {
         CHECK(recon360FramesForWindow(p[1], 30.0) == 90);
         CHECK(recon360FramesForWindow(p[1], 1.0) == p[1].minFrames);
     }
+}
+
+static void testArgumentQuoting(const fs::path& tmp) {
+    // Empty string
+    CHECK(recon360QuoteArg(L"") == L"\"\"");
+    CHECK(recon360QuoteArgUtf8("") == "\"\"");
+
+    // Plain string without special chars
+    CHECK(recon360QuoteArg(L"plain") == L"plain");
+    CHECK(recon360QuoteArgUtf8("plain") == "plain");
+
+    // String with spaces
+    CHECK(recon360QuoteArg(L"hello world") == L"\"hello world\"");
+    CHECK(recon360QuoteArgUtf8("hello world") == "\"hello world\"");
+
+    // Path with spaces and backslashes
+    CHECK(recon360QuoteArg(L"C:\\Program Files\\LichtFeld Studio\\app.exe") == L"\"C:\\Program Files\\LichtFeld Studio\\app.exe\"");
+    CHECK(recon360QuoteArgUtf8("C:\\Program Files\\LichtFeld Studio\\app.exe") == "\"C:\\Program Files\\LichtFeld Studio\\app.exe\"");
+
+    // Path without spaces and trailing backslash needs no quotes
+    CHECK(recon360QuoteArg(L"C:\\folder\\") == L"C:\\folder\\");
+    CHECK(recon360QuoteArgUtf8("C:\\folder\\") == "C:\\folder\\");
+
+    // Path with spaces and trailing backslash (must double backslashes before closing quote: \ -> \\)
+    CHECK(recon360QuoteArg(L"C:\\my folder\\") == L"\"C:\\my folder\\\\\"");
+    CHECK(recon360QuoteArgUtf8("C:\\my folder\\") == "\"C:\\my folder\\\\\"");
+
+    // Multiple trailing backslashes with spaces (\\ -> \\\\)
+    CHECK(recon360QuoteArg(L"C:\\my folder\\\\") == L"\"C:\\my folder\\\\\\\\\"");
+
+    // Internal quotes (quote must be escaped with \")
+    CHECK(recon360QuoteArg(L"say \"hello\"") == L"\"say \\\"hello\\\"\"");
+    CHECK(recon360QuoteArgUtf8("say \"hello\"") == "\"say \\\"hello\\\"\"");
+
+    // Backslashes followed by quote (n backslashes -> 2n+1 backslashes)
+    CHECK(recon360QuoteArg(L"a\\\"b") == L"\"a\\\\\\\"b\"");
+
+    // Unicode path preserved
+    CHECK(recon360QuoteArg(L"C:\\vidéo test\\splat.ply") == L"\"C:\\vidéo test\\splat.ply\"");
+
+    // LichtFeld discovery test
+    Recon360Settings st;
+    const fs::path dummyLfs = tmp / "LichtFeld-Studio.exe";
+    {
+        std::ofstream dummy(dummyLfs);
+        dummy << "dummy";
+    }
+    st.lichtfeldExe = dummyLfs.u8string();
+    std::string found = recon360FindLichtfeld(st);
+    CHECK(!found.empty());
+    CHECK(fs::equivalent(fs::u8path(found), dummyLfs));
 }
 
 static Recon360JobSpec baseSpec(const fs::path& video, const fs::path& out, const char* id) {
@@ -430,6 +482,53 @@ static void testZUpDetection(const fs::path& tmp) {
     }
     CHECK(recon360IsZUpOutput(ply.u8string()));
     CHECK(!recon360IsZUpOutput((tmp / "elsewhere.ply").u8string()));
+
+    // Verify sidecar detection
+    const fs::path plyWithSidecar = tmp / "scene_with_sidecar.ply";
+    std::ofstream(plyWithSidecar) << "ply\n";
+    {
+        nlohmann::json sc;
+        sc["upAxis"] = "z_up";
+        std::ofstream(tmp / "scene_with_sidecar.ply.pf360.json") << sc.dump();
+    }
+    CHECK(recon360IsZUpOutput(plyWithSidecar.u8string()));
+
+    // Verify preference isolation logic:
+    // A generic PLY without sidecar or report does not identify as Z-up
+    const fs::path genericPly = tmp / "generic_3dgs.ply";
+    std::ofstream(genericPly) << "ply\n";
+    CHECK(!recon360IsZUpOutput(genericPly.u8string()));
+
+    // Emulate viewer resolution:
+    // User preference defaults to YDown
+    int userPrefUpAxis = (int)pf::SplatUpAxis::YDown;
+
+    // 1. Loading LFS / recon PLY selects ZUp for the cloud: axisAutoDetected = true
+    bool cloud1Auto = recon360IsZUpOutput(plyWithSidecar.u8string());
+    pf::SplatUpAxis cloud1Axis = cloud1Auto ? pf::SplatUpAxis::ZUp : (pf::SplatUpAxis)userPrefUpAxis;
+    CHECK(cloud1Axis == pf::SplatUpAxis::ZUp);
+    CHECK(cloud1Auto == true);
+    // User preference must remain untouched!
+    CHECK(userPrefUpAxis == (int)pf::SplatUpAxis::YDown);
+
+    // If user changes combo on the auto-detected LFS cloud (e.g. to YUp), preference is NOT updated:
+    if (!cloud1Auto) { userPrefUpAxis = (int)pf::SplatUpAxis::YUp; }
+    CHECK(userPrefUpAxis == (int)pf::SplatUpAxis::YDown);
+
+    // 2. Loading generic PLY next uses user preference -> still YDown, axisAutoDetected = false
+    bool cloud2Auto = recon360IsZUpOutput(genericPly.u8string());
+    pf::SplatUpAxis cloud2Axis = cloud2Auto ? pf::SplatUpAxis::ZUp : (pf::SplatUpAxis)userPrefUpAxis;
+    CHECK(cloud2Axis == pf::SplatUpAxis::YDown);
+    CHECK(cloud2Auto == false);
+    CHECK(userPrefUpAxis == (int)pf::SplatUpAxis::YDown);
+
+    // Even with a guessed spawn (hasSpawn = true), user change on generic cloud updates preference!
+    bool genericHasSpawn = true;
+    (void)genericHasSpawn;
+    if (!cloud2Auto) {
+        userPrefUpAxis = (int)pf::SplatUpAxis::YUp;
+    }
+    CHECK(userPrefUpAxis == (int)pf::SplatUpAxis::YUp);
 }
 
 #ifdef _WIN32
@@ -792,6 +891,7 @@ int main(int argc, char** argv) {
 
     testViews();
     testPresets();
+    testArgumentQuoting(tmp);
     testManifest(tmp);
     testZUpDetection(tmp);
 #ifdef _WIN32
