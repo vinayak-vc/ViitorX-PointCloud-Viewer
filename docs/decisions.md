@@ -4,7 +4,7 @@ This document records major design decisions.
 
 ## LichtFeld-Studio Subprocess Isolation (GPL-3.0 Compliance)
 - **Status**: PROPOSED (pending A/B gate and Owner approval)
-- **Decision**: LichtFeld-Studio is integrated into PointForge as an external, isolated standalone subprocess communicating via CLI parameters, stdout progress telemetry, and standard 3DGS PLY files, rather than linking in-process as a dynamic/static library.
+- **Decision**: LichtFeld-Studio would run as an external, isolated standalone subprocess communicating via CLI parameters, stdout progress telemetry, and standard 3DGS PLY files, rather than linking in-process as a dynamic/static library.
 - **Reason**: LichtFeld-Studio is licensed under GPL-3.0-or-later. Linking in-process would create a derivative work subject to copyleft GPL licensing, compromising PointForge's proprietary licensing model. Subprocess execution via Python subprocess (`tools/pf360`) provides strict process and licensing isolation while maintaining high throughput.
 
 ## GLOMAP Camera Solver Progress Reporting
