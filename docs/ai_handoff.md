@@ -3,7 +3,39 @@
 ## Session (2026-11-25) - LichtFeld-Studio integration & A/B tooling (cards BT-1, BT-2, BT-3, BT-8)
 
 - **Role**: Antigravity (Senior C++ Implementer); Claude (Tech Lead / Architect / Reviewer).
-- **BT-13 Completed & In Review ('Edit in LichtFeld' button & editor launch)**:
+- **BT-12 Completed & In Review (Tile training for large scenes)**:
+  - **Architecture & Implementation (`tools/pf360/pf360/tiles.py`)**:
+    - `plan_tiles_from_cameras` / `plan_tiles_from_transforms`: analyzes camera trajectory in transforms frame, identifies principal walk dimension ($Y$ axis, extent 11.64 units), partitions camera bounds into $N$ equal segments with fractional overlap (`overlap_fraction = 0.15` / 15% of walk extent) and wide scene margin (2000 units on non-walk axes to preserve full sky, horizon, and distant geometry).
+    - `box_to_lfs`: converts transforms bounding boxes $(x, y, z)$ to LichtFeld COLMAP frame $(x, -y, -z)$ ensuring each minimum strictly precedes its maximum.
+    - `merge_tile_plys`: streams per-tile binary PLY exports in chunks, deduplicates Gaussians by checking coordinates against each tile's core box, writing a consolidated PLY with updated header vertex count.
+    - `train_tiles`: standalone CLI and programmatic runner executing tiles sequentially with shared VRAM safety, tracking per-tile timings, merging deduplicated PLYs, frame-normalizing once into transforms Z-up frame, and writing sidecar `.pf360.json`.
+    - Integrated with `tools/pf360/pf360/lichtfeld_engine.py` (via `train_lfs_tiles`), `manifest.py` (validation for `training.tiles` default 1 and `training.tileOverlap` default 0.15), and `nerfstudio_backend.py` (cache fingerprinting).
+    - **Threshold Gating**: auto-tiling off by default (`tiles = 1`), triggered only when views $\ge 2500$ (`should_auto_tile`). Walk extent gate dropped — COLMAP coordinate scale is arbitrary (the same scene can produce any numeric extent). 10s preview clip never auto-tiles.
+    - **MCMC forced for tiled runs** (round 2 fix, [C-18]): `train_lfs_tiles` unconditionally sets `tile_tr["lfsStrategy"] = "mcmc"` before building tile commands. MRNF gradient densification saturates at ~600k Gaussians inside a cropbox half-space; MCMC fills the per-tile cap correctly. Result dict reports `"strategy": "mcmc", "strategyForced": "mcmc"`.
+    - **Fractional tileOverlap** (round 2 fix, [C-18]): `manifest.tileOverlap` is now a fraction of the walk extent (default `0.15` = 15%, range `0.05`–`0.5`). `validate()` updated accordingly. Breaking schema change from the old absolute-unit value of 1.5.
+    - **No hardcoded "preview10s" in output names** (round 2 fix, [C-18]): `tiles.py` `train_tiles()` gains `output_basename: Optional[str]` parameter; fallback name is `splat_{iterations}_{n}tiles_{strategy}_zup.ply`.
+    - **Trade-off note**: tiling with MCMC costs approximately −0.30 dB vs a single MCMC run on the same scene (23.122 dB vs 23.419 dB). Acceptable for scenes too large for a single-GPU run. Worst case is small scenes where tile overlap region is large relative to tile extent (double-training the boundary). The 2500-view gate avoids tiling small scenes.
+  - **10s Preview Clip Verification (Holdout Split: 1246 train views, 182 eval views)**:
+    - **Root Cause & Strategy Comparison**:
+      - In MRNF, gradient-based densification and `--crop` prunes points outside each tile's cropbox, saturating at ~600k points inside the half-space, leading to 980k merged Gaussians and 22.671 dB PSNR (-0.42 dB vs single MRNF).
+      - In MCMC, the optimizer redistributes and saturates the fixed particle budget up to `max-cap` per tile (`1,079,000` = overlap-scaled budget). Deduplication keeps 1,527,673 points, matching single-run detail.
+    - **MCMC 2-Tile Run Results**:
+      - Tile 1/2: 129.1s training wall-clock, 1,079,000 splats.
+      - Tile 2/2: 133.0s training wall-clock, 1,079,000 splats.
+      - Total merged splats: **1,527,673 Gaussians** (361.3 MB) merged in **0.79s**.
+      - Frame-normalised once to `preview10s_2tiles_mcmc.ply`.
+      - **Holdout Evaluation (`ab_score.py`)**:
+        - **PSNR**: **23.122 dB** (+0.029 dB vs single LFS MRNF 23.093 dB; -0.297 dB vs single LFS MCMC 23.419 dB).
+        - **SSIM**: **0.7671** (vs single MRNF 0.7783, single MCMC 0.7765).
+        - **LPIPS**: **0.2666** (vs single MRNF 0.2168, single MCMC 0.2462).
+    - **Visual Seam Verification**:
+      - Rendered 2 holdout views spanning the split boundary ($Y = -0.175$) comparing `[ Single Run LFS | 2-Tile Run | Ground Truth ]` side by side:
+        - `C:\lfs\evidence_bt12_seam_frame_108.png` ($Y = -0.9301$): Single 26.83 dB / 0.9425 SSIM | Tiles 26.44 dB / 0.9420 SSIM (virtually identical).
+        - `C:\lfs\evidence_bt12_seam_frame_093.png` ($Y = +0.0086$): Single 23.71 dB / 0.7579 SSIM | Tiles 22.99 dB / 0.7512 SSIM.
+      - Visual confirmation shows smooth spatial continuity without double-density or clipping seams.
+    - Tests: 155 Python tests passed (including `test_tiles.py`), 175 `pf360hosttest` passed.
+  - Card moved to `review`. Uncommitted pending Claude's review.
+- **BT-13 Completed (Accepted in [C-16], commit `4e9d199`)**:
   - **CHANGES_REQUESTED (Round 4 from [C-15]) Addressed**:
     1. *Dedicated `axisAutoDetected` Flag*: Used per-cloud `axisAutoDetected` boolean on `SceneCloud` (set when `recon360IsZUpOutput` or camera path is detected, carried over across reloads in `reloadSplat`).
     2. *Generic Splat Preference Updates*: Updated Properties panel combo to guard saved default preference updates with `if (!c.axisAutoDetected)`, ensuring generic splats with guessed spawn points from `findSplatSpawn` can still update `splatUpAxis`. Updated combo comment.

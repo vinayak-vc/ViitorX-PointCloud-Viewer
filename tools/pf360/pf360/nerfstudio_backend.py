@@ -464,6 +464,9 @@ class NerfstudioBackend(ReconstructionBackend):
                     inputs["dropMisplacedPanoramas"] = False
                 if tr.get("maxTrainingViews", 0):
                     inputs["maxTrainingViews"] = tr["maxTrainingViews"]
+                if tr.get("tiles", 1) > 1:
+                    inputs["tiles"] = tr["tiles"]
+                    inputs["tileOverlap"] = float(tr.get("tileOverlap", 1.5))
                 return inputs
             keys = ("method", "iterations", "downscaleFactor", "shDegree", "randomSeed", "useScaleRegularization",
                     "cullAlphaThresh", "densifyGradThresh", "cullScaleThresh")

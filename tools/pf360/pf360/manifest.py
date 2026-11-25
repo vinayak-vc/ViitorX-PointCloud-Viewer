@@ -79,6 +79,8 @@ def resolve(raw: Dict[str, Any], video_duration: Optional[float] = None) -> Dict
     tr.setdefault("engine", "nerfstudio")
     tr.setdefault("lfsStrategy", "mrnf")
     tr.setdefault("maxGaussians", 2_000_000)
+    tr.setdefault("tiles", 1)
+    tr.setdefault("tileOverlap", 0.15)
 
     # Resolution downscale factor: LichtFeld Balanced/High default to 1 (-r 1), Preview to 2 (-r 2).
     # Nerfstudio presets remain unchanged (Preview: 4, Balanced: 2, High: 1).
@@ -89,8 +91,7 @@ def resolve(raw: Dict[str, Any], video_duration: Optional[float] = None) -> Dict
             tr["downscaleFactor"] = 2
         else:
             tr["downscaleFactor"] = base["downscaleFactor"]
-    else:
-        tr.setdefault("downscaleFactor", base["downscaleFactor"])
+    tr.setdefault("downscaleFactor", base["downscaleFactor"])
     tr.setdefault("shDegree", base["shDegree"])
     tr.setdefault("useScaleRegularization", base["useScaleRegularization"])
     tr.setdefault("randomSeed", 42)
@@ -210,6 +211,8 @@ def validate(m: Dict[str, Any], check_files: bool = True) -> Dict[str, Any]:
         problems.append("training.lfsStrategy must be 'mrnf' or 'mcmc'")
     mg = tr.get("maxGaussians", 2_000_000)
     _in(problems, "training.maxGaussians", mg, 1000, 50_000_000, integer=True)
+    _in(problems, "training.tiles", tr.get("tiles", 1), 1, 64, integer=True)
+    _in(problems, "training.tileOverlap", tr.get("tileOverlap", 0.15), 0.05, 0.5)
     if tr.get("method") not in limits["method"]:
         problems.append("training.method must be one of %s" % limits["method"])
     _in(problems, "training.iterations", tr.get("iterations"), *limits["iterations"], integer=True)
