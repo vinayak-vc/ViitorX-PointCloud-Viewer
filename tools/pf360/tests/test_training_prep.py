@@ -224,5 +224,60 @@ class LongScheduleTests(unittest.TestCase):
             manifest.validate(ManifestTests()._m(longSchedule="yes"))
 
 
+class TestLichtFeldNoRamBudget(unittest.TestCase):
+    def _set_wh(self, processed: Path, w: int = 1000, h: int = 1000):
+        tf = processed / "transforms.json"
+        t = json.loads(tf.read_text(encoding="utf-8"))
+        t["w"], t["h"] = w, h
+        tf.write_text(json.dumps(t), encoding="utf-8")
+        return t
+
+    def test_no_ram_budget_keeps_all_good_views(self):
+        processed, planar = _workspace(n_pan=40, views=4, bad=(10,))
+        self._set_wh(processed)
+        logs = []
+        stats = tp.prepare(
+            processed,
+            planar,
+            seed_cap=0,
+            ram_bytes=120_000_000,
+            apply_ram_budget=False,
+            log=logs.append,
+        )
+        self.assertEqual(stats["trainingViews"], 156)
+        self.assertEqual(stats["viewBudget"], "none (lichtfeld)")
+        t = json.loads((processed / "transforms.json").read_text(encoding="utf-8"))
+        self.assertEqual(len(t["frames"]), 156)
+        self.assertTrue(any("no RAM view budget for LichtFeld" in line for line in logs))
+
+    def test_no_ram_budget_still_respects_explicit_max_views(self):
+        processed, planar = _workspace(n_pan=40, views=4, bad=(10,))
+        self._set_wh(processed)
+        stats = tp.prepare(
+            processed,
+            planar,
+            seed_cap=0,
+            max_views=20,
+            ram_bytes=120_000_000,
+            apply_ram_budget=False,
+        )
+        self.assertGreater(stats["trainingViews"], 0)
+        self.assertLessEqual(stats["trainingViews"], 20)
+
+    def test_ram_budget_enabled_caps_views_for_nerfstudio(self):
+        processed, planar = _workspace(n_pan=40, views=4, bad=(10,))
+        t = self._set_wh(processed)
+        stats = tp.prepare(
+            processed,
+            planar,
+            seed_cap=0,
+            ram_bytes=120_000_000,
+            apply_ram_budget=True,
+        )
+        budget = tp.view_budget(t, 1, 120_000_000)
+        self.assertEqual(stats["viewBudget"], budget)
+        self.assertLessEqual(stats["trainingViews"], budget)
+
+
 if __name__ == "__main__":
     unittest.main()

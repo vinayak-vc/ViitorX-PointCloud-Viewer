@@ -316,6 +316,7 @@ def train_lfs(ctx: StageContext) -> Dict[str, Any]:
     try:
         prep = training_prep.prepare(ws.processed_dir, ws.planar_dir, seed_cap=cap,
                                      drop_misplaced=drop, max_views=int(tr.get("maxTrainingViews", 0)),
+                                     apply_ram_budget=False,
                                      downscale=int(tr.get("downscaleFactor", 1)), seed=int(tr.get("randomSeed", 42)),
                                      log=lambda m: ctx.emitter.log(m, stage="training"))
     except (OSError, ValueError) as e:
@@ -692,7 +693,7 @@ def export_lfs(ctx: StageContext) -> Dict[str, Any]:
                     tr_res = json.load(f).get("pf360Level", {})
             except (OSError, ValueError):
                 pass
-    for k in ("levelled", "levelTiltDeg", "levelR", "levelT"):
+    for k in ("levelled", "levelTiltDeg", "levelR", "levelT", "trainingViews", "viewBudget"):
         if k in tr_res:
             sidecar[k] = tr_res[k]
 

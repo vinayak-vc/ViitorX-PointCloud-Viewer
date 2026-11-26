@@ -280,7 +280,8 @@ def subsample_panoramas(frames: Sequence[Dict[str, Any]], pans: Dict[str, List[T
 
 
 def prepare(processed_dir: Path, planar_dir: Path, *, seed_cap: int = DEFAULT_SEED_POINT_CAP,
-            drop_misplaced: bool = True, max_views: int = 0, downscale: int = 1, ram_bytes: Optional[int] = None,
+            drop_misplaced: bool = True, max_views: int = 0, apply_ram_budget: bool = True,
+            downscale: int = 1, ram_bytes: Optional[int] = None,
             seed: int = 42, log=None) -> Dict[str, Any]:
     """Writes processed/transforms.json (training view) from transforms_all.json (the camera
     stage's output, saved on first call) and, when thinning, sparse_pc_train.ply. Returns stats."""
@@ -324,8 +325,12 @@ def prepare(processed_dir: Path, planar_dir: Path, *, seed_cap: int = DEFAULT_SE
         else:
             stats["misplaced"] = {"skipped": mismatch}
 
-    if max_views <= 0:                           # auto: what fits in RAM
-        max_views = view_budget(t, downscale, total_ram_bytes() if ram_bytes is None else ram_bytes)
+    if max_views <= 0:                           # auto: what fits in RAM (Nerfstudio only)
+        if apply_ram_budget:
+            max_views = view_budget(t, downscale, total_ram_bytes() if ram_bytes is None else ram_bytes)
+        else:
+            stats["viewBudget"] = "none (lichtfeld)"
+            say("training on %d of %d views (no RAM view budget for LichtFeld)" % (len(frames), stats["views"]))
     if max_views > 0 and len(frames) > max_views:
         before = len(frames)
         if pans is not None:
