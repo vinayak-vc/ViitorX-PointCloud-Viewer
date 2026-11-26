@@ -7,18 +7,20 @@
 namespace pf {
 
 // Z-up world: yaw=0, pitch=0 looks +Y with +Z up and +X to the right.
-// Roll-free orientation for a given yaw/pitch (forward = (sin y cos p, cos y cos p, sin p)).
-glm::quat Camera::fromYawPitch(float yawDeg, float pitchDeg) {
+// Orientation for a given yaw/pitch and optional horizon tilt offset about local forward (+Y).
+glm::quat Camera::fromYawPitch(float yawDeg, float pitchDeg, float tiltDeg) {
     glm::quat qYaw   = glm::angleAxis(glm::radians(-yawDeg), glm::vec3(0, 0, 1));
     glm::quat qPitch = glm::angleAxis(glm::radians(pitchDeg), glm::vec3(1, 0, 0));
-    return glm::normalize(qYaw * qPitch);
+    glm::quat qRoll  = glm::angleAxis(glm::radians(tiltDeg),  glm::vec3(0, 1, 0));
+    return glm::normalize(qYaw * qPitch * qRoll);
 }
 
 void Camera::sync() const {
-    if (!orientValid_ || yaw != syncYaw_ || pitch != syncPitch_) {
-        orient_ = fromYawPitch(yaw, pitch);
+    if (!orientValid_ || yaw != syncYaw_ || pitch != syncPitch_ || tiltOffset != syncTilt_) {
+        orient_ = fromYawPitch(yaw, pitch, keepLevel ? std::clamp(tiltOffset, -45.0f, 45.0f) : 0.0f);
         syncYaw_ = yaw;
         syncPitch_ = pitch;
+        syncTilt_ = tiltOffset;
         orientValid_ = true;
     }
 }
@@ -52,17 +54,22 @@ glm::mat4 Camera::proj() const {
 
 void Camera::addYawPitch(float dYaw, float dPitch) {
     sync();
+    if (lockYaw) dYaw = 0.0f;
+    if (lockPitch) dPitch = 0.0f;
+    if (dYaw == 0.0f && dPitch == 0.0f) return;
+
     if (keepLevel) {
-        // World-up yaw + clamped pitch, rebuilt roll-free every time: turning
-        // while looking up/down can no longer tilt the horizon. The clamp stops
-        // short of the poles so forward never lines up with world up.
+        // World-up yaw + clamped pitch, rebuilt from (yaw, pitch, tiltOffset) every time:
+        // turning while looking up/down never accumulates drift.
         yaw   += dYaw * lookSpeed;
         if (yaw > 180.0f)  yaw -= 360.0f;
         if (yaw < -180.0f) yaw += 360.0f;
         pitch = std::clamp(pitch + dPitch * lookSpeed, -89.0f, 89.0f);
-        orient_ = fromYawPitch(yaw, pitch);
+        tiltOffset = std::clamp(tiltOffset, -45.0f, 45.0f);
+        orient_ = fromYawPitch(yaw, pitch, tiltOffset);
         syncYaw_ = yaw;
         syncPitch_ = pitch;
+        syncTilt_ = tiltOffset;
         orientValid_ = true;
         return;
     }
@@ -83,12 +90,20 @@ void Camera::addYawPitch(float dYaw, float dPitch) {
     yaw   = glm::degrees(std::atan2(f.x, f.y));
     syncYaw_ = yaw;
     syncPitch_ = pitch;
+    syncTilt_ = tiltOffset;
     orientValid_ = true;
 }
 
 void Camera::roll(float dDeg) {
-    if (keepLevel) return;   // roll is a free-look feature; level mode never tilts
+    if (lockTilt) return;
     sync();
+    if (keepLevel) {
+        tiltOffset = std::clamp(tiltOffset + dDeg, -45.0f, 45.0f);
+        orient_ = fromYawPitch(yaw, pitch, tiltOffset);
+        syncTilt_ = tiltOffset;
+        orientValid_ = true;
+        return;
+    }
     // Local forward is +Y in camera space, so rolling is a local rotation about Y.
     // Forward and yaw/pitch are unchanged, so the yaw/pitch cache stays valid.
     orient_ = glm::normalize(orient_ * glm::angleAxis(glm::radians(dDeg), glm::vec3(0, 1, 0)));
@@ -100,9 +115,13 @@ void Camera::pan(float dxPx, float dyPx, float unitsPerPx) {
 
 void Camera::levelHorizon() {
     sync();
-    // yaw/pitch describe the forward direction only, so rebuilding from them
-    // gives the same forward with zero roll.
-    orient_ = fromYawPitch(yaw, pitch);
+    // Reset horizon tilt offset and rebuild roll-free from yaw/pitch.
+    tiltOffset = 0.0f;
+    orient_ = fromYawPitch(yaw, pitch, 0.0f);
+    syncYaw_ = yaw;
+    syncPitch_ = pitch;
+    syncTilt_ = 0.0f;
+    orientValid_ = true;
 }
 
 void Camera::lookAt(const glm::vec3& target) {

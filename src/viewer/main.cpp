@@ -653,6 +653,8 @@ int main(int argc, char** argv) {
     // Export-dialog path, quitting when it finishes. Smoke-test hook for the
     // camera-path export pipeline (same spirit as --convert).
     std::string exportVideoOnStart;
+    bool cliTiltSet = false;
+    float cliTiltDeg = 0.0f;
     // --export-slice <out-prefix>: export a central metadata slice to
     // <prefix>.dxf/.csv/.png, then quit when all three complete. Smoke-test
     // hook for the clip export pipeline.
@@ -677,6 +679,9 @@ int main(int argc, char** argv) {
             convertOnStart = argv[++i];
         } else if (strcmp(a, "--export-video") == 0 && i + 1 < argc) {
             exportVideoOnStart = argv[++i];
+        } else if (strcmp(a, "--tilt-deg") == 0 && i + 1 < argc) {
+            cliTiltDeg = std::clamp((float)atof(argv[++i]), -45.0f, 45.0f);
+            cliTiltSet = true;
         } else if (strcmp(a, "--export-slice") == 0 && i + 1 < argc) {
             exportSliceOnStart = argv[++i];
         } else if (strcmp(a, "--export-glb") == 0 && i + 1 < argc) {
@@ -994,6 +999,7 @@ int main(int argc, char** argv) {
         const double cubeSize = activeCloudSize();
         cam.position = glm::vec3(0.0f, -(float)cubeSize, 0.0f);
         cam.yaw = 0.0f; cam.pitch = 0.0f;
+        cam.levelHorizon();
         cam.nearZ = (float)std::max(0.01, cubeSize / 5000.0);
         cam.farZ  = (float)(cubeSize * 8.0);
         cam.moveSpeed = (float)(cubeSize / 8.0);
@@ -1118,6 +1124,17 @@ int main(int argc, char** argv) {
     bool hoverValid = false;
     float navHintT = 0.0f;           // first-load fading nav hint (seconds left)
     float speedHintT = 0.0f;         // "Fly speed" overlay after a wheel change (seconds left)
+    float lockHintT = 0.0f;          // status-bar hint when rotation input is blocked by a lock
+    std::string lockHintMsg;
+    auto showLockHint = [&](const char* msg) {
+        lockHintMsg = msg;
+        lockHintT = 1.5f;
+    };
+    auto checkRotLocks = [&](float dx, float dy) {
+        if (cam.allLocked() && (dx != 0.0f || dy != 0.0f)) { showLockHint("rotation locked"); return; }
+        if (cam.lockYaw && dx != 0.0f) showLockHint("yaw locked");
+        else if (cam.lockPitch && dy != 0.0f) showLockHint("pitch locked");
+    };
     float stereoHintT = 0.0f;        // "F9 to exit" hint when entering stereo
     std::string loadedDir;           // currently loaded octree directory
 
@@ -1144,7 +1161,9 @@ int main(int argc, char** argv) {
         clipMax[0]=1000.0f; clipMax[1]=1000.0f; clipMax[2]=1000.0f;
         stereoSBS = false; eyeSeparation = 0.05f; focalDistance = 10.0f;
         camSpeedMultiplier = 1.0f;
-        cam.keepLevel = true; splatNearClip = 0.02f; splatNearAuto = true;
+        cam.keepLevel = true; cam.tiltOffset = 0.0f;
+        cam.lockTilt = false; cam.lockPitch = false; cam.lockYaw = false;
+        splatNearClip = 0.02f; splatNearAuto = true;
         uiScale = autoUiScale;
         darkTheme = true;
         enableEDL = false; edlStrength = 1.0f; edlRadius = 1.5f;
@@ -1169,6 +1188,10 @@ int main(int argc, char** argv) {
         fprintf(f, "splatNearClip=%f\n", splatNearClip);
         fprintf(f, "splatNearAuto=%d\n", (int)splatNearAuto);
         fprintf(f, "camKeepLevel=%d\n", (int)cam.keepLevel);
+        fprintf(f, "camTiltOffset=%f\n", cam.tiltOffset);
+        fprintf(f, "camLockTilt=%d\n", (int)cam.lockTilt);
+        fprintf(f, "camLockPitch=%d\n", (int)cam.lockPitch);
+        fprintf(f, "camLockYaw=%d\n", (int)cam.lockYaw);
         fprintf(f, "sseBudget=%f\n", sseBudget);
         fprintf(f, "gpuBudgetMB=%d\n", gpuBudgetMB);
         fprintf(f, "uploadsPerFrame=%d\n", uploadsPerFrame);
@@ -1245,6 +1268,10 @@ int main(int argc, char** argv) {
             else if (sscanf(line, "splatNearClip=%f", &f1) == 1) splatNearClip = std::clamp(f1, 0.0001f, 1.0f);
             else if (sscanf(line, "splatNearAuto=%d", &i) == 1) splatNearAuto = (i != 0);
             else if (sscanf(line, "camKeepLevel=%d", &i) == 1) cam.keepLevel = (i != 0);
+            else if (sscanf(line, "camTiltOffset=%f", &f1) == 1) cam.tiltOffset = std::clamp(f1, -45.0f, 45.0f);
+            else if (sscanf(line, "camLockTilt=%d", &i) == 1) cam.lockTilt = (i != 0);
+            else if (sscanf(line, "camLockPitch=%d", &i) == 1) cam.lockPitch = (i != 0);
+            else if (sscanf(line, "camLockYaw=%d", &i) == 1) cam.lockYaw = (i != 0);
             else if (sscanf(line, "sseBudget=%f", &f1) == 1) sseBudget = f1;
             else if (sscanf(line, "gpuBudgetMB=%d", &i) == 1) gpuBudgetMB = i;
             else if (sscanf(line, "uploadsPerFrame=%d", &i) == 1) uploadsPerFrame = i;
@@ -1347,6 +1374,7 @@ int main(int argc, char** argv) {
         float px = 0, py = 0, pz = 0, yaw = 0, pitch = 0;
         int   ortho = 0;
         float orthoSize = 100;
+        float tilt = 0.0f;
     };
     std::map<std::string, std::vector<CamBookmark>> allBookmarks;
 
@@ -1369,8 +1397,8 @@ int main(int argc, char** argv) {
             *t1 = 0; *t2 = 0;
             CamBookmark b;
             b.name = t1 + 1;
-            if (sscanf(t2 + 1, "%f %f %f %f %f %d %f",
-                       &b.px, &b.py, &b.pz, &b.yaw, &b.pitch, &b.ortho, &b.orthoSize) == 7)
+            if (sscanf(t2 + 1, "%f %f %f %f %f %d %f %f",
+                       &b.px, &b.py, &b.pz, &b.yaw, &b.pitch, &b.ortho, &b.orthoSize, &b.tilt) >= 7)
                 allBookmarks[line].push_back(std::move(b));
         }
         fclose(f);
@@ -1380,14 +1408,15 @@ int main(int argc, char** argv) {
         if (!f) return;
         for (const auto& kv : allBookmarks)
             for (const auto& b : kv.second)
-                fprintf(f, "%s\t%s\t%f %f %f %f %f %d %f\n",
+                fprintf(f, "%s\t%s\t%f %f %f %f %f %d %f %f\n",
                         kv.first.c_str(), b.name.c_str(),
-                        b.px, b.py, b.pz, b.yaw, b.pitch, b.ortho, b.orthoSize);
+                        b.px, b.py, b.pz, b.yaw, b.pitch, b.ortho, b.orthoSize, b.tilt);
         fclose(f);
     };
     auto gotoBookmark = [&](const CamBookmark& b) {
         cam.position = glm::vec3(b.px, b.py, b.pz);
         cam.yaw = b.yaw; cam.pitch = b.pitch;
+        cam.tiltOffset = std::clamp(b.tilt, -45.0f, 45.0f);
         cam.isOrtho = b.ortho != 0;
         cam.orthoSize = b.orthoSize;
         pivot = glm::vec3(0.0f);
@@ -1402,7 +1431,7 @@ int main(int argc, char** argv) {
         if (name.empty()) name = "View " + std::to_string(v.size() + 1);
         v.push_back({name,
                      cam.position.x, cam.position.y, cam.position.z,
-                     cam.yaw, cam.pitch, cam.isOrtho ? 1 : 0, cam.orthoSize});
+                     cam.yaw, cam.pitch, cam.isOrtho ? 1 : 0, cam.orthoSize, cam.tiltOffset});
         saveBookmarks();
         logInfo("Bookmark saved: " + name); // (addToast is defined later)
     };
@@ -1434,9 +1463,9 @@ int main(int argc, char** argv) {
             *t1 = 0;
             CamKey k;
             double t;
-            if (sscanf(t1 + 1, "%lf %f %f %f %f %f %d %f",
+            if (sscanf(t1 + 1, "%lf %f %f %f %f %f %d %f %f",
                        &t, &k.px, &k.py, &k.pz, &k.yaw, &k.pitch,
-                       &k.ortho, &k.orthoSize) == 8) {
+                       &k.ortho, &k.orthoSize, &k.tilt) >= 8) {
                 k.t = t;
                 allCamPaths[line].keys.push_back(k);
             }
@@ -1450,14 +1479,15 @@ int main(int argc, char** argv) {
         fprintf(f, "# pf-campath 1\n");
         for (const auto& kv : allCamPaths)
             for (const auto& k : kv.second.keys)
-                fprintf(f, "%s\t%f %f %f %f %f %f %d %f\n",
+                fprintf(f, "%s\t%f %f %f %f %f %f %d %f %f\n",
                         kv.first.c_str(), k.t, k.px, k.py, k.pz,
-                        k.yaw, k.pitch, k.ortho, k.orthoSize);
+                        k.yaw, k.pitch, k.ortho, k.orthoSize, k.tilt);
         fclose(f);
     };
     auto applyPathPose = [&](const CamKey& k) {
         cam.position = glm::vec3(k.px, k.py, k.pz);
         cam.yaw = k.yaw; cam.pitch = k.pitch;
+        cam.tiltOffset = std::clamp(k.tilt, -45.0f, 45.0f);
         cam.isOrtho = k.ortho != 0;
         cam.orthoSize = k.orthoSize;
         pivot = glm::vec3(0.0f);
@@ -1479,7 +1509,7 @@ int main(int argc, char** argv) {
             for (const CamBookmark& b : it->second)
                 arr.push_back({{"name", b.name}, {"px", b.px}, {"py", b.py}, {"pz", b.pz},
                                {"yaw", b.yaw}, {"pitch", b.pitch}, {"ortho", b.ortho},
-                               {"orthoSize", b.orthoSize}});
+                               {"orthoSize", b.orthoSize}, {"tilt", b.tilt}});
         root["bookmarks"] = std::move(arr);
         return root.dump();
     };
@@ -1491,7 +1521,7 @@ int main(int argc, char** argv) {
             for (const CamKey& k : it->second.keys)
                 keys.push_back({{"t", k.t}, {"px", k.px}, {"py", k.py}, {"pz", k.pz},
                                {"yaw", k.yaw}, {"pitch", k.pitch}, {"ortho", k.ortho},
-                               {"orthoSize", k.orthoSize}});
+                               {"orthoSize", k.orthoSize}, {"tilt", k.tilt}});
         root["keys"] = std::move(keys);   // single path per cloud (matches CamPath)
         return root.dump();
     };
@@ -1523,6 +1553,7 @@ int main(int argc, char** argv) {
                     b.px = e.value("px", 0.0f); b.py = e.value("py", 0.0f); b.pz = e.value("pz", 0.0f);
                     b.yaw = e.value("yaw", 0.0f); b.pitch = e.value("pitch", 0.0f);
                     b.ortho = e.value("ortho", 0); b.orthoSize = e.value("orthoSize", 100.0f);
+                    b.tilt = e.value("tilt", 0.0f);
                     v.push_back(std::move(b));
                 }
                 allBookmarks[dir] = std::move(v);   // package is authoritative for this cloud
@@ -1538,6 +1569,7 @@ int main(int argc, char** argv) {
                     k.t = e.value("t", 0.0); k.px = e.value("px", 0.0f); k.py = e.value("py", 0.0f);
                     k.pz = e.value("pz", 0.0f); k.yaw = e.value("yaw", 0.0f); k.pitch = e.value("pitch", 0.0f);
                     k.ortho = e.value("ortho", 0); k.orthoSize = e.value("orthoSize", 100.0f);
+                    k.tilt = e.value("tilt", 0.0f);
                     path.keys.push_back(k);
                 }
                 path.sortKeys();
@@ -3009,18 +3041,37 @@ int main(int argc, char** argv) {
             const bool hasInterior = activeCloudIndex >= 0 && activeCloud().hasSpawn;
             if (hasInterior) {
                 // Inside view for 360 reconstruction: pan horizontally from inside the spawn pose
-                for (int i = 0; i < 3; ++i) {
+                if (cliTiltSet) {
+                    const float yaws[4]   = {0.0f, 0.0f, 180.0f, 360.0f};
+                    const double times[4] = {0.0,  1.0,  2.5,    4.0};
+                    for (int i = 0; i < 4; ++i) {
+                        cam = savedCam;
+                        cam.yaw += yaws[i];
+                        cam.tiltOffset = cliTiltDeg;
+                        CamKey k;
+                        k.t = times[i];
+                        k.px = cam.position.x; k.py = cam.position.y; k.pz = cam.position.z;
+                        k.yaw = cam.yaw; k.pitch = cam.pitch;
+                        k.tilt = cam.tiltOffset;
+                        k.ortho = 0; k.orthoSize = cam.orthoSize;
+                        cp.keys.push_back(k);
+                    }
                     cam = savedCam;
-                    cam.yaw += -30.0f + 30.0f * (float)i;
-                    cam.levelHorizon();
-                    CamKey k;
-                    k.t = i * 2.0;
-                    k.px = cam.position.x; k.py = cam.position.y; k.pz = cam.position.z;
-                    k.yaw = cam.yaw; k.pitch = cam.pitch;
-                    k.ortho = 0; k.orthoSize = cam.orthoSize;
-                    cp.keys.push_back(k);
+                } else {
+                    for (int i = 0; i < 3; ++i) {
+                        cam = savedCam;
+                        cam.yaw += -30.0f + 30.0f * (float)i;
+                        cam.levelHorizon();
+                        CamKey k;
+                        k.t = i * 2.0;
+                        k.px = cam.position.x; k.py = cam.position.y; k.pz = cam.position.z;
+                        k.yaw = cam.yaw; k.pitch = cam.pitch;
+                        k.tilt = cam.tiltOffset;
+                        k.ortho = 0; k.orthoSize = cam.orthoSize;
+                        cp.keys.push_back(k);
+                    }
+                    cam = savedCam;
                 }
-                cam = savedCam;
                 logInfo("--export-video: inside-view horizontal pan path (4 s) -> " + exportVideoOnStart);
             } else {
                 const double cs = activeCloudSize();
@@ -3143,8 +3194,10 @@ int main(int argc, char** argv) {
                 mouseLook = false; SDL_SetRelativeMouseMode(SDL_FALSE);
             } else if (e.type == SDL_MOUSEMOTION) {
                 if (mouseLook) {
+                    checkRotLocks((float)e.motion.xrel, -(float)e.motion.yrel);
                     cam.addYawPitch((float)e.motion.xrel, -(float)e.motion.yrel);
                 } else if (orbitDrag && octreeLoaded) {
+                    checkRotLocks((float)e.motion.xrel, -(float)e.motion.yrel);
                     cam.orbit((float)e.motion.xrel, -(float)e.motion.yrel, pivot);
                 } else if (panDrag && octreeLoaded) {
                     const glm::vec3 before = cam.position;
@@ -3229,7 +3282,8 @@ int main(int argc, char** argv) {
                 } else if (!typing && octreeLoaded && k == SDLK_HOME) {
                     if (!spawnInsideSplats()) setupCamera();     // Home = back to the start spot
                 } else if (!typing && octreeLoaded && k == SDLK_g) {
-                    cam.levelHorizon();                         // G = one-press level horizon
+                    cam.levelHorizon();                         // G = one-press level horizon (resets tilt offset)
+                    saveSettings();
                 } else if (k == SDLK_ESCAPE) {
                     if (stereoSBS) {
                         stereoSBS = false; saveSettings();      // Esc leaves stereo first
@@ -3264,11 +3318,17 @@ int main(int argc, char** argv) {
             if (ks[SDL_SCANCODE_E]) moveDir += camUp;
             if (ks[SDL_SCANCODE_Q]) moveDir -= camUp;
 
-            // Z / X roll the camera about its forward axis to level the horizon.
+            // Z / X roll (or adjust horizon tilt in level mode).
             // Hold to roll; Shift = faster.
             const float rollRate = 45.0f * dt * (ks[SDL_SCANCODE_LSHIFT] ? 3.0f : 1.0f);
-            if (ks[SDL_SCANCODE_Z]) cam.roll( rollRate);
-            if (ks[SDL_SCANCODE_X]) cam.roll(-rollRate);
+            if (ks[SDL_SCANCODE_Z] || ks[SDL_SCANCODE_X]) {
+                if (cam.lockTilt) {
+                    showLockHint("tilt locked");
+                } else {
+                    if (ks[SDL_SCANCODE_Z]) cam.roll( rollRate);
+                    if (ks[SDL_SCANCODE_X]) cam.roll(-rollRate);
+                }
+            }
 
             if (glm::length(moveDir) > 0.0f) {
                 moveDir = glm::normalize(moveDir);
@@ -3298,11 +3358,13 @@ int main(int argc, char** argv) {
                 float invY = padInvertY ? -1.0f : 1.0f;
 
                 if (lookWithLeft) {
+                    checkRotLocks(s.lx, -s.ly * invY);
                     cam.addYawPitch(s.lx * padLookSens * dt, -s.ly * invY * padLookSens * dt);
                 } else {
                     glm::vec3 fwd = cam.front(), rgt = cam.right();
                     cam.position += (rgt * s.lx - fwd * s.ly) * mv;   // left stick = move
                     // Right stick = look (Xbox); absent on custom pads -> zero.
+                    checkRotLocks(s.rx, -s.ry * invY);
                     cam.addYawPitch(s.rx * padLookSens * dt, -s.ry * invY * padLookSens * dt);
                 }
                 // Triggers / D-pad vertical = down / up.
@@ -3347,6 +3409,7 @@ int main(int argc, char** argv) {
                 else if (serialNavRelease) { io.AddKeyEvent(ImGuiKey_GamepadFaceDown, false); serialNavRelease = false; }
             } else if (octreeLoaded) {
                 // Joystick = look; hold trigger to fly forward along the look dir.
+                checkRotLocks(sx, -sy * invY);
                 cam.addYawPitch(sx * padLookSens * dt, -sy * invY * padLookSens * dt);
                 if (serial.triggerHeld()) {
                     float mv = cam.moveSpeed * dt * camSpeedMultiplier * padMoveSens;
@@ -3967,10 +4030,11 @@ int main(int argc, char** argv) {
                     CamKey k;
                     cp.sample((double)vex.frameIdx / vex.cfg.fps, k);
                     const glm::vec3 uPos = cam.position;
-                    const float uYaw = cam.yaw, uPitch = cam.pitch, uAspect = cam.aspect;
+                    const float uYaw = cam.yaw, uPitch = cam.pitch, uTilt = cam.tiltOffset, uAspect = cam.aspect;
                     const bool uOrtho = cam.isOrtho; const float uOrthoSize = cam.orthoSize;
                     cam.position = glm::vec3(k.px, k.py, k.pz);
                     cam.yaw = k.yaw; cam.pitch = k.pitch;
+                    cam.tiltOffset = std::clamp(k.tilt, -45.0f, 45.0f);
                     cam.isOrtho = k.ortho != 0; cam.orthoSize = k.orthoSize;
 
                     glBindFramebuffer(GL_FRAMEBUFFER, vex.fbo);
@@ -3985,6 +4049,7 @@ int main(int argc, char** argv) {
                     totalVisibleNodes = vis0; totalDrawnNodes = drawn0;
 
                     cam.position = uPos; cam.yaw = uYaw; cam.pitch = uPitch;
+                    cam.tiltOffset = uTilt;
                     cam.aspect = uAspect; cam.isOrtho = uOrtho; cam.orthoSize = uOrthoSize;
 
                     if (drawn < vis && vex.settleTicks < 240) {
@@ -4954,16 +5019,33 @@ int main(int argc, char** argv) {
                         ImGui::SameLine();
                         if (ImGui::Button("Frame All")) frameAllReq = true;
                         ImGui::SameLine();
-                        if (ImGui::Button("Level Horizon (G)")) cam.levelHorizon();
-                        ImGui::SetItemTooltip("Remove roll: keeps where you look, makes the horizon level.");
+                        if (ImGui::Button("Level Horizon (G)")) { cam.levelHorizon(); settingsChanged = true; }
+                        ImGui::SetItemTooltip("Remove roll and reset horizon tilt offset to 0.");
                         if (ImGui::Checkbox("Keep horizon level", &cam.keepLevel)) {
                             if (cam.keepLevel) cam.levelHorizon();
                             settingsChanged = true;
                         }
                         ImGui::SetItemTooltip("On: turning is about world up and the horizon never tilts\n"
-                                              "(like Unreal / games). Looking up/down stops at straight up/down.\n"
-                                              "Off: free 6-DOF look about the camera's own axes; the view can\n"
-                                              "roll, and Z/X roll by hand.");
+                                              "(like Unreal / games), with optional Horizon tilt offset.\n"
+                                              "Off: free 6-DOF look about the camera's own axes; Z/X roll freely.");
+                        if (cam.keepLevel) {
+                            if (ImGui::SliderFloat("Horizon tilt", &cam.tiltOffset, -45.0f, 45.0f, "%.1f deg")) {
+                                settingsChanged = true;
+                            }
+                            ImGui::SetItemTooltip("Constant horizon tilt offset in level mode (Z/X adjust, G resets to 0).");
+                        }
+                        if (ImGui::Checkbox("Lock tilt (roll, Z/X)", &cam.lockTilt)) settingsChanged = true;
+                        ImGui::SetItemTooltip("Lock tilt / roll axis (blocks Z/X roll input).");
+                        if (ImGui::Checkbox("Lock look up/down (pitch)", &cam.lockPitch)) settingsChanged = true;
+                        ImGui::SetItemTooltip("Lock pitch axis (blocks up/down look from mouse, gamepad, and ESP32).");
+                        if (ImGui::Checkbox("Lock turn left/right (yaw)", &cam.lockYaw)) settingsChanged = true;
+                        ImGui::SetItemTooltip("Lock yaw axis (blocks left/right turn from mouse, gamepad, and ESP32).");
+                        bool allLock = cam.allLocked();
+                        if (ImGui::Checkbox("Lock all", &allLock)) {
+                            cam.setAllLocked(allLock);
+                            settingsChanged = true;
+                        }
+                        ImGui::SetItemTooltip("Lock all rotation axes (roll, pitch, yaw); WASD/QE movement still works.");
                         ImGui::Text("Presets:");
                         ImGui::SameLine(); if (ImGui::SmallButton("Front (1)")) camPresetFront();
                         ImGui::SameLine(); if (ImGui::SmallButton("Side (3)")) camPresetSide();
@@ -5024,6 +5106,7 @@ int main(int argc, char** argv) {
                                 cp.keys[i].pz = cam.position.z;
                                 cp.keys[i].yaw = cam.yaw;
                                 cp.keys[i].pitch = cam.pitch;
+                                cp.keys[i].tilt = cam.tiltOffset;
                                 cp.keys[i].ortho = cam.isOrtho ? 1 : 0;
                                 cp.keys[i].orthoSize = cam.orthoSize;
                                 pathChanged = true;
@@ -5039,6 +5122,7 @@ int main(int argc, char** argv) {
                             k.t = cp.keys.empty() ? 0.0 : cp.duration() + 2.0;
                             k.px = cam.position.x; k.py = cam.position.y; k.pz = cam.position.z;
                             k.yaw = cam.yaw; k.pitch = cam.pitch;
+                            k.tilt = cam.tiltOffset;
                             k.ortho = cam.isOrtho ? 1 : 0; k.orthoSize = cam.orthoSize;
                             cp.keys.push_back(k);
                             pathChanged = true;
@@ -6738,6 +6822,11 @@ int main(int argc, char** argv) {
                             ImGui::Text("XYZ %.2f, %.2f, %.2f", hoverWorld.x, hoverWorld.y, hoverWorld.z);
                         else
                             ImGui::TextDisabled("XYZ --");
+                        if (lockHintT > 0.0f) {
+                            lockHintT -= dt;
+                            ImGui::SameLine(0, 14);
+                            ImGui::TextColored(ImVec4(1.0f, 0.78f, 0.25f, 1.0f), "%s", lockHintMsg.c_str());
+                        }
                     } else {
                         ImGui::TextDisabled("No cloud loaded - F1 shortcuts");
                     }

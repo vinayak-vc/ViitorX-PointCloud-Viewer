@@ -30,7 +30,14 @@ public:
     // true: mouse look yaws about WORLD up (+Z) and pitch is clamped to +-89 deg,
     // so the horizon never tilts (Unreal / game style). false: free 6-DOF look
     // about the camera's own axes, which slowly accumulates roll.
-    bool  keepLevel = true;
+    bool  keepLevel  = true;
+    float tiltOffset = 0.0f;   // degrees (-45..45), constant horizon tilt in level mode
+    bool  lockTilt   = false;  // blocks roll (Z/X)
+    bool  lockPitch  = false;  // blocks look up/down (pitch)
+    bool  lockYaw    = false;  // blocks turn left/right (yaw)
+
+    bool allLocked() const { return lockTilt && lockPitch && lockYaw; }
+    void setAllLocked(bool v) { lockTilt = lockPitch = lockYaw = v; }
 
     glm::vec3 front() const;   // camera forward
     glm::vec3 right() const;   // camera right
@@ -66,14 +73,15 @@ public:
                    glm::vec3& outOrigin, glm::vec3& outDir) const;
 
 private:
-    // Rebuild orient_ from yaw/pitch if they were changed externally.
+    // Rebuild orient_ from yaw/pitch/tiltOffset if they were changed externally.
     void sync() const;
-    static glm::quat fromYawPitch(float yawDeg, float pitchDeg);
+    static glm::quat fromYawPitch(float yawDeg, float pitchDeg, float tiltDeg = 0.0f);
 
     mutable glm::quat orient_{1.0f, 0.0f, 0.0f, 0.0f};  // w, x, y, z
     mutable bool  orientValid_ = false;
     mutable float syncYaw_ = 0.0f;
     mutable float syncPitch_ = 0.0f;
+    mutable float syncTilt_ = 0.0f;
 };
 
 } // namespace pf

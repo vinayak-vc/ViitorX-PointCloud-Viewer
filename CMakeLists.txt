@@ -366,6 +366,14 @@ if(PF_BUILD_TESTS)
     add_dependencies(pf360hosttest embed_worker_header)
     add_dependencies(pf360hosttest pfview)   # pfview's post-build copies the worker beside the exes
     add_test(NAME pf360_host COMMAND pf360hosttest)
+
+    add_executable(cameratest
+        src/tools/cameratest/main.cpp
+        src/viewer/Camera.cpp
+    )
+    target_include_directories(cameratest PRIVATE src)
+    target_link_libraries(cameratest PRIVATE glm::glm)
+    add_test(NAME camera_test COMMAND cameratest)
 endif()
 
 # ---------------------------------------------------------------------------

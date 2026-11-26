@@ -14,6 +14,7 @@ struct CamKey {
     float  yaw = 0, pitch = 0;
     int    ortho = 0;        // discrete: not interpolated, previous key wins
     float  orthoSize = 100.0f;
+    float  tilt = 0.0f;
 };
 
 // Keyframed camera path with smooth interpolation:
@@ -89,6 +90,9 @@ struct CamPath {
         out.pitch = std::clamp((float)herm(keys[k0].pitch, keys[k1].pitch,
                                            keys[k2].pitch, keys[k3].pitch),
                                -89.0f, 89.0f);
+        out.tilt = std::clamp((float)herm(keys[k0].tilt, keys[k1].tilt,
+                                          keys[k2].tilt, keys[k3].tilt),
+                              -45.0f, 45.0f);
         out.orthoSize = std::max(0.01f, (float)herm(keys[k0].orthoSize, keys[k1].orthoSize,
                                                     keys[k2].orthoSize, keys[k3].orthoSize));
         out.ortho = keys[k1].ortho;   // discrete channel: hold until the next key
